@@ -14,6 +14,12 @@ Data sources (all free, via nflreadpy):
 NOTE: nflreadpy returns Polars DataFrames. We convert to pandas immediately
 after each pull so the rest of the codebase (styling, Streamlit, scoring)
 stays consistent with the pandas-based MLB tool.
+
+RESOLVED ID KEY MISMATCH ACROSS TABLES: player_stats natively keys players on
+`player_id`, while NGS/rosters/depth_charts key on `gsis_id`. pull_player_stats()
+renames player_id -> gsis_id immediately on pull, so every downstream function
+in this file (detect_role_change, calc_receiving_mu, calc_kicking_mu, etc.)
+can safely join/filter on `gsis_id` consistently across all tables.
 """
 
 import pandas as pd
@@ -45,9 +51,17 @@ def pull_ngs(stat_type: str, years: list[int]) -> pd.DataFrame:
 
 
 def pull_player_stats(years: list[int]) -> pd.DataFrame:
-    """Game-level player stats (targets, receptions, rush att, pass yds, etc.)."""
-    df = nfl.load_player_stats(seasons=years)
-    return df.to_pandas()
+    """
+    Game-level player stats (targets, receptions, rush att, pass yds, etc.).
+
+    CONFIRMED: player_stats keys players on `player_id`, while NGS/rosters/
+    depth_charts all key on `gsis_id`. Renaming here so every other function
+    in this file can join on `gsis_id` consistently without re-checking which
+    table uses which name.
+    """
+    df = nfl.load_player_stats(seasons=years).to_pandas()
+    df = df.rename(columns={"player_id": "gsis_id"})
+    return df
 
 
 def pull_snap_counts(years: list[int]) -> pd.DataFrame:
@@ -89,17 +103,32 @@ def pull_rosters(years: list[int]) -> pd.DataFrame:
 # 2. COVERAGE % AGGREGATION (per defense, by team)
 # ---------------------------------------------------------------------------
 
-def build_coverage_profile(participation_df: pd.DataFrame) -> pd.DataFrame:
+def build_coverage_profile(participation_df: pd.DataFrame, pbp_df: pd.DataFrame) -> pd.DataFrame:
     """
     Aggregates defense_coverage_type and defense_man_zone_type into
     per-team usage rates.
+
+    CONFIRMED real participation columns: defenders_in_box, defense_coverage_type,
+    defense_man_zone_type, defense_personnel, offense_formation, offense_personnel,
+    route, time_to_throw, was_pressure, possession_team, nflverse_game_id, play_id.
+
+    CONFIRMED join key fix: pbp_df has NO nflverse_game_id column - only
+    game_id (which IS the nflverse-format ID, e.g. "2025_01_KC_BAL") and
+    old_game_id (legacy numeric). participation_df's nflverse_game_id
+    corresponds to pbp's game_id, not a column of the same name - so the
+    join uses left_on/right_on across the differently-named columns.
 
     Returns one row per defteam with columns like:
       cover_1_pct, cover_2_pct, cover_3_pct, cover_4_pct, cover_6_pct,
       man_pct, zone_pct, n_plays
     """
-    df = participation_df.copy()
-    df = df.dropna(subset=["defense_coverage_type"])
+    merged = participation_df.merge(
+        pbp_df[["game_id", "play_id", "defteam", "posteam"]],
+        left_on=["nflverse_game_id", "play_id"],
+        right_on=["game_id", "play_id"],
+        how="left",
+    )
+    df = merged.dropna(subset=["defense_coverage_type", "defteam"])
 
     coverage_counts = (
         df.groupby(["defteam", "defense_coverage_type"])
@@ -239,6 +268,10 @@ def get_coordinator_tendency_profile(coach_name: str, tendency_df: pd.DataFrame,
     Pulls the tendency rows (PROE, box count, coverage rate, personnel, motion, pace)
     for every team/season that coordinator called plays for, so their profile
     travels with them to a new team.
+
+    NOTE: expects tendency_df to have a "team_season_key" column - this needs
+    to be built once we construct a season-level tendency table (not yet
+    implemented as of this version).
     """
     teams_seasons = coordinator_history.get(coach_name, [])
     if not teams_seasons:
@@ -251,25 +284,36 @@ def get_coordinator_tendency_profile(coach_name: str, tendency_df: pd.DataFrame,
 # 4b. ROLE / VOLUME BRIDGE FOR TRADES, NEW STARTERS, NEW COORDINATORS
 # ---------------------------------------------------------------------------
 
-def detect_role_change(player_id: str, current_season: int, current_week: int,
+def detect_role_change(player_gsis_id: str, current_season: int, current_week: int,
                         rosters_df: pd.DataFrame, depth_charts_df: pd.DataFrame,
-                        player_stats_df: pd.DataFrame) -> dict:
+                        player_stats_df: pd.DataFrame, schedules_df: pd.DataFrame) -> dict:
     """
     Flags whether a player's team/role changed recently (trade, new starter
     promotion, depth chart shift) so downstream mu calc knows to bridge
     volume from depth chart position rather than trust trailing stat history.
 
+    CONFIRMED real column fixes vs original draft:
+      - player ID key is `gsis_id` (not player_id) - consistent across
+        rosters, depth_charts, and NGS data. player_stats_df is renamed to
+        gsis_id at pull time (see pull_player_stats), so this join works too.
+      - depth_charts_df has NO season/week columns - only a `dt` (date) field
+        and `pos_slot`/`pos_rank` (not `depth_position`). We match the closest
+        `dt` on/before the target game's date (pulled from schedules_df) instead
+        of filtering by season/week directly.
+      - rosters_df confirmed to have `season`, `week`, `team`, `gsis_id` - that
+        part of the original logic holds.
+
     Returns a dict like:
       {
         "team_changed": bool,
         "current_team": str,
-        "games_on_current_team": int,   # how many games of real volume data exist under new team
-        "depth_chart_slot": str,        # e.g. "WR1", "RB2", "starter" - used as volume proxy pre-data
-        "use_depth_chart_estimate": bool,  # True until enough real games accumulate (~2-3)
+        "games_on_current_team": int,
+        "depth_chart_slot": str,   # from pos_slot (e.g. "WR1", "RB2")
+        "use_depth_chart_estimate": bool,
       }
     """
     roster_row = rosters_df[
-        (rosters_df["player_id"] == player_id) & (rosters_df["season"] == current_season)
+        (rosters_df["gsis_id"] == player_gsis_id) & (rosters_df["season"] == current_season)
     ]
     if roster_row.empty:
         return {"team_changed": None, "current_team": None, "games_on_current_team": 0,
@@ -278,21 +322,29 @@ def detect_role_change(player_id: str, current_season: int, current_week: int,
     current_team = roster_row.iloc[0].get("team")
 
     games_on_team = player_stats_df[
-        (player_stats_df["player_id"] == player_id)
+        (player_stats_df["gsis_id"] == player_gsis_id)
         & (player_stats_df["team"] == current_team)
         & (player_stats_df["season"] == current_season)
         & (player_stats_df["week"] < current_week)
     ].shape[0]
 
-    depth_row = depth_charts_df[
-        (depth_charts_df["player_id"] == player_id)
-        & (depth_charts_df["season"] == current_season)
-        & (depth_charts_df["week"] == current_week)
+    # depth_charts_df has no season/week - find the game date for this
+    # season/week from schedules_df, then match the closest dt on/before it
+    game_date_row = schedules_df[
+        (schedules_df["season"] == current_season) & (schedules_df["week"] == current_week)
     ]
-    depth_slot = depth_row.iloc[0].get("depth_position") if not depth_row.empty else None
+    depth_slot = None
+    if not game_date_row.empty:
+        target_date = game_date_row.iloc[0].get("gameday")
+        player_depth_rows = depth_charts_df[
+            (depth_charts_df["gsis_id"] == player_gsis_id)
+            & (depth_charts_df["dt"] <= target_date)
+        ].sort_values("dt", ascending=False)
+        if not player_depth_rows.empty:
+            depth_slot = player_depth_rows.iloc[0].get("pos_slot")
 
     prior_team_row = rosters_df[
-        (rosters_df["player_id"] == player_id) & (rosters_df["season"] == current_season - 1)
+        (rosters_df["gsis_id"] == player_gsis_id) & (rosters_df["season"] == current_season - 1)
     ]
     prior_team = prior_team_row.iloc[0].get("team") if not prior_team_row.empty else None
     team_changed = (prior_team is not None) and (prior_team != current_team)
@@ -302,7 +354,7 @@ def detect_role_change(player_id: str, current_season: int, current_week: int,
         "current_team": current_team,
         "games_on_current_team": games_on_team,
         "depth_chart_slot": depth_slot,
-        "use_depth_chart_estimate": games_on_team < 3,  # bridge until ~3 real games exist
+        "use_depth_chart_estimate": games_on_team < 3,
     }
 
 
@@ -339,47 +391,106 @@ def blend_scheme_baseline(current_season_tendency: float, prior_baseline_tendenc
 # 5. MU CALCULATION PER PROP TYPE
 # ---------------------------------------------------------------------------
 
-def calc_passing_mu(qb_ngs_row, def_coverage_profile_row, pbp_volume_row):
+def calc_passing_mu(qb_ngs_row, def_coverage_profile_row, team_total_attempts):
     """
-    mu = expected pass attempts (volume, from PROE/game-script) x efficiency
-    adjusted for the specific defense's coverage tendency and pressure rate.
-    Placeholder structure - fill in real weighting once data is pulled.
+    mu = expected pass attempts (volume) x efficiency, adjusted for defense's
+    coverage tendency and pressure rate.
+
+    CONFIRMED real NGS passing columns (via nflreadpy load_nextgen_stats):
+      attempts, completions, pass_yards, pass_touchdowns, interceptions,
+      completion_percentage, completion_percentage_above_expectation,
+      expected_completion_percentage, avg_time_to_throw, avg_completed_air_yards,
+      avg_intended_air_yards, avg_air_yards_differential, avg_air_yards_to_sticks,
+      aggressiveness, passer_rating, max_air_distance, max_completed_air_distance
+
+    NOTE: there is no pre-built "PROE" (pass rate over expected) field in NGS -
+    raw volume is just `attempts`. True PROE needs to be derived from pbp
+    (comparing actual pass rate to expected pass rate by down/distance/score).
+    For now, use the QB's raw `attempts` as volume; swap in a real PROE-adjusted
+    figure once that's built from pbp data.
     """
-    expected_attempts = pbp_volume_row.get("proe_adj_attempts", np.nan)
+    raw_attempts = qb_ngs_row.get("attempts", np.nan)
     cpoe = qb_ngs_row.get("completion_percentage_above_expectation", np.nan)
-    ypa = qb_ngs_row.get("avg_intended_air_yards", np.nan)
+    adot = qb_ngs_row.get("avg_intended_air_yards", np.nan)
+    aggressiveness = qb_ngs_row.get("aggressiveness", np.nan)
     # defense adjustment factor from coverage profile / pressure rate goes here
-    return expected_attempts, cpoe, ypa
+    return raw_attempts, cpoe, adot, aggressiveness
 
 
-def calc_rushing_mu(rb_ngs_row, def_box_profile_row, explosive_row):
+def calc_rushing_mu(rb_ngs_row, team_total_rush_attempts, def_box_profile_row):
     """
     mu = rush share x efficiency (yards over expected), adjusted for
     how often this defense stacks the box against this offense.
+
+    CONFIRMED real NGS rushing columns:
+      rush_attempts, rush_yards, rush_touchdowns, efficiency, avg_rush_yards,
+      avg_time_to_los, expected_rush_yards, rush_yards_over_expected,
+      rush_yards_over_expected_per_att, rush_pct_over_expected,
+      percent_attempts_gte_eight_defenders
+
+    NOTE: there is no pre-built "rush_attempt_share" field - compute manually
+    as rb_ngs_row["rush_attempts"] / team_total_rush_attempts (sum of all RBs'
+    rush_attempts for that team/week). Also note NGS rushing already includes
+    percent_attempts_gte_eight_defenders per player - this can be used directly
+    instead of (or alongside) the FTN-derived box-count profile.
     """
-    rush_share = rb_ngs_row.get("rush_attempt_share", np.nan)
+    rush_attempts = rb_ngs_row.get("rush_attempts", np.nan)
+    rush_share = (
+        rush_attempts / team_total_rush_attempts
+        if team_total_rush_attempts else np.nan
+    )
     efficiency = rb_ngs_row.get("rush_yards_over_expected_per_att", np.nan)
-    box_stack_pct = def_box_profile_row.get("pct_stacked_7plus", np.nan)
-    return rush_share, efficiency, box_stack_pct
+    box_stack_pct_faced = rb_ngs_row.get("percent_attempts_gte_eight_defenders", np.nan)
+    return rush_share, efficiency, box_stack_pct_faced
 
 
-def calc_receiving_mu(wr_ngs_row, def_coverage_profile_row, explosive_row):
+def calc_receiving_mu(wr_ngs_row, wr_player_stats_row, def_coverage_profile_row):
     """
     mu = target share x catch efficiency, adjusted for defense's coverage
     shell tendency and how this specific offense/WR performs against it.
+
+    UPDATE: player_stats already has target_share and wopr (weighted
+    opportunity rating) built in - no manual computation from team totals
+    needed after all. Also has air_yards_share, racr, pacr as bonus
+    efficiency-share metrics. NGS still supplies adot/yac_oe (not in
+    player_stats).
+
+    CONFIRMED real NGS receiving columns: avg_intended_air_yards (= aDOT),
+    avg_yac_above_expectation, avg_separation, avg_cushion.
+    CONFIRMED real player_stats columns: target_share, wopr, air_yards_share,
+    racr, receiving_epa.
     """
-    target_share = wr_ngs_row.get("target_share", np.nan)
-    adot = wr_ngs_row.get("avg_depth_of_target", np.nan)
+    target_share = wr_player_stats_row.get("target_share", np.nan)
+    wopr = wr_player_stats_row.get("wopr", np.nan)
+    adot = wr_ngs_row.get("avg_intended_air_yards", np.nan)
     yac_oe = wr_ngs_row.get("avg_yac_above_expectation", np.nan)
-    return target_share, adot, yac_oe
+    separation = wr_ngs_row.get("avg_separation", np.nan)
+    return target_share, wopr, adot, yac_oe, separation
 
 
-def calc_kicking_mu(team_redzone_trip_rate, kicker_fg_pct_by_distance, projected_td_count):
+def calc_kicking_mu(kicker_player_stats_row: dict) -> dict:
     """
-    FG mu driven by red-zone trip rate x kicker accuracy by distance bucket.
-    XP mu driven almost entirely off projected offensive TD count.
+    FG/XP mu pulled directly from player_stats' pre-built distance-bucket
+    columns - no manual pbp derivation needed.
+
+    CONFIRMED real player_stats columns (much richer than initially assumed):
+      fg_att, fg_made, fg_pct, fg_long,
+      fg_made_0_19, fg_made_20_29, fg_made_30_39, fg_made_40_49,
+      fg_made_50_59, fg_made_60_,
+      fg_missed_0_19, fg_missed_20_29, fg_missed_30_39, fg_missed_40_49,
+      fg_missed_50_59, fg_missed_60_,
+      pat_att, pat_made, pat_missed, pat_pct, pat_blocked,
+      gwfg_att, gwfg_made (game-winning FG specific)
     """
-    return team_redzone_trip_rate, kicker_fg_pct_by_distance, projected_td_count
+    return {
+        "fg_pct_overall": kicker_player_stats_row.get("fg_pct", np.nan),
+        "fg_pct_0_39": None,  # combine fg_made_0_19 + fg_made_20_29 + fg_made_30_39 vs attempts in that range once we have team-level FG attempt distribution
+        "fg_made_40_49": kicker_player_stats_row.get("fg_made_40_49", np.nan),
+        "fg_made_50_59": kicker_player_stats_row.get("fg_made_50_59", np.nan),
+        "fg_long": kicker_player_stats_row.get("fg_long", np.nan),
+        "pat_pct": kicker_player_stats_row.get("pat_pct", np.nan),
+        "pat_att": kicker_player_stats_row.get("pat_att", np.nan),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -391,4 +502,47 @@ def rescore_quality_mu_row_nfl(mu: float, line: float, sigma: float) -> dict:
     Given a mu (model projection), a line (book or user-entered), and an
     estimated sigma (variance - higher for tail-heavy props like longest
     rush / pass TD), returns p_over, p_under, and edge.
-    Uses a normal
+    Uses a normal approximation, consistent with the MLB tool's approach
+    for continuous stats; swap in Poisson for count stats (TDs, receptions)
+    the same way rescore_quality_mu_row() does for MLB counting stats.
+    """
+    from scipy.stats import norm
+    if sigma <= 0 or np.isnan(mu) or np.isnan(line):
+        return {"p_over": np.nan, "p_under": np.nan, "edge": np.nan}
+
+    z = (line - mu) / sigma
+    p_under = norm.cdf(z)
+    p_over = 1 - p_under
+    edge = abs(p_over - 0.5) * 2  # 0 = coinflip, 1 = max conviction, same shape as MLB edge
+    return {"p_over": round(p_over, 3), "p_under": round(p_under, 3), "edge": round(edge, 3)}
+
+
+def calc_quality_score(matchup_exploit_strength: float, sample_size_games: int,
+                        coverage_confidence: float) -> float:
+    """
+    Placeholder quality_score formula, same 0-100 scale as MLB tool.
+    matchup_exploit_strength: how much this specific offense/player profile
+        beats this specific defense's tendency (e.g. high aDOT WR vs man-heavy defense)
+    sample_size_games: games backing the mu (fewer games early season = lower confidence)
+    coverage_confidence: how much of the play sample has charted coverage data
+    """
+    base = matchup_exploit_strength * 70
+    sample_bonus = min(sample_size_games / 10, 1.0) * 20
+    coverage_bonus = coverage_confidence * 10
+    return round(min(base + sample_bonus + coverage_bonus, 100), 1)
+
+
+# ---------------------------------------------------------------------------
+# 7. FULL SLATE SCAN (mirrors scan_full_slate_quality_mu from MLB tool)
+# ---------------------------------------------------------------------------
+
+def scan_full_slate_nfl(week: int, season: int) -> pd.DataFrame:
+    """
+    Placeholder for the weekly full-slate scanner. NFL has far fewer
+    confirmed players/games per week than MLB (1 game per team per week,
+    ~14-16 games max vs MLB's larger nightly slate), so this should be
+    lighter-weight than scan_full_slate_quality_mu() while following the
+    same shape: pull data -> compute mu per prop per player -> merge live
+    lines -> score edge/p_over/quality -> return one combined DataFrame.
+    """
+    raise NotImplementedError("Wire this up once data pulls are confirmed live.")
