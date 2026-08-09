@@ -513,10 +513,6 @@ def calc_offense_fantasy_points(player_stats_row: dict) -> float:
       Fumbles Lost: -1 | 2-Point Conversion: 2
       Offensive Fumble Recovery TD: 6 | Kick/Punt/FG Return TD: 6
 
-    Applies uniformly across QB/RB/WR/TE - a WR's passing terms simply
-    evaluate to 0 since they have no passing stats, same for a QB's
-    receiving terms, etc.
-
     NOTE: qualifying rule (1+ offensive snap or return TD) should be checked
     upstream using snap_counts (offense_snaps > 0) before calling this, since
     player_stats alone doesn't carry a snap-participation flag.
@@ -635,8 +631,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     for lines).
 
     Returns columns including (not exhaustive):
-      gsis_id, player_display_name, team, position, prop_type,
-      mu inputs specific to each prop type, sigma, quality_score inputs
+      gsis_id, player_display_name, team, position, prop_type, mu, sigma
     """
     schedules_df = pull_schedules([season])
     rosters_df = pull_rosters([season])
@@ -653,6 +648,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     box_def_profile, box_off_profile = build_box_count_profile(ftn_df)
     explosive_rates = build_explosive_rates(pbp_df)
     fallback_sigmas = build_league_fallback_sigmas(player_stats_df, season, week)
+    fallback_mus = build_league_fallback_mus(player_stats_df, season, week)
 
     this_week_games = schedules_df[
         (schedules_df["season"] == season) & (schedules_df["week"] == week)
@@ -661,108 +657,183 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
         this_week_games["home_team"], this_week_games["away_team"]
     ]).unique().tolist()
 
+    # Eligible players come from ROSTERS (who's on the team this week),
+    # NOT from this week's own NGS/player_stats rows - those don't exist
+    # yet for an upcoming week. This fixes the original bug where scanning
+    # a future week returned zero rows.
+    week_rosters = rosters_df[
+        (rosters_df["season"] == season) & (rosters_df["team"].isin(teams_this_week))
+    ]
+
     rows = []
 
     # --- Passing props ---
-    qb_rows = ngs_pass_df[
-        (ngs_pass_df["season"] == season) & (ngs_pass_df["week"] == week)
-        & (ngs_pass_df["team_abbr"].isin(teams_this_week))
-    ]
-    for _, qb in qb_rows.iterrows():
-        raw_attempts, cpoe, adot, aggressiveness = calc_passing_mu(qb, None, None)
-        gsis_id = qb.get("player_gsis_id")
+    qb_pool = week_rosters[week_rosters["position"] == "QB"]
+    for _, qb in qb_pool.iterrows():
+        gsis_id = qb.get("gsis_id")
+        mu = calc_prop_mu(
+            gsis_id, "passing_yards", player_stats_df, season, week,
+            league_fallback_mu=fallback_mus.get(("QB", "passing_yards")),
+        )
         sigma = calc_player_sigma(
             gsis_id, "passing_yards", player_stats_df, season, week,
             league_fallback_sigma=fallback_sigmas.get(("QB", "passing_yards")),
         )
         rows.append({
-            "gsis_id": gsis_id, "player_display_name": qb.get("player_display_name"),
-            "team": qb.get("team_abbr"), "position": "QB", "prop_type": "pass_yards",
-            "mu_input_attempts": raw_attempts, "cpoe": cpoe, "adot": adot, "sigma": sigma,
+            "gsis_id": gsis_id, "player_display_name": qb.get("full_name"),
+            "team": qb.get("team"), "position": "QB", "prop_type": "pass_yards",
+            "mu": mu, "sigma": sigma,
         })
 
     # --- Rushing props ---
-    rush_rows = ngs_rush_df[
-        (ngs_rush_df["season"] == season) & (ngs_rush_df["week"] == week)
-        & (ngs_rush_df["team_abbr"].isin(teams_this_week))
-    ]
-    team_rush_totals = rush_rows.groupby("team_abbr")["rush_attempts"].sum().to_dict()
-    for _, rb in rush_rows.iterrows():
-        team_total = team_rush_totals.get(rb.get("team_abbr"), 0)
-        rush_share, efficiency, box_faced = calc_rushing_mu(rb, team_total, None)
-        gsis_id = rb.get("player_gsis_id")
+    rush_pool = week_rosters[week_rosters["position"].isin(["RB", "QB"])]
+    for _, rb in rush_pool.iterrows():
+        gsis_id = rb.get("gsis_id")
+        position = rb.get("position")
+        mu = calc_prop_mu(
+            gsis_id, "rushing_yards", player_stats_df, season, week,
+            league_fallback_mu=fallback_mus.get((position, "rushing_yards")),
+        )
         sigma = calc_player_sigma(
             gsis_id, "rushing_yards", player_stats_df, season, week,
-            league_fallback_sigma=fallback_sigmas.get(("RB", "rushing_yards")),
+            league_fallback_sigma=fallback_sigmas.get((position, "rushing_yards")),
         )
-        rows.append({
-            "gsis_id": gsis_id, "player_display_name": rb.get("player_display_name"),
-            "team": rb.get("team_abbr"), "position": "RB", "prop_type": "rush_yards",
-            "rush_share": rush_share, "efficiency": efficiency, "box_stack_faced": box_faced,
-            "sigma": sigma,
-        })
+        if pd.notna(mu):  # skip QBs/RBs with no real rushing history at all
+            rows.append({
+                "gsis_id": gsis_id, "player_display_name": rb.get("full_name"),
+                "team": rb.get("team"), "position": position, "prop_type": "rush_yards",
+                "mu": mu, "sigma": sigma,
+            })
 
     # --- Receiving props ---
-    rec_rows = ngs_rec_df[
-        (ngs_rec_df["season"] == season) & (ngs_rec_df["week"] == week)
-        & (ngs_rec_df["team_abbr"].isin(teams_this_week))
-    ]
-    ps_this_week = player_stats_df[
-        (player_stats_df["season"] == season) & (player_stats_df["week"] == week)
-    ]
-    for _, wr in rec_rows.iterrows():
-        gsis_id = wr.get("player_gsis_id")
-        ps_match = ps_this_week[ps_this_week["gsis_id"] == gsis_id]
-        ps_row = ps_match.iloc[0].to_dict() if not ps_match.empty else {}
-        target_share, wopr, adot, yac_oe, separation = calc_receiving_mu(wr, ps_row, None)
-        position = wr.get("player_position")
+    rec_pool = week_rosters[week_rosters["position"].isin(["WR", "TE", "RB"])]
+    for _, wr in rec_pool.iterrows():
+        gsis_id = wr.get("gsis_id")
+        position = wr.get("position")
+        mu = calc_prop_mu(
+            gsis_id, "receiving_yards", player_stats_df, season, week,
+            league_fallback_mu=fallback_mus.get((position, "receiving_yards")),
+        )
         sigma = calc_player_sigma(
             gsis_id, "receiving_yards", player_stats_df, season, week,
             league_fallback_sigma=fallback_sigmas.get((position, "receiving_yards")),
         )
-        rows.append({
-            "gsis_id": gsis_id, "player_display_name": wr.get("player_display_name"),
-            "team": wr.get("team_abbr"), "position": position, "prop_type": "rec_yards",
-            "target_share": target_share, "wopr": wopr, "adot": adot,
-            "yac_oe": yac_oe, "separation": separation, "sigma": sigma,
-        })
+        if pd.notna(mu):
+            rows.append({
+                "gsis_id": gsis_id, "player_display_name": wr.get("full_name"),
+                "team": wr.get("team"), "position": position, "prop_type": "rec_yards",
+                "mu": mu, "sigma": sigma,
+            })
 
     # --- Fantasy points (offense: QB, RB, WR, TE) ---
     offense_positions = ["QB", "RB", "WR", "TE"]
-    fantasy_pool = ps_this_week[
-        (ps_this_week["team"].isin(teams_this_week))
-        & (ps_this_week["position"].isin(offense_positions))
-    ]
-    for _, ps_row in fantasy_pool.iterrows():
-        fantasy_pts = calc_offense_fantasy_points(ps_row.to_dict())
-        gsis_id = ps_row.get("gsis_id")
-        sigma = calc_player_sigma(
-            gsis_id, "fantasy_points_ppr", player_stats_df, season, week,
+    fantasy_pool_roster = week_rosters[week_rosters["position"].isin(offense_positions)]
+    for _, pr in fantasy_pool_roster.iterrows():
+        gsis_id = pr.get("gsis_id")
+        recent_games = player_stats_df[
+            (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season)
+            & (player_stats_df["week"] < week)
+        ].sort_values("week", ascending=False).head(6)
+        if recent_games.empty:
+            continue
+        fantasy_pts_per_game = recent_games.apply(
+            lambda r: calc_offense_fantasy_points(r.to_dict()), axis=1
         )
+        mu_fantasy = round(fantasy_pts_per_game.mean(), 2)
+        sigma = round(fantasy_pts_per_game.std(ddof=1), 2) if len(fantasy_pts_per_game) >= 2 else np.nan
         rows.append({
-            "gsis_id": gsis_id, "player_display_name": ps_row.get("player_display_name"),
-            "team": ps_row.get("team"), "position": ps_row.get("position"), "prop_type": "fantasy_points",
-            "mu_fantasy_points": fantasy_pts, "sigma": sigma,
+            "gsis_id": gsis_id, "player_display_name": pr.get("full_name"),
+            "team": pr.get("team"), "position": pr.get("position"), "prop_type": "fantasy_points",
+            "mu": mu_fantasy, "sigma": sigma,
         })
 
     # --- Kicker fantasy + FG/XP props ---
-    kicker_rows = ps_this_week[
-        (ps_this_week["position"] == "K") & (ps_this_week["team"].isin(teams_this_week))
-    ]
-    for _, k_row in kicker_rows.iterrows():
-        kicking_data = calc_kicking_mu(k_row.to_dict())
-        kicker_fantasy = calc_kicker_fantasy_points(k_row.to_dict())
-        gsis_id = k_row.get("gsis_id")
-        sigma = calc_player_sigma(
-            gsis_id, "fantasy_points_ppr", player_stats_df, season, week,
+    kicker_pool = week_rosters[week_rosters["position"] == "K"]
+    for _, kr in kicker_pool.iterrows():
+        gsis_id = kr.get("gsis_id")
+        recent_games = player_stats_df[
+            (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season)
+            & (player_stats_df["week"] < week)
+        ].sort_values("week", ascending=False).head(6)
+        if recent_games.empty:
+            continue
+        kicker_pts_per_game = recent_games.apply(
+            lambda r: calc_kicker_fantasy_points(r.to_dict()), axis=1
         )
+        mu_kicker = round(kicker_pts_per_game.mean(), 2)
+        sigma = round(kicker_pts_per_game.std(ddof=1), 2) if len(kicker_pts_per_game) >= 2 else np.nan
         rows.append({
-            "gsis_id": gsis_id, "player_display_name": k_row.get("player_display_name"),
-            "team": k_row.get("team"), "position": "K", "prop_type": "kicker_fantasy",
-            **kicking_data, "mu_fantasy_points": kicker_fantasy, "sigma": sigma,
+            "gsis_id": gsis_id, "player_display_name": kr.get("full_name"),
+            "team": kr.get("team"), "position": "K", "prop_type": "kicker_fantasy",
+            "mu": mu_kicker, "sigma": sigma,
         })
 
     return pd.DataFrame(rows)
+
+
+def calc_prop_mu(player_gsis_id: str, prop_column: str, player_stats_df: pd.DataFrame,
+                  season: int, current_week: int, lookback_games: int = 6,
+                  min_games: int = 2, league_fallback_mu: float = None) -> float:
+    """
+    Computes mu as the average of a player's own recent real games for a
+    given stat column (e.g. "passing_yards", "rushing_yards",
+    "receiving_yards"), using player_stats history from weeks BEFORE
+    current_week only.
+
+    THIS FIXES A REAL BUG: the original scanner filtered NGS data by
+    week == target_week to find both the list of eligible players AND their
+    stat inputs. That only works retroactively (scanning an already-played
+    week) - for an upcoming week, that week's data doesn't exist yet, so the
+    scan would return zero rows. Using a lookback average from PRIOR weeks
+    fixes this and is also the correct way to build a predictive mu (using
+    the target week's own result as an input would be using the answer to
+    predict the answer).
+
+    Returns NaN if the player has fewer than min_games of history and no
+    league_fallback_mu is provided - the row should be flagged low-confidence
+    in the UI rather than scored with a guessed mu.
+    """
+    history = player_stats_df[
+        (player_stats_df["gsis_id"] == player_gsis_id)
+        & (player_stats_df["season"] == season)
+        & (player_stats_df["week"] < current_week)
+    ].sort_values("week", ascending=False).head(lookback_games)
+
+    if len(history) < min_games:
+        return league_fallback_mu if league_fallback_mu is not None else np.nan
+
+    return round(history[prop_column].mean(), 2)
+
+
+def build_league_fallback_mus(player_stats_df: pd.DataFrame, season: int,
+                               through_week: int) -> dict:
+    """
+    Position-level average mu fallback (e.g. "what does an average starting
+    RB rush for per game this season") for players without enough of their
+    own history yet (rookies, recent trades, Week 1-2). Same structure as
+    build_league_fallback_sigmas().
+    """
+    prop_by_position = {
+        "QB": ["passing_yards", "rushing_yards"],
+        "RB": ["rushing_yards", "receiving_yards"],
+        "WR": ["receiving_yards", "rushing_yards"],
+        "TE": ["receiving_yards"],
+    }
+    df = player_stats_df[
+        (player_stats_df["season"] == season) & (player_stats_df["week"] < through_week)
+    ]
+    fallback = {}
+    for position, columns in prop_by_position.items():
+        pos_df = df[df["position"] == position]
+        for col in columns:
+            per_player_avg = (
+                pos_df.groupby("gsis_id")[col]
+                .agg(["mean", "count"])
+                .query("count >= 2")
+            )
+            if not per_player_avg.empty:
+                fallback[(position, col)] = round(per_player_avg["mean"].mean(), 2)
+    return fallback
 
 
 # ---------------------------------------------------------------------------
