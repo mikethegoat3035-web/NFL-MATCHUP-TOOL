@@ -98,18 +98,36 @@ if st.session_state.slate_df is not None and not st.session_state.slate_df.empty
         )
         backtest_filtered = filtered[filtered["games_sampled"] >= min_games_filter] if "games_sampled" in filtered.columns else filtered
 
-        display_cols = ["player_display_name", "team", "position", "prop_type",
-                         "mu", "sigma", "actual", "miss", "abs_miss", "games_sampled"]
+        # Simplified view: no need to read sigma/miss/abs_miss as numbers.
+        # match_ratio = abs_miss / sigma (how many "typical swings" off the miss was).
+        # The whole row is colored green-to-pale based on this - dark green means
+        # mu closely tracked what actually happened, pale/white means it was a
+        # bigger surprise. Just look at the color, no math needed.
+        backtest_filtered = backtest_filtered.copy()
+        backtest_filtered["match_ratio"] = backtest_filtered.apply(
+            lambda r: (r["abs_miss"] / r["sigma"]) if pd.notna(r.get("sigma")) and r.get("sigma", 0) > 0 else np.nan,
+            axis=1,
+        )
+
+        display_cols = ["player_display_name", "team", "position", "prop_type", "mu", "actual", "miss"]
         display_cols = [c for c in display_cols if c in backtest_filtered.columns]
-        backtest_sorted = backtest_filtered[display_cols].sort_values(
-            "abs_miss", ascending=False, na_position="last"
+        backtest_sorted = backtest_filtered[display_cols + ["match_ratio"]].sort_values(
+            "match_ratio", ascending=True, na_position="last"
         )
-        # Color-coded like the MLB tool: green = small miss (good), red = big miss (bad).
-        # RdYlGn_r maps low values to green and high values to red.
-        styled_backtest = backtest_sorted.style.background_gradient(
-            subset=["abs_miss"], cmap="RdYlGn_r"
-        )
+        display_only = backtest_sorted[display_cols]
+
+        def _row_color(row):
+            ratio = backtest_sorted.loc[row.name, "match_ratio"]
+            if pd.isna(ratio):
+                return [""] * len(row)
+            capped = min(ratio, 3.0)
+            intensity = max(0, 1 - (capped / 3.0))
+            return [f"background-color: rgba(0, 140, 0, {intensity:.2f})"] * len(row)
+
+        styled_backtest = display_only.style.apply(_row_color, axis=1)
         st.dataframe(styled_backtest, use_container_width=True)
+        st.caption("Brighter/more visible green = mu closely matched what actually happened, "
+                   "just like the MLB tool. Fading toward the dark background = bigger surprise.")
 
         valid = backtest_filtered.dropna(subset=["mu", "actual"])
         if not valid.empty:
