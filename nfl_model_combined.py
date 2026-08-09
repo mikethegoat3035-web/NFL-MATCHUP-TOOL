@@ -1075,3 +1075,61 @@ def scan_full_slate_nfl(season: int, week: int) -> pd.DataFrame:
     slate_df["p_over"] = np.nan
     slate_df["edge"] = np.nan
     return slate_df
+
+
+# ---------------------------------------------------------------------------
+# 8. BACKTEST MODE - compare projected mu against actual results for a
+#    completed week (no real lines needed - tests mu accuracy directly)
+# ---------------------------------------------------------------------------
+
+def backtest_week(season: int, week: int) -> pd.DataFrame:
+    """
+    Runs the scanner for a week that's already been played, then joins in
+    each player's REAL result for that week, so you can compare mu (what
+    the model projected using only prior weeks) against what actually
+    happened - no betting line needed for this.
+
+    Only meaningful for a week where player_stats already has real results
+    (i.e. week has been played). Running this on a genuinely upcoming week
+    will just show NaN in the actual/miss columns since the result doesn't
+    exist yet.
+
+    Returns the same columns as scan_full_slate_nfl(), plus:
+      actual: the player's real stat for that prop_type in that week
+      miss: mu - actual (positive = model overprojected, negative = underprojected)
+      abs_miss: absolute value of miss, for sorting worst-to-best
+    """
+    slate_df = build_weekly_slate(season, week)
+    player_stats_df = pull_player_stats([season])
+
+    actual_week = player_stats_df[
+        (player_stats_df["season"] == season) & (player_stats_df["week"] == week)
+    ].set_index("gsis_id")
+
+    prop_to_stat_column = {
+        "pass_yards": "passing_yards",
+        "rush_yards": "rushing_yards",
+        "rec_yards": "receiving_yards",
+        "fantasy_points": "fantasy_points_ppr",
+    }
+
+    def _lookup_actual(row):
+        prop_type = row["prop_type"]
+        gsis_id = row["gsis_id"]
+        if gsis_id not in actual_week.index:
+            return np.nan
+        if prop_type == "kicker_fantasy":
+            return calc_kicker_fantasy_points(actual_week.loc[gsis_id].to_dict())
+        stat_col = prop_to_stat_column.get(prop_type)
+        if stat_col is None:
+            return np.nan
+        val = actual_week.loc[gsis_id]
+        if isinstance(val, pd.DataFrame):  # duplicate index safety
+            val = val.iloc[0]
+        return val.get(stat_col, np.nan)
+
+    slate_df["actual"] = slate_df.apply(_lookup_actual, axis=1)
+    slate_df["miss"] = slate_df["mu"] - slate_df["actual"]
+    slate_df["abs_miss"] = slate_df["miss"].abs()
+
+    return slate_df.drop(columns=["line", "p_over", "edge"], errors="ignore")
