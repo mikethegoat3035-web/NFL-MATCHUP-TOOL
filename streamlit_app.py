@@ -1,153 +1,105 @@
 """
-TEMPORARY diagnostic version of streamlit_app.py.
-Purpose: pull real data from nflreadpy and display actual column names
-so we can correct the placeholder column names in nfl_model_combined.py.
-Once we've confirmed everything, this gets replaced by the real scanner UI.
+streamlit_app.py
+NFL Matchup Tool - main UI. Scans a week's slate, shows every prop with
+mu-based inputs, and lets you type in a line per row to get live edge/p_over,
+same workflow as the MLB tool's adjustable Best Edges table.
 """
 
 import streamlit as st
-import nflreadpy as nfl
+import pandas as pd
+import numpy as np
+from nfl_model_combined import scan_full_slate_nfl, rescore_quality_mu_row_nfl
 
-st.title("NFL Matchup Tool — Data Diagnostic")
-st.write("Pulling real data to confirm column names before building the scanner.")
+st.set_page_config(page_title="NFL Matchup Tool", layout="wide")
+st.title("NFL Matchup Tool")
+st.caption("Scan a week's slate, then type in lines per row to get live edge/probability.")
 
-YEARS = [2025]  # last completed season - safest for a first pull test
+# -----------------------------------------------------------------------
+# Season / week selection
+# -----------------------------------------------------------------------
+col1, col2 = st.columns(2)
+with col1:
+    season = st.number_input("Season", min_value=2020, max_value=2030, value=2026, step=1)
+with col2:
+    week = st.number_input("Week", min_value=1, max_value=18, value=1, step=1)
 
-st.header("1. Play-by-play (load_pbp) — filtered to relevant columns")
-try:
-    pbp = nfl.load_pbp(seasons=YEARS).to_pandas()
-    st.success(f"Pulled {len(pbp):,} rows, {len(pbp.columns)} total columns")
+if "slate_df" not in st.session_state:
+    st.session_state.slate_df = None
 
-    candidates = [
-        "play_type", "posteam", "defteam", "down", "ydstogo", "yardline_100",
-        "rush_attempt", "rushing_yards", "rusher_player_id", "rusher_player_name",
-        "run_location", "run_gap",
-        "pass_attempt", "passing_yards", "passer_player_id", "passer_player_name",
-        "complete_pass", "incomplete_pass", "interception",
-        "receiver_player_id", "receiver_player_name", "receiving_yards",
-        "air_yards", "yards_after_catch", "pass_location",
-        "touchdown", "rush_touchdown", "pass_touchdown",
-        "field_goal_attempt", "field_goal_result", "kick_distance",
-        "extra_point_attempt", "extra_point_result",
-        "sack", "qb_hit", "epa", "wp", "game_id", "week", "season", "game_date",
-        "nflverse_game_id", "play_id",
-    ]
-    found = [c for c in candidates if c in pbp.columns]
-    missing = [c for c in candidates if c not in pbp.columns]
+if st.button("Scan full slate", type="primary"):
+    with st.spinner(f"Pulling and scoring Week {week}, {season}..."):
+        try:
+            st.session_state.slate_df = scan_full_slate_nfl(season, week)
+            st.success(f"Loaded {len(st.session_state.slate_df)} prop rows.")
+        except Exception as e:
+            st.error(f"Scan failed: {e}")
+            st.session_state.slate_df = None
 
-    st.write("FOUND (usable as-is):", found)
-    st.write("MISSING (need a different name — check the full list below):", missing)
+# -----------------------------------------------------------------------
+# Filters + editable table
+# -----------------------------------------------------------------------
+if st.session_state.slate_df is not None and not st.session_state.slate_df.empty:
+    df = st.session_state.slate_df.copy()
 
-    st.write("Full column list (371 total), for cross-checking missing ones:")
-    st.code("\n".join(sorted(pbp.columns.tolist())))
-except Exception as e:
-    st.error(f"pbp pull failed: {e}")
+    st.subheader("Filters")
+    fcol1, fcol2, fcol3 = st.columns(3)
+    with fcol1:
+        prop_types = ["All"] + sorted(df["prop_type"].dropna().unique().tolist())
+        prop_filter = st.selectbox("Prop type", prop_types)
+    with fcol2:
+        positions = ["All"] + sorted(df["position"].dropna().unique().tolist())
+        position_filter = st.selectbox("Position", positions)
+    with fcol3:
+        min_edge_filter = st.slider("Minimum edge (after entering lines)", 0.0, 1.0, 0.0, 0.05)
 
-st.header("2. Next Gen Stats — passing")
-try:
-    ngs_pass = nfl.load_nextgen_stats(stat_type="passing", seasons=YEARS).to_pandas()
-    st.success(f"Pulled {len(ngs_pass):,} rows")
-    st.write("Columns:", sorted(ngs_pass.columns.tolist()))
-    st.dataframe(ngs_pass.head(3))
-except Exception as e:
-    st.error(f"NGS passing pull failed: {e}")
+    filtered = df.copy()
+    if prop_filter != "All":
+        filtered = filtered[filtered["prop_type"] == prop_filter]
+    if position_filter != "All":
+        filtered = filtered[filtered["position"] == position_filter]
 
-st.header("3. Next Gen Stats — rushing")
-try:
-    ngs_rush = nfl.load_nextgen_stats(stat_type="rushing", seasons=YEARS).to_pandas()
-    st.success(f"Pulled {len(ngs_rush):,} rows")
-    st.write("Columns:", sorted(ngs_rush.columns.tolist()))
-    st.dataframe(ngs_rush.head(3))
-except Exception as e:
-    st.error(f"NGS rushing pull failed: {e}")
+    st.subheader("Slate - enter a line per row to compute edge/probability")
+    st.caption(
+        "Type a value in the 'line' column for any prop you want scored. "
+        "mu is derived from the other columns for now - edge/p_over recompute "
+        "automatically once you enter a line and sigma is available."
+    )
 
-st.header("4. Next Gen Stats — receiving")
-try:
-    ngs_rec = nfl.load_nextgen_stats(stat_type="receiving", seasons=YEARS).to_pandas()
-    st.success(f"Pulled {len(ngs_rec):,} rows")
-    st.write("Columns:", sorted(ngs_rec.columns.tolist()))
-    st.dataframe(ngs_rec.head(3))
-except Exception as e:
-    st.error(f"NGS receiving pull failed: {e}")
+    edited = st.data_editor(
+        filtered,
+        column_config={
+            "line": st.column_config.NumberColumn("line", help="Enter the book/DFS line for this prop"),
+        },
+        disabled=[c for c in filtered.columns if c not in ("line",)],
+        num_rows="fixed",
+        use_container_width=True,
+        key="slate_editor",
+    )
 
-st.header("5. Player stats (load_player_stats) — filtered to relevant columns")
-try:
-    player_stats = nfl.load_player_stats(seasons=YEARS).to_pandas()
-    st.success(f"Pulled {len(player_stats):,} rows, {len(player_stats.columns)} total columns")
+    # Recompute edge/p_over live wherever a line was entered. Every row now
+    # has a real mu (see calc_prop_mu / fantasy lookback-average in the
+    # backend) and sigma, so this is a straight rescore per row - no more
+    # special-casing by prop_type needed.
+    results = []
+    for _, row in edited.iterrows():
+        mu = row.get("mu")
+        line = row.get("line")
+        sigma = row.get("sigma")
+        if pd.notna(line) and pd.notna(mu) and pd.notna(sigma):
+            scored = rescore_quality_mu_row_nfl(mu, line, sigma)
+            results.append({**row.to_dict(), **scored})
+        else:
+            results.append({**row.to_dict(), "p_over": np.nan, "edge": np.nan})
 
-    candidates = [
-        "player_id", "gsis_id", "player_display_name", "player_name",
-        "position", "team", "recent_team", "season", "week",
-        "completions", "attempts", "passing_yards", "passing_tds", "interceptions",
-        "carries", "rushing_yards", "rushing_tds",
-        "receptions", "targets", "receiving_yards", "receiving_tds",
-        "fantasy_points", "fantasy_points_ppr",
-    ]
-    found = [c for c in candidates if c in player_stats.columns]
-    missing = [c for c in candidates if c not in player_stats.columns]
+    scored_df = pd.DataFrame(results)
+    if min_edge_filter > 0:
+        scored_df = scored_df[scored_df["edge"].fillna(0) >= min_edge_filter]
 
-    st.write("FOUND (usable as-is):", found)
-    st.write("MISSING (need a different name — check the full list below):", missing)
+    display_cols = ["player_display_name", "team", "position", "prop_type",
+                     "mu", "sigma", "line", "p_over", "edge"]
+    display_cols = [c for c in display_cols if c in scored_df.columns]
+    st.dataframe(scored_df[display_cols].sort_values("edge", ascending=False, na_position="last"),
+                 use_container_width=True)
 
-    st.write("Full column list, for cross-checking missing ones:")
-    st.code("\n".join(sorted(player_stats.columns.tolist())))
-except Exception as e:
-    st.error(f"player_stats pull failed: {e}")
-
-st.header("6. FTN charting (load_ftn_charting)")
-try:
-    ftn = nfl.load_ftn_charting(seasons=YEARS).to_pandas()
-    st.success(f"Pulled {len(ftn):,} rows")
-    st.write("Columns:", sorted(ftn.columns.tolist()))
-    st.dataframe(ftn.head(3))
-except Exception as e:
-    st.error(f"FTN charting pull failed: {e}")
-
-st.header("7. Participation (load_participation)")
-try:
-    participation = nfl.load_participation(seasons=YEARS).to_pandas()
-    st.success(f"Pulled {len(participation):,} rows")
-    st.write("Columns:", sorted(participation.columns.tolist()))
-    st.dataframe(participation.head(3))
-except Exception as e:
-    st.error(f"participation pull failed: {e}")
-
-st.header("8. Snap counts (load_snap_counts)")
-try:
-    snaps = nfl.load_snap_counts(seasons=YEARS).to_pandas()
-    st.success(f"Pulled {len(snaps):,} rows")
-    st.write("Columns:", sorted(snaps.columns.tolist()))
-    st.dataframe(snaps.head(3))
-except Exception as e:
-    st.error(f"snap_counts pull failed: {e}")
-
-st.header("9. Depth charts (load_depth_charts)")
-try:
-    depth = nfl.load_depth_charts(seasons=YEARS).to_pandas()
-    st.success(f"Pulled {len(depth):,} rows")
-    st.write("Columns:", sorted(depth.columns.tolist()))
-    st.dataframe(depth.head(3))
-except Exception as e:
-    st.error(f"depth_charts pull failed: {e}")
-
-st.header("10. Rosters (load_rosters)")
-try:
-    rosters = nfl.load_rosters(seasons=YEARS).to_pandas()
-    st.success(f"Pulled {len(rosters):,} rows")
-    st.write("Columns:", sorted(rosters.columns.tolist()))
-    st.dataframe(rosters.head(3))
-except Exception as e:
-    st.error(f"rosters pull failed: {e}")
-
-st.header("11. Schedules (load_schedules) — checking gameday column")
-try:
-    schedules = nfl.load_schedules(seasons=YEARS).to_pandas()
-    st.success(f"Pulled {len(schedules):,} rows")
-    st.write("Columns:", sorted(schedules.columns.tolist()))
-    st.dataframe(schedules.head(3))
-except Exception as e:
-    st.error(f"schedules pull failed: {e}")
-
-st.info("Once every section above shows real columns with no red errors, "
-        "screenshot each section (or copy the column list text) and send it back "
-        "so the backend file can be corrected to match the real data.")
+else:
+    st.info("Click 'Scan full slate' to load this week's props.")
