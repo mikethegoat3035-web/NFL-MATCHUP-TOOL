@@ -388,6 +388,109 @@ def blend_scheme_baseline(current_season_tendency: float, prior_baseline_tendenc
 
 
 # ---------------------------------------------------------------------------
+# 4c. TEAM-LEVEL TENDENCY BLENDING (coverage %, box-stack rate) ACROSS SEASONS
+# ---------------------------------------------------------------------------
+
+def blend_team_tendency_profiles(current_profile_df: pd.DataFrame, prior_profile_df: pd.DataFrame,
+                                  key_col: str, games_played_by_team: dict,
+                                  full_confidence_games: int = 5) -> pd.DataFrame:
+    """
+    Blends a current-season team tendency table (e.g. coverage % by team,
+    still thin early in the season) with the prior season's full-season
+    table, using the same shrinkage logic as blend_scheme_baseline() -
+    weight shifts toward current-season data as that team's real game count
+    grows, rather than a fixed week cutover.
+
+    current_profile_df / prior_profile_df: output of build_coverage_profile()
+    or build_box_count_profile() - one row per team, numeric tendency columns.
+    key_col: the team column name (e.g. "defteam" or "posteam").
+    games_played_by_team: {team_abbr: games_played_this_season} - used to
+    decide how much to trust the current-season numbers for that specific team.
+
+    Returns one row per team with each numeric column blended. Teams present
+    in only one of the two tables pass through unblended (using whichever
+    table has them).
+    """
+    merged = prior_profile_df.merge(
+        current_profile_df, on=key_col, how="outer", suffixes=("_prior", "_current")
+    )
+
+    numeric_cols = [c for c in prior_profile_df.columns if c != key_col]
+    result = merged[[key_col]].copy()
+
+    for col in numeric_cols:
+        prior_col = f"{col}_prior"
+        current_col = f"{col}_current"
+        if prior_col not in merged.columns or current_col not in merged.columns:
+            continue
+
+        def _blend_row(row):
+            team = row[key_col]
+            games = games_played_by_team.get(team, 0)
+            prior_val = row.get(prior_col)
+            current_val = row.get(current_col)
+            if pd.isna(current_val):
+                return prior_val
+            if pd.isna(prior_val):
+                return current_val
+            return blend_scheme_baseline(current_val, prior_val, games, full_confidence_games)
+
+        result[col] = merged.apply(_blend_row, axis=1)
+
+    return result
+
+
+def build_blended_coverage_profile(season: int, week: int) -> pd.DataFrame:
+    """
+    Builds the coverage-% profile for the target week using a blend of this
+    season's completed weeks (weeks < target week only - avoids leaking
+    future data) and last season's full-season profile, weighted by how
+    many real games each team has played so far this season.
+    """
+    current_pbp = pull_pbp([season])
+    current_pbp = current_pbp[current_pbp["week"] < week]
+    current_participation = pull_participation([season])
+    current_participation = current_participation[
+        current_participation["nflverse_game_id"].isin(current_pbp["game_id"])
+    ]
+    current_coverage = build_coverage_profile(current_participation, current_pbp)
+
+    prior_pbp = pull_pbp([season - 1])
+    prior_participation = pull_participation([season - 1])
+    prior_coverage = build_coverage_profile(prior_participation, prior_pbp)
+
+    games_played_by_team = current_pbp.groupby("defteam")["game_id"].nunique().to_dict()
+
+    return blend_team_tendency_profiles(
+        current_coverage, prior_coverage, "defteam", games_played_by_team
+    )
+
+
+def build_blended_box_profile(season: int, week: int) -> tuple:
+    """
+    Same blending approach as build_blended_coverage_profile(), applied to
+    the box-stack rate profile (both defensive and offensive-side views).
+    """
+    current_ftn = pull_ftn_charting([season])
+    current_ftn = current_ftn[current_ftn["week"] < week]
+    current_def_profile, current_off_profile = build_box_count_profile(current_ftn)
+
+    prior_ftn = pull_ftn_charting([season - 1])
+    prior_def_profile, prior_off_profile = build_box_count_profile(prior_ftn)
+
+    games_played_by_defteam = current_ftn.groupby("defteam")["nflverse_game_id"].nunique().to_dict()
+    games_played_by_posteam = current_ftn.groupby("posteam")["nflverse_game_id"].nunique().to_dict()
+
+    blended_def = blend_team_tendency_profiles(
+        current_def_profile, prior_def_profile, "defteam", games_played_by_defteam
+    )
+    blended_off = blend_team_tendency_profiles(
+        current_off_profile, prior_off_profile, "posteam", games_played_by_posteam
+    )
+    return blended_def, blended_off
+
+
+# ---------------------------------------------------------------------------
 # 5. MU CALCULATION PER PROP TYPE
 # ---------------------------------------------------------------------------
 
@@ -644,8 +747,8 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     participation_df = pull_participation([season])
     ftn_df = pull_ftn_charting([season])
 
-    coverage_profile = build_coverage_profile(participation_df, pbp_df)
-    box_def_profile, box_off_profile = build_box_count_profile(ftn_df)
+    coverage_profile = build_blended_coverage_profile(season, week)
+    box_def_profile, box_off_profile = build_blended_box_profile(season, week)
     explosive_rates = build_explosive_rates(pbp_df)
     fallback_sigmas = build_league_fallback_sigmas(player_stats_df, season, week)
     fallback_mus = build_league_fallback_mus(player_stats_df, season, week)
@@ -734,6 +837,12 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season)
             & (player_stats_df["week"] < week)
         ].sort_values("week", ascending=False).head(6)
+        if len(recent_games) < 2:
+            # bridge across season boundary for Week 1-2 of a new season
+            prior_season_games = player_stats_df[
+                (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season - 1)
+            ].sort_values("week", ascending=False).head(6)
+            recent_games = pd.concat([recent_games, prior_season_games])
         if recent_games.empty:
             continue
         fantasy_pts_per_game = recent_games.apply(
@@ -755,6 +864,11 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season)
             & (player_stats_df["week"] < week)
         ].sort_values("week", ascending=False).head(6)
+        if len(recent_games) < 2:
+            prior_season_games = player_stats_df[
+                (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season - 1)
+            ].sort_values("week", ascending=False).head(6)
+            recent_games = pd.concat([recent_games, prior_season_games])
         if recent_games.empty:
             continue
         kicker_pts_per_game = recent_games.apply(
@@ -780,29 +894,46 @@ def calc_prop_mu(player_gsis_id: str, prop_column: str, player_stats_df: pd.Data
     "receiving_yards"), using player_stats history from weeks BEFORE
     current_week only.
 
-    THIS FIXES A REAL BUG: the original scanner filtered NGS data by
-    week == target_week to find both the list of eligible players AND their
-    stat inputs. That only works retroactively (scanning an already-played
-    week) - for an upcoming week, that week's data doesn't exist yet, so the
-    scan would return zero rows. Using a lookback average from PRIOR weeks
-    fixes this and is also the correct way to build a predictive mu (using
-    the target week's own result as an input would be using the answer to
-    predict the answer).
+    CROSS-SEASON FIX: for Week 1 of a new season (e.g. season=2026, week=1),
+    there is ZERO history within that season yet - player_stats for the new
+    season doesn't exist until games are actually played. Without this fix,
+    every Week 1 row would come back NaN. This now falls back to the end of
+    the PRIOR season's games when the current season doesn't have enough
+    history, so Week 1 uses last season's most recent form as a starting
+    point - same bridging idea as blend_scheme_baseline(), applied here
+    directly rather than left unused.
 
-    Returns NaN if the player has fewer than min_games of history and no
+    THIS ALSO FIXES A REAL BUG from an earlier version: the original scanner
+    filtered NGS data by week == target_week to find both the list of
+    eligible players AND their stat inputs, which only works retroactively
+    (scanning an already-played week) and would also be data leakage (using
+    the target week's own result as an input).
+
+    Returns NaN if there's no usable history in either season and no
     league_fallback_mu is provided - the row should be flagged low-confidence
     in the UI rather than scored with a guessed mu.
     """
-    history = player_stats_df[
+    current_season_history = player_stats_df[
         (player_stats_df["gsis_id"] == player_gsis_id)
         & (player_stats_df["season"] == season)
         & (player_stats_df["week"] < current_week)
     ].sort_values("week", ascending=False).head(lookback_games)
 
-    if len(history) < min_games:
-        return league_fallback_mu if league_fallback_mu is not None else np.nan
+    if len(current_season_history) >= min_games:
+        return round(current_season_history[prop_column].mean(), 2)
 
-    return round(history[prop_column].mean(), 2)
+    # Not enough current-season games (e.g. Week 1-2, or right after a trade) -
+    # bridge with the end of the prior season instead of returning NaN outright.
+    prior_season_history = player_stats_df[
+        (player_stats_df["gsis_id"] == player_gsis_id)
+        & (player_stats_df["season"] == season - 1)
+    ].sort_values("week", ascending=False).head(lookback_games)
+
+    combined = pd.concat([current_season_history, prior_season_history])
+    if len(combined) >= min_games:
+        return round(combined[prop_column].mean(), 2)
+
+    return league_fallback_mu if league_fallback_mu is not None else np.nan
 
 
 def build_league_fallback_mus(player_stats_df: pd.DataFrame, season: int,
@@ -849,24 +980,36 @@ def calc_player_sigma(player_gsis_id: str, prop_column: str, player_stats_df: pd
     their real weekly history from player_stats, up to `lookback_games` most
     recent games before current_week.
 
+    CROSS-SEASON FIX (same as calc_prop_mu): falls back to the end of the
+    prior season's games when the current season doesn't have enough history
+    yet (Week 1-2 of a new season) rather than returning NaN immediately.
+
     This is the missing piece rescore_quality_mu_row_nfl() needs - without
     a real sigma, mu can't be turned into p_over/edge.
 
-    If the player has fewer than `min_games` of history (rookie, recent
-    trade, early season), falls back to `league_fallback_sigma` for that
-    prop/position if provided - otherwise returns NaN and the row should be
-    flagged as low-confidence in the UI rather than scored with a guessed sigma.
+    Returns league_fallback_sigma if there's no usable history in either
+    season - otherwise NaN, and the row should be flagged as low-confidence
+    in the UI rather than scored with a guessed sigma.
     """
-    history = player_stats_df[
+    current_season_history = player_stats_df[
         (player_stats_df["gsis_id"] == player_gsis_id)
         & (player_stats_df["season"] == season)
         & (player_stats_df["week"] < current_week)
     ].sort_values("week", ascending=False).head(lookback_games)
 
-    if len(history) < min_games:
-        return league_fallback_sigma if league_fallback_sigma is not None else np.nan
+    if len(current_season_history) >= min_games:
+        return round(current_season_history[prop_column].std(ddof=1), 3)
 
-    return round(history[prop_column].std(ddof=1), 3)
+    prior_season_history = player_stats_df[
+        (player_stats_df["gsis_id"] == player_gsis_id)
+        & (player_stats_df["season"] == season - 1)
+    ].sort_values("week", ascending=False).head(lookback_games)
+
+    combined = pd.concat([current_season_history, prior_season_history])
+    if len(combined) >= min_games:
+        return round(combined[prop_column].std(ddof=1), 3)
+
+    return league_fallback_sigma if league_fallback_sigma is not None else np.nan
 
 
 def build_league_fallback_sigmas(player_stats_df: pd.DataFrame, season: int,
