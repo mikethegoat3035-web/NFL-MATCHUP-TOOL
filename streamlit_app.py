@@ -70,12 +70,27 @@ try:
 except Exception as e:
     st.error(f"NGS receiving pull failed: {e}")
 
-st.header("5. Player stats (load_player_stats)")
+st.header("5. Player stats (load_player_stats) — filtered to relevant columns")
 try:
     player_stats = nfl.load_player_stats(seasons=YEARS).to_pandas()
-    st.success(f"Pulled {len(player_stats):,} rows")
-    st.write("Columns:", sorted(player_stats.columns.tolist()))
-    st.dataframe(player_stats.head(3))
+    st.success(f"Pulled {len(player_stats):,} rows, {len(player_stats.columns)} total columns")
+
+    candidates = [
+        "player_id", "gsis_id", "player_display_name", "player_name",
+        "position", "team", "recent_team", "season", "week",
+        "completions", "attempts", "passing_yards", "passing_tds", "interceptions",
+        "carries", "rushing_yards", "rushing_tds",
+        "receptions", "targets", "receiving_yards", "receiving_tds",
+        "fantasy_points", "fantasy_points_ppr",
+    ]
+    found = [c for c in candidates if c in player_stats.columns]
+    missing = [c for c in candidates if c not in player_stats.columns]
+
+    st.write("FOUND (usable as-is):", found)
+    st.write("MISSING (need a different name — check the full list below):", missing)
+
+    st.write("Full column list, for cross-checking missing ones:")
+    st.code("\n".join(sorted(player_stats.columns.tolist())))
 except Exception as e:
     st.error(f"player_stats pull failed: {e}")
 
@@ -123,6 +138,15 @@ try:
     st.dataframe(rosters.head(3))
 except Exception as e:
     st.error(f"rosters pull failed: {e}")
+
+st.header("11. Schedules (load_schedules) — checking gameday column")
+try:
+    schedules = nfl.load_schedules(seasons=YEARS).to_pandas()
+    st.success(f"Pulled {len(schedules):,} rows")
+    st.write("Columns:", sorted(schedules.columns.tolist()))
+    st.dataframe(schedules.head(3))
+except Exception as e:
+    st.error(f"schedules pull failed: {e}")
 
 st.info("Once every section above shows real columns with no red errors, "
         "screenshot each section (or copy the column list text) and send it back "
