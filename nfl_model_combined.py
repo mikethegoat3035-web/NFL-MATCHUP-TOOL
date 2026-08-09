@@ -166,13 +166,25 @@ def build_coverage_profile(participation_df: pd.DataFrame, pbp_df: pd.DataFrame)
     return result
 
 
-def build_box_count_profile(ftn_df: pd.DataFrame) -> pd.DataFrame:
+def build_box_count_profile(ftn_df: pd.DataFrame, pbp_df: pd.DataFrame) -> pd.DataFrame:
     """
     Aggregates n_defense_box into a per-team stacked-box rate.
+
+    FIX: ftn_df has NO defteam/posteam columns directly - only
+    nflverse_game_id and nflverse_play_id. Joins to pbp_df on those keys
+    (pbp's game_id/play_id) to pull in defteam/posteam, same fix as
+    build_coverage_profile() needed for participation_df.
+
     Returns avg box count and % of plays with 7+ / 8+ defenders in the box,
     split by defteam (and separately, offense's box counts faced, by posteam).
     """
-    df = ftn_df.dropna(subset=["n_defense_box"]).copy()
+    merged = ftn_df.merge(
+        pbp_df[["game_id", "play_id", "defteam", "posteam"]],
+        left_on=["nflverse_game_id", "nflverse_play_id"],
+        right_on=["game_id", "play_id"],
+        how="left",
+    )
+    df = merged.dropna(subset=["n_defense_box", "defteam"]).copy()
 
     def_profile = (
         df.groupby("defteam")
@@ -186,7 +198,8 @@ def build_box_count_profile(ftn_df: pd.DataFrame) -> pd.DataFrame:
     )
 
     off_profile = (
-        df.groupby("posteam")
+        df.dropna(subset=["posteam"])
+        .groupby("posteam")
         .agg(
             avg_box_faced=("n_defense_box", "mean"),
             pct_faced_stacked_7plus=("n_defense_box", lambda x: (x >= 7).mean()),
@@ -473,13 +486,16 @@ def build_blended_box_profile(season: int, week: int) -> tuple:
     """
     current_ftn = pull_ftn_charting([season])
     current_ftn = current_ftn[current_ftn["week"] < week]
-    current_def_profile, current_off_profile = build_box_count_profile(current_ftn)
+    current_pbp = pull_pbp([season])
+    current_pbp = current_pbp[current_pbp["week"] < week]
+    current_def_profile, current_off_profile = build_box_count_profile(current_ftn, current_pbp)
 
     prior_ftn = pull_ftn_charting([season - 1])
-    prior_def_profile, prior_off_profile = build_box_count_profile(prior_ftn)
+    prior_pbp = pull_pbp([season - 1])
+    prior_def_profile, prior_off_profile = build_box_count_profile(prior_ftn, prior_pbp)
 
-    games_played_by_defteam = current_ftn.groupby("defteam")["nflverse_game_id"].nunique().to_dict()
-    games_played_by_posteam = current_ftn.groupby("posteam")["nflverse_game_id"].nunique().to_dict()
+    games_played_by_defteam = current_pbp[current_pbp["defteam"].notna()].groupby("defteam")["game_id"].nunique().to_dict()
+    games_played_by_posteam = current_pbp[current_pbp["posteam"].notna()].groupby("posteam")["game_id"].nunique().to_dict()
 
     blended_def = blend_team_tendency_profiles(
         current_def_profile, prior_def_profile, "defteam", games_played_by_defteam
