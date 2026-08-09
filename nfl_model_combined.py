@@ -273,10 +273,6 @@ def get_coordinator_tendency_profile(coach_name: str, tendency_df: pd.DataFrame,
     Pulls the tendency rows (PROE, box count, coverage rate, personnel, motion, pace)
     for every team/season that coordinator called plays for, so their profile
     travels with them to a new team.
-
-    NOTE: expects tendency_df to have a "team_season_key" column - this needs
-    to be built once we construct a season-level tendency table (not yet
-    implemented as of this version).
     """
     teams_seasons = coordinator_history.get(coach_name, [])
     if not teams_seasons:
@@ -299,8 +295,7 @@ def detect_role_change(player_gsis_id: str, current_season: int, current_week: i
 
     CONFIRMED real column fixes vs original draft:
       - player ID key is `gsis_id` (not player_id) - consistent across
-        rosters, depth_charts, and NGS data. player_stats_df is renamed to
-        gsis_id at pull time (see pull_player_stats), so this join works too.
+        rosters, depth_charts, and NGS data.
       - depth_charts_df has NO season/week columns - only a `dt` (date) field
         and `pos_slot`/`pos_rank` (not `depth_position`). We match the closest
         `dt` on/before the target game's date (pulled from schedules_df) instead
@@ -629,27 +624,23 @@ def calc_quality_score(matchup_exploit_strength: float, sample_size_games: int,
     return round(min(base + sample_bonus + coverage_bonus, 100), 1)
 
 
-# ---------------------------------------------------------------------------
-# 7. FULL SLATE SCAN (mirrors scan_full_slate_quality_mu from MLB tool)
-# ---------------------------------------------------------------------------
-
 def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     """
     Pulls and merges every data source needed for one week's slate, returning
     a single player-level DataFrame with mu inputs for every prop type ready
-    to score. Lines are NOT auto-pulled - the "line" column is left for
-    manual/adjustable entry per row in the Streamlit UI, same as the MLB
-    tool's adjustable Best Edges table (Underdog auto-pull was unreliable on
-    the MLB tool, and PrizePicks auto-pull was decided against too - staying
-    fully manual for lines going forward).
+    to score. This does NOT include lines - lines are entered/adjusted
+    manually per row in the Streamlit UI, same as the MLB tool's adjustable
+    Best Edges table (avoids repeating the unreliable Underdog auto-pull
+    issue; PrizePicks auto-pull decided against too - staying fully manual
+    for lines).
 
     Returns columns including (not exhaustive):
       gsis_id, player_display_name, team, position, prop_type,
-      mu inputs specific to each prop type, quality_score inputs
+      mu inputs specific to each prop type, sigma, quality_score inputs
     """
     schedules_df = pull_schedules([season])
     rosters_df = pull_rosters([season])
-    depth_charts_df = pull_depth_charts([season])
+    depth_charts_df = pull_depth_charts([season]) if nfl else pd.DataFrame()
     player_stats_df = pull_player_stats([season])
     ngs_pass_df = pull_ngs("passing", [season])
     ngs_rush_df = pull_ngs("rushing", [season])
@@ -661,6 +652,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     coverage_profile = build_coverage_profile(participation_df, pbp_df)
     box_def_profile, box_off_profile = build_box_count_profile(ftn_df)
     explosive_rates = build_explosive_rates(pbp_df)
+    fallback_sigmas = build_league_fallback_sigmas(player_stats_df, season, week)
 
     this_week_games = schedules_df[
         (schedules_df["season"] == season) & (schedules_df["week"] == week)
@@ -678,10 +670,15 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     ]
     for _, qb in qb_rows.iterrows():
         raw_attempts, cpoe, adot, aggressiveness = calc_passing_mu(qb, None, None)
+        gsis_id = qb.get("player_gsis_id")
+        sigma = calc_player_sigma(
+            gsis_id, "passing_yards", player_stats_df, season, week,
+            league_fallback_sigma=fallback_sigmas.get(("QB", "passing_yards")),
+        )
         rows.append({
-            "gsis_id": qb.get("player_gsis_id"), "player_display_name": qb.get("player_display_name"),
+            "gsis_id": gsis_id, "player_display_name": qb.get("player_display_name"),
             "team": qb.get("team_abbr"), "position": "QB", "prop_type": "pass_yards",
-            "mu_input_attempts": raw_attempts, "cpoe": cpoe, "adot": adot,
+            "mu_input_attempts": raw_attempts, "cpoe": cpoe, "adot": adot, "sigma": sigma,
         })
 
     # --- Rushing props ---
@@ -693,10 +690,16 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     for _, rb in rush_rows.iterrows():
         team_total = team_rush_totals.get(rb.get("team_abbr"), 0)
         rush_share, efficiency, box_faced = calc_rushing_mu(rb, team_total, None)
+        gsis_id = rb.get("player_gsis_id")
+        sigma = calc_player_sigma(
+            gsis_id, "rushing_yards", player_stats_df, season, week,
+            league_fallback_sigma=fallback_sigmas.get(("RB", "rushing_yards")),
+        )
         rows.append({
-            "gsis_id": rb.get("player_gsis_id"), "player_display_name": rb.get("player_display_name"),
+            "gsis_id": gsis_id, "player_display_name": rb.get("player_display_name"),
             "team": rb.get("team_abbr"), "position": "RB", "prop_type": "rush_yards",
             "rush_share": rush_share, "efficiency": efficiency, "box_stack_faced": box_faced,
+            "sigma": sigma,
         })
 
     # --- Receiving props ---
@@ -708,14 +711,20 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
         (player_stats_df["season"] == season) & (player_stats_df["week"] == week)
     ]
     for _, wr in rec_rows.iterrows():
-        ps_match = ps_this_week[ps_this_week["gsis_id"] == wr.get("player_gsis_id")]
+        gsis_id = wr.get("player_gsis_id")
+        ps_match = ps_this_week[ps_this_week["gsis_id"] == gsis_id]
         ps_row = ps_match.iloc[0].to_dict() if not ps_match.empty else {}
         target_share, wopr, adot, yac_oe, separation = calc_receiving_mu(wr, ps_row, None)
+        position = wr.get("player_position")
+        sigma = calc_player_sigma(
+            gsis_id, "receiving_yards", player_stats_df, season, week,
+            league_fallback_sigma=fallback_sigmas.get((position, "receiving_yards")),
+        )
         rows.append({
-            "gsis_id": wr.get("player_gsis_id"), "player_display_name": wr.get("player_display_name"),
-            "team": wr.get("team_abbr"), "position": wr.get("player_position"), "prop_type": "rec_yards",
+            "gsis_id": gsis_id, "player_display_name": wr.get("player_display_name"),
+            "team": wr.get("team_abbr"), "position": position, "prop_type": "rec_yards",
             "target_share": target_share, "wopr": wopr, "adot": adot,
-            "yac_oe": yac_oe, "separation": separation,
+            "yac_oe": yac_oe, "separation": separation, "sigma": sigma,
         })
 
     # --- Fantasy points (offense: QB, RB, WR, TE) ---
@@ -726,10 +735,14 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     ]
     for _, ps_row in fantasy_pool.iterrows():
         fantasy_pts = calc_offense_fantasy_points(ps_row.to_dict())
+        gsis_id = ps_row.get("gsis_id")
+        sigma = calc_player_sigma(
+            gsis_id, "fantasy_points_ppr", player_stats_df, season, week,
+        )
         rows.append({
-            "gsis_id": ps_row.get("gsis_id"), "player_display_name": ps_row.get("player_display_name"),
+            "gsis_id": gsis_id, "player_display_name": ps_row.get("player_display_name"),
             "team": ps_row.get("team"), "position": ps_row.get("position"), "prop_type": "fantasy_points",
-            "mu_fantasy_points": fantasy_pts,
+            "mu_fantasy_points": fantasy_pts, "sigma": sigma,
         })
 
     # --- Kicker fantasy + FG/XP props ---
@@ -739,14 +752,100 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     for _, k_row in kicker_rows.iterrows():
         kicking_data = calc_kicking_mu(k_row.to_dict())
         kicker_fantasy = calc_kicker_fantasy_points(k_row.to_dict())
+        gsis_id = k_row.get("gsis_id")
+        sigma = calc_player_sigma(
+            gsis_id, "fantasy_points_ppr", player_stats_df, season, week,
+        )
         rows.append({
-            "gsis_id": k_row.get("gsis_id"), "player_display_name": k_row.get("player_display_name"),
+            "gsis_id": gsis_id, "player_display_name": k_row.get("player_display_name"),
             "team": k_row.get("team"), "position": "K", "prop_type": "kicker_fantasy",
-            **kicking_data, "mu_fantasy_points": kicker_fantasy,
+            **kicking_data, "mu_fantasy_points": kicker_fantasy, "sigma": sigma,
         })
 
     return pd.DataFrame(rows)
 
+
+# ---------------------------------------------------------------------------
+# 6b. SIGMA (VARIANCE) ESTIMATION PER PROP TYPE
+# ---------------------------------------------------------------------------
+
+def calc_player_sigma(player_gsis_id: str, prop_column: str, player_stats_df: pd.DataFrame,
+                       season: int, current_week: int, lookback_games: int = 8,
+                       min_games: int = 3, league_fallback_sigma: float = None) -> float:
+    """
+    Computes a player's own game-to-game standard deviation for a given prop
+    column (e.g. "rushing_yards", "receiving_yards", "passing_yards") using
+    their real weekly history from player_stats, up to `lookback_games` most
+    recent games before current_week.
+
+    This is the missing piece rescore_quality_mu_row_nfl() needs - without
+    a real sigma, mu can't be turned into p_over/edge.
+
+    If the player has fewer than `min_games` of history (rookie, recent
+    trade, early season), falls back to `league_fallback_sigma` for that
+    prop/position if provided - otherwise returns NaN and the row should be
+    flagged as low-confidence in the UI rather than scored with a guessed sigma.
+    """
+    history = player_stats_df[
+        (player_stats_df["gsis_id"] == player_gsis_id)
+        & (player_stats_df["season"] == season)
+        & (player_stats_df["week"] < current_week)
+    ].sort_values("week", ascending=False).head(lookback_games)
+
+    if len(history) < min_games:
+        return league_fallback_sigma if league_fallback_sigma is not None else np.nan
+
+    return round(history[prop_column].std(ddof=1), 3)
+
+
+def build_league_fallback_sigmas(player_stats_df: pd.DataFrame, season: int,
+                                  through_week: int) -> dict:
+    """
+    Builds position-level fallback sigma values (e.g. "what's the typical
+    game-to-game std dev for an average starting RB's rushing_yards this
+    season") to use when an individual player doesn't have enough history
+    yet (rookies, recent trades, Week 1-2). Computed as the average
+    within-player std dev across all players at that position with enough
+    games, NOT the spread across different players (that would conflate
+    variance between players with variance within one player's games).
+
+    Returns a dict like:
+      {
+        ("RB", "rushing_yards"): 22.4,
+        ("WR", "receiving_yards"): 19.1,
+        ("QB", "passing_yards"): 48.7,
+        ...
+      }
+    """
+    prop_by_position = {
+        "QB": ["passing_yards", "rushing_yards"],
+        "RB": ["rushing_yards", "receiving_yards"],
+        "WR": ["receiving_yards", "rushing_yards"],
+        "TE": ["receiving_yards"],
+    }
+
+    df = player_stats_df[
+        (player_stats_df["season"] == season) & (player_stats_df["week"] < through_week)
+    ]
+
+    fallback = {}
+    for position, columns in prop_by_position.items():
+        pos_df = df[df["position"] == position]
+        for col in columns:
+            per_player_std = (
+                pos_df.groupby("gsis_id")[col]
+                .agg(["std", "count"])
+                .query("count >= 3")  # only players with enough games to get a real std
+            )
+            if not per_player_std.empty:
+                fallback[(position, col)] = round(per_player_std["std"].mean(), 3)
+
+    return fallback
+
+
+# ---------------------------------------------------------------------------
+# 7. FULL SLATE SCAN (mirrors scan_full_slate_quality_mu from MLB tool)
+# ---------------------------------------------------------------------------
 
 def scan_full_slate_nfl(season: int, week: int) -> pd.DataFrame:
     """
