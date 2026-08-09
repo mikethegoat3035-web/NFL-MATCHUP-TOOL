@@ -85,17 +85,33 @@ if st.session_state.slate_df is not None and not st.session_state.slate_df.empty
         st.subheader(f"Backtest — Week {week}, {season}: projected mu vs actual result")
         st.caption(
             "mu was computed using only weeks before this one - actual is what "
-            "really happened. Sorted by biggest miss first."
-        )
-        display_cols = ["player_display_name", "team", "position", "prop_type",
-                         "mu", "sigma", "actual", "miss", "abs_miss"]
-        display_cols = [c for c in display_cols if c in filtered.columns]
-        st.dataframe(
-            filtered[display_cols].sort_values("abs_miss", ascending=False, na_position="last"),
-            use_container_width=True,
+            "really happened. Only players who actually played that week are "
+            "shown (backups/inactives are excluded). Sorted by biggest miss first."
         )
 
-        valid = filtered.dropna(subset=["mu", "actual"])
+        min_games_filter = st.slider(
+            "Minimum games sampled (higher = mu backed by more real history)",
+            0, 8, 3,
+            help="Filters out rows where mu was based on very little (or zero) real "
+                 "prior data, so a 'big miss' actually reflects the model being wrong "
+                 "rather than just not having enough history yet.",
+        )
+        backtest_filtered = filtered[filtered["games_sampled"] >= min_games_filter] if "games_sampled" in filtered.columns else filtered
+
+        display_cols = ["player_display_name", "team", "position", "prop_type",
+                         "mu", "sigma", "actual", "miss", "abs_miss", "games_sampled"]
+        display_cols = [c for c in display_cols if c in backtest_filtered.columns]
+        backtest_sorted = backtest_filtered[display_cols].sort_values(
+            "abs_miss", ascending=False, na_position="last"
+        )
+        # Color-coded like the MLB tool: green = small miss (good), red = big miss (bad).
+        # RdYlGn_r maps low values to green and high values to red.
+        styled_backtest = backtest_sorted.style.background_gradient(
+            subset=["abs_miss"], cmap="RdYlGn_r"
+        )
+        st.dataframe(styled_backtest, use_container_width=True)
+
+        valid = backtest_filtered.dropna(subset=["mu", "actual"])
         if not valid.empty:
             mcol1, mcol2, mcol3 = st.columns(3)
             with mcol1:
@@ -144,8 +160,12 @@ if st.session_state.slate_df is not None and not st.session_state.slate_df.empty
         display_cols = ["player_display_name", "team", "position", "prop_type",
                          "mu", "sigma", "line", "p_over", "edge"]
         display_cols = [c for c in display_cols if c in scored_df.columns]
-        st.dataframe(scored_df[display_cols].sort_values("edge", ascending=False, na_position="last"),
-                     use_container_width=True)
+        scan_sorted = scored_df[display_cols].sort_values("edge", ascending=False, na_position="last")
+        # Color-coded like the MLB tool: brighter/darker green = stronger edge/p_over.
+        styled_scan = scan_sorted.style.background_gradient(
+            subset=[c for c in ["edge", "p_over"] if c in scan_sorted.columns], cmap="Greens"
+        )
+        st.dataframe(styled_scan, use_container_width=True)
 
 else:
     st.info("Click the button above to load this week's props.")
