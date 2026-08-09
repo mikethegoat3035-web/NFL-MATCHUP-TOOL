@@ -13,13 +13,33 @@ st.write("Pulling real data to confirm column names before building the scanner.
 
 YEARS = [2025]  # last completed season - safest for a first pull test
 
-st.header("1. Play-by-play (load_pbp)")
+st.header("1. Play-by-play (load_pbp) — filtered to relevant columns")
 try:
     pbp = nfl.load_pbp(seasons=YEARS).to_pandas()
-    st.success(f"Pulled {len(pbp):,} rows")
-    st.write("Columns:", sorted(pbp.columns.tolist()))
-    st.write("Sample row:")
-    st.dataframe(pbp.head(3))
+    st.success(f"Pulled {len(pbp):,} rows, {len(pbp.columns)} total columns")
+
+    candidates = [
+        "play_type", "posteam", "defteam", "down", "ydstogo", "yardline_100",
+        "rush_attempt", "rushing_yards", "rusher_player_id", "rusher_player_name",
+        "run_location", "run_gap",
+        "pass_attempt", "passing_yards", "passer_player_id", "passer_player_name",
+        "complete_pass", "incomplete_pass", "interception",
+        "receiver_player_id", "receiver_player_name", "receiving_yards",
+        "air_yards", "yards_after_catch", "pass_location",
+        "touchdown", "rush_touchdown", "pass_touchdown",
+        "field_goal_attempt", "field_goal_result", "kick_distance",
+        "extra_point_attempt", "extra_point_result",
+        "sack", "qb_hit", "epa", "wp", "game_id", "week", "season", "game_date",
+        "nflverse_game_id", "play_id",
+    ]
+    found = [c for c in candidates if c in pbp.columns]
+    missing = [c for c in candidates if c not in pbp.columns]
+
+    st.write("FOUND (usable as-is):", found)
+    st.write("MISSING (need a different name — check the full list below):", missing)
+
+    st.write("Full column list (371 total), for cross-checking missing ones:")
+    st.code("\n".join(sorted(pbp.columns.tolist())))
 except Exception as e:
     st.error(f"pbp pull failed: {e}")
 
