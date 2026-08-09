@@ -1098,6 +1098,53 @@ def scan_full_slate_nfl(season: int, week: int) -> pd.DataFrame:
 #    completed week (no real lines needed - tests mu accuracy directly)
 # ---------------------------------------------------------------------------
 
+def get_starters_for_week(season: int, week: int, depth_charts_df: pd.DataFrame,
+                           schedules_df: pd.DataFrame) -> set:
+    """
+    Returns the set of gsis_ids who were starters at their position for the
+    game nearest this season/week, using position-specific pos_rank
+    thresholds rather than a flat pos_rank==1 - most offenses run 3-WR sets
+    (11 personnel), so WR1/WR2/WR3 are all commonly real starters, not just
+    WR1. Same logic applies loosely to RB in committee backfields.
+
+    ASSUMPTION FLAGGED: depth_charts' pos_rank column is assumed to use the
+    standard convention where 1 = first-string, 2 = second-string, etc.
+    Column existence is confirmed real, but the actual values (and whether
+    pos_abb reliably reads "QB"/"RB"/"WR"/"TE") haven't been verified
+    against live output yet - check this once real starter/backup sets
+    come back to confirm the thresholds below actually match known
+    starters, and adjust if needed.
+
+    depth_charts_df has no season/week columns - only a `dt` date field, so
+    this matches the closest depth chart snapshot on/before the target
+    game's date (same approach as detect_role_change()).
+    """
+    starter_rank_threshold = {
+        "QB": 1,
+        "RB": 2,   # covers committee backfields (RB1 + RB2)
+        "WR": 3,   # covers standard 3-WR (11 personnel) sets
+        "TE": 1,
+        "K": 1,
+    }
+
+    game_date_row = schedules_df[
+        (schedules_df["season"] == season) & (schedules_df["week"] == week)
+    ]
+    if game_date_row.empty:
+        return set()
+
+    target_date = game_date_row["gameday"].max()  # use latest game date that week as cutoff
+    snapshot = depth_charts_df[depth_charts_df["dt"] <= target_date].sort_values("dt")
+    if snapshot.empty:
+        return set()
+
+    # take the most recent depth chart entry per player before the cutoff
+    latest_per_player = snapshot.groupby("gsis_id").tail(1).copy()
+    latest_per_player["rank_threshold"] = latest_per_player["pos_abb"].map(starter_rank_threshold).fillna(1)
+    starters = latest_per_player[latest_per_player["pos_rank"] <= latest_per_player["rank_threshold"]]
+    return set(starters["gsis_id"].dropna().tolist())
+
+
 def backtest_week(season: int, week: int) -> pd.DataFrame:
     """
     Runs the scanner for a week that's already been played, then joins in
@@ -1105,18 +1152,27 @@ def backtest_week(season: int, week: int) -> pd.DataFrame:
     the model projected using only prior weeks) against what actually
     happened - no betting line needed for this.
 
-    Only meaningful for a week where player_stats already has real results
-    (i.e. week has been played). Running this on a genuinely upcoming week
-    will just show NaN in the actual/miss columns since the result doesn't
-    exist yet.
+    SIMPLIFIED per feedback - now automatically:
+      1. Excludes rows where actual == 0 (backup/inactive/non-participant
+         noise, on top of the existing "must have a real player_stats
+         entry" filter).
+      2. Filters to STARTERS ONLY at each position, using depth_charts'
+         position-specific pos_rank thresholds (see get_starters_for_week()
+         for the flagged assumption on pos_rank values).
+      3. Returns ONLY the BEST (biggest) discrepancies - match_ratio >= 2.0,
+         meaning the result was more than double that player's normal
+         week-to-week swing. Close matches (mu ≈ actual) aren't useful for
+         spotting mispriced-line opportunities, since a line near mu
+         would've been a coinflip either way.
 
-    Returns the same columns as scan_full_slate_nfl(), plus:
-      actual: the player's real stat for that prop_type in that week
-      miss: mu - actual (positive = model overprojected, negative = underprojected)
-      abs_miss: absolute value of miss, for sorting worst-to-best
+    Returns columns: player_display_name, team, position, prop_type, mu,
+    sigma, actual, miss, abs_miss, match_ratio, games_sampled - sorted by
+    biggest surprise (match_ratio) first.
     """
     slate_df = build_weekly_slate(season, week)
     player_stats_df = pull_player_stats([season])
+    depth_charts_df = pull_depth_charts([season]) if nfl else pd.DataFrame()
+    schedules_df = pull_schedules([season])
 
     actual_week = player_stats_df[
         (player_stats_df["season"] == season) & (player_stats_df["week"] == week)
@@ -1144,8 +1200,41 @@ def backtest_week(season: int, week: int) -> pd.DataFrame:
             val = val.iloc[0]
         return val.get(stat_col, np.nan)
 
+    def _games_sampled(row):
+        gsis_id = row["gsis_id"]
+        history = player_stats_df[
+            (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season)
+            & (player_stats_df["week"] < week)
+        ]
+        return len(history)
+
     slate_df["actual"] = slate_df.apply(_lookup_actual, axis=1)
+    slate_df["games_sampled"] = slate_df.apply(_games_sampled, axis=1)
+
+    # 1. Drop non-participants: no result at all, OR a literal 0 (backup who
+    #    barely got in, inactive, etc. - a real starter essentially never
+    #    posts a true 0 in these stat categories).
+    slate_df = slate_df.dropna(subset=["actual"])
+    slate_df = slate_df[slate_df["actual"] != 0].copy()
+
+    # 2. Starters only.
+    starter_ids = get_starters_for_week(season, week, depth_charts_df, schedules_df)
+    if starter_ids:
+        slate_df = slate_df[slate_df["gsis_id"].isin(starter_ids)]
+
     slate_df["miss"] = slate_df["mu"] - slate_df["actual"]
     slate_df["abs_miss"] = slate_df["miss"].abs()
+    slate_df["match_ratio"] = slate_df.apply(
+        lambda r: (r["abs_miss"] / r["sigma"]) if pd.notna(r.get("sigma")) and r.get("sigma", 0) > 0 else np.nan,
+        axis=1,
+    )
 
-    return slate_df.drop(columns=["line", "p_over", "edge"], errors="ignore")
+    # 3. Only the BEST (biggest) discrepancies - match_ratio >= 2.0 means the
+    #    result was more than double that player's normal week-to-week swing,
+    #    genuinely rare rather than just "somewhat off." This is a tighter bar
+    #    than the earlier 1.0 threshold, per feedback to only catch the best
+    #    mispriced-line candidates, not moderately notable ones.
+    slate_df = slate_df[slate_df["match_ratio"] >= 2.0]
+
+    result = slate_df.drop(columns=["line", "p_over", "edge"], errors="ignore")
+    return result.sort_values("match_ratio", ascending=False, na_position="last")
