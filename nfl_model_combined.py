@@ -99,6 +99,11 @@ def pull_rosters(years: list[int]) -> pd.DataFrame:
     return df.to_pandas()
 
 
+def pull_depth_charts(years: list[int]) -> pd.DataFrame:
+    df = nfl.load_depth_charts(seasons=years)
+    return df.to_pandas()
+
+
 # ---------------------------------------------------------------------------
 # 2. COVERAGE % AGGREGATION (per defense, by team)
 # ---------------------------------------------------------------------------
@@ -494,6 +499,98 @@ def calc_kicking_mu(kicker_player_stats_row: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 5b. FANTASY POINTS CALCULATION (offense + kicker)
+# ---------------------------------------------------------------------------
+
+def calc_offense_fantasy_points(player_stats_row: dict) -> float:
+    """
+    Full PPR offensive fantasy scoring, using confirmed real player_stats columns:
+      passing_yards, passing_tds, passing_interceptions,
+      rushing_yards, rushing_tds,
+      receptions, receiving_yards, receiving_tds,
+      rushing_fumbles_lost, receiving_fumbles_lost, sack_fumbles_lost,
+      passing_2pt_conversions, rushing_2pt_conversions, receiving_2pt_conversions
+
+    Scoring rules (as provided):
+      Passing Yards: 0.04/yd | Passing TD: 4 | INT: -1
+      Rushing Yards: 0.1/yd | Rushing TD: 6
+      Receptions: 1 (Full PPR) | Receiving Yards: 0.1/yd | Receiving TD: 6
+      Fumbles Lost: -1 | 2-Point Conversion: 2
+      Offensive Fumble Recovery TD: 6 | Kick/Punt/FG Return TD: 6
+
+    Applies uniformly across QB/RB/WR/TE - a WR's passing terms simply
+    evaluate to 0 since they have no passing stats, same for a QB's
+    receiving terms, etc.
+
+    NOTE: qualifying rule (1+ offensive snap or return TD) should be checked
+    upstream using snap_counts (offense_snaps > 0) before calling this, since
+    player_stats alone doesn't carry a snap-participation flag.
+    """
+    r = player_stats_row
+    points = 0.0
+    points += r.get("passing_yards", 0) * 0.04
+    points += r.get("passing_tds", 0) * 4
+    points += r.get("passing_interceptions", 0) * -1
+    points += r.get("rushing_yards", 0) * 0.1
+    points += r.get("rushing_tds", 0) * 6
+    points += r.get("receptions", 0) * 1
+    points += r.get("receiving_yards", 0) * 0.1
+    points += r.get("receiving_tds", 0) * 6
+
+    fumbles_lost = (
+        r.get("rushing_fumbles_lost", 0)
+        + r.get("receiving_fumbles_lost", 0)
+        + r.get("sack_fumbles_lost", 0)
+    )
+    points += fumbles_lost * -1
+
+    two_pt = (
+        r.get("passing_2pt_conversions", 0)
+        + r.get("rushing_2pt_conversions", 0)
+        + r.get("receiving_2pt_conversions", 0)
+    )
+    points += two_pt * 2
+
+    # Return TDs (special_teams_tds) and offensive fumble recovery TDs are not
+    # cleanly broken out in player_stats as separate columns - special_teams_tds
+    # exists and can be added at 6pts/each; offensive fumble recovery TD isn't
+    # a distinct column and would need pbp-level detection if you want it exact.
+    points += r.get("special_teams_tds", 0) * 6
+
+    return round(points, 2)
+
+
+def calc_kicker_fantasy_points(player_stats_row: dict) -> float:
+    """
+    Kicker fantasy scoring, using confirmed real player_stats columns:
+      fg_made_0_19, fg_made_20_29, fg_made_30_39 (all = "0-39 yard" bucket, 3pts each)
+      fg_made_40_49 (4pts), fg_made_50_59 + fg_made_60_ (both = "50+", 5pts each)
+      fg_missed_* (any distance, -1pt each)
+      pat_made (1pt), pat_missed (-1pt)
+    """
+    r = player_stats_row
+    points = 0.0
+
+    fg_0_39 = r.get("fg_made_0_19", 0) + r.get("fg_made_20_29", 0) + r.get("fg_made_30_39", 0)
+    points += fg_0_39 * 3
+    points += r.get("fg_made_40_49", 0) * 4
+    fg_50_plus = r.get("fg_made_50_59", 0) + r.get("fg_made_60_", 0)
+    points += fg_50_plus * 5
+
+    fg_missed_total = (
+        r.get("fg_missed_0_19", 0) + r.get("fg_missed_20_29", 0)
+        + r.get("fg_missed_30_39", 0) + r.get("fg_missed_40_49", 0)
+        + r.get("fg_missed_50_59", 0) + r.get("fg_missed_60_", 0)
+    )
+    points += fg_missed_total * -1
+
+    points += r.get("pat_made", 0) * 1
+    points += r.get("pat_missed", 0) * -1
+
+    return round(points, 2)
+
+
+# ---------------------------------------------------------------------------
 # 6. PROBABILITY / EDGE / QUALITY SCORING (mirrors rescore_quality_mu_row from MLB tool)
 # ---------------------------------------------------------------------------
 
@@ -536,13 +633,132 @@ def calc_quality_score(matchup_exploit_strength: float, sample_size_games: int,
 # 7. FULL SLATE SCAN (mirrors scan_full_slate_quality_mu from MLB tool)
 # ---------------------------------------------------------------------------
 
-def scan_full_slate_nfl(week: int, season: int) -> pd.DataFrame:
+def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     """
-    Placeholder for the weekly full-slate scanner. NFL has far fewer
-    confirmed players/games per week than MLB (1 game per team per week,
-    ~14-16 games max vs MLB's larger nightly slate), so this should be
-    lighter-weight than scan_full_slate_quality_mu() while following the
-    same shape: pull data -> compute mu per prop per player -> merge live
-    lines -> score edge/p_over/quality -> return one combined DataFrame.
+    Pulls and merges every data source needed for one week's slate, returning
+    a single player-level DataFrame with mu inputs for every prop type ready
+    to score. Lines are NOT auto-pulled - the "line" column is left for
+    manual/adjustable entry per row in the Streamlit UI, same as the MLB
+    tool's adjustable Best Edges table (Underdog auto-pull was unreliable on
+    the MLB tool, and PrizePicks auto-pull was decided against too - staying
+    fully manual for lines going forward).
+
+    Returns columns including (not exhaustive):
+      gsis_id, player_display_name, team, position, prop_type,
+      mu inputs specific to each prop type, quality_score inputs
     """
-    raise NotImplementedError("Wire this up once data pulls are confirmed live.")
+    schedules_df = pull_schedules([season])
+    rosters_df = pull_rosters([season])
+    depth_charts_df = pull_depth_charts([season])
+    player_stats_df = pull_player_stats([season])
+    ngs_pass_df = pull_ngs("passing", [season])
+    ngs_rush_df = pull_ngs("rushing", [season])
+    ngs_rec_df = pull_ngs("receiving", [season])
+    pbp_df = pull_pbp([season])
+    participation_df = pull_participation([season])
+    ftn_df = pull_ftn_charting([season])
+
+    coverage_profile = build_coverage_profile(participation_df, pbp_df)
+    box_def_profile, box_off_profile = build_box_count_profile(ftn_df)
+    explosive_rates = build_explosive_rates(pbp_df)
+
+    this_week_games = schedules_df[
+        (schedules_df["season"] == season) & (schedules_df["week"] == week)
+    ]
+    teams_this_week = pd.concat([
+        this_week_games["home_team"], this_week_games["away_team"]
+    ]).unique().tolist()
+
+    rows = []
+
+    # --- Passing props ---
+    qb_rows = ngs_pass_df[
+        (ngs_pass_df["season"] == season) & (ngs_pass_df["week"] == week)
+        & (ngs_pass_df["team_abbr"].isin(teams_this_week))
+    ]
+    for _, qb in qb_rows.iterrows():
+        raw_attempts, cpoe, adot, aggressiveness = calc_passing_mu(qb, None, None)
+        rows.append({
+            "gsis_id": qb.get("player_gsis_id"), "player_display_name": qb.get("player_display_name"),
+            "team": qb.get("team_abbr"), "position": "QB", "prop_type": "pass_yards",
+            "mu_input_attempts": raw_attempts, "cpoe": cpoe, "adot": adot,
+        })
+
+    # --- Rushing props ---
+    rush_rows = ngs_rush_df[
+        (ngs_rush_df["season"] == season) & (ngs_rush_df["week"] == week)
+        & (ngs_rush_df["team_abbr"].isin(teams_this_week))
+    ]
+    team_rush_totals = rush_rows.groupby("team_abbr")["rush_attempts"].sum().to_dict()
+    for _, rb in rush_rows.iterrows():
+        team_total = team_rush_totals.get(rb.get("team_abbr"), 0)
+        rush_share, efficiency, box_faced = calc_rushing_mu(rb, team_total, None)
+        rows.append({
+            "gsis_id": rb.get("player_gsis_id"), "player_display_name": rb.get("player_display_name"),
+            "team": rb.get("team_abbr"), "position": "RB", "prop_type": "rush_yards",
+            "rush_share": rush_share, "efficiency": efficiency, "box_stack_faced": box_faced,
+        })
+
+    # --- Receiving props ---
+    rec_rows = ngs_rec_df[
+        (ngs_rec_df["season"] == season) & (ngs_rec_df["week"] == week)
+        & (ngs_rec_df["team_abbr"].isin(teams_this_week))
+    ]
+    ps_this_week = player_stats_df[
+        (player_stats_df["season"] == season) & (player_stats_df["week"] == week)
+    ]
+    for _, wr in rec_rows.iterrows():
+        ps_match = ps_this_week[ps_this_week["gsis_id"] == wr.get("player_gsis_id")]
+        ps_row = ps_match.iloc[0].to_dict() if not ps_match.empty else {}
+        target_share, wopr, adot, yac_oe, separation = calc_receiving_mu(wr, ps_row, None)
+        rows.append({
+            "gsis_id": wr.get("player_gsis_id"), "player_display_name": wr.get("player_display_name"),
+            "team": wr.get("team_abbr"), "position": wr.get("player_position"), "prop_type": "rec_yards",
+            "target_share": target_share, "wopr": wopr, "adot": adot,
+            "yac_oe": yac_oe, "separation": separation,
+        })
+
+    # --- Fantasy points (offense: QB, RB, WR, TE) ---
+    offense_positions = ["QB", "RB", "WR", "TE"]
+    fantasy_pool = ps_this_week[
+        (ps_this_week["team"].isin(teams_this_week))
+        & (ps_this_week["position"].isin(offense_positions))
+    ]
+    for _, ps_row in fantasy_pool.iterrows():
+        fantasy_pts = calc_offense_fantasy_points(ps_row.to_dict())
+        rows.append({
+            "gsis_id": ps_row.get("gsis_id"), "player_display_name": ps_row.get("player_display_name"),
+            "team": ps_row.get("team"), "position": ps_row.get("position"), "prop_type": "fantasy_points",
+            "mu_fantasy_points": fantasy_pts,
+        })
+
+    # --- Kicker fantasy + FG/XP props ---
+    kicker_rows = ps_this_week[
+        (ps_this_week["position"] == "K") & (ps_this_week["team"].isin(teams_this_week))
+    ]
+    for _, k_row in kicker_rows.iterrows():
+        kicking_data = calc_kicking_mu(k_row.to_dict())
+        kicker_fantasy = calc_kicker_fantasy_points(k_row.to_dict())
+        rows.append({
+            "gsis_id": k_row.get("gsis_id"), "player_display_name": k_row.get("player_display_name"),
+            "team": k_row.get("team"), "position": "K", "prop_type": "kicker_fantasy",
+            **kicking_data, "mu_fantasy_points": kicker_fantasy,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def scan_full_slate_nfl(season: int, week: int) -> pd.DataFrame:
+    """
+    Weekly full-slate scanner. Builds the slate (see build_weekly_slate),
+    but does NOT auto-fill lines or compute edge/p_over - those are added
+    in the Streamlit UI via an adjustable "line" column per row, same as
+    the MLB tool's adjustable Best Edges table. quality_score and mu
+    components are pre-computed here; edge/p_over recompute live in the UI
+    whenever the user edits a line.
+    """
+    slate_df = build_weekly_slate(season, week)
+    slate_df["line"] = np.nan  # user fills this in per row in the UI
+    slate_df["p_over"] = np.nan
+    slate_df["edge"] = np.nan
+    return slate_df
