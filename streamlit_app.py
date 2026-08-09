@@ -80,56 +80,49 @@ if st.session_state.slate_df is not None and not st.session_state.slate_df.empty
 
     if st.session_state.backtest_mode:
         # -----------------------------------------------------------
-        # BACKTEST DISPLAY: mu vs actual, sorted by biggest miss
+        # BACKTEST DISPLAY: only significant surprises among real starters
         # -----------------------------------------------------------
-        st.subheader(f"Backtest — Week {week}, {season}: projected mu vs actual result")
+        st.subheader(f"Backtest — Week {week}, {season}: significant surprises")
         st.caption(
-            "mu was computed using only weeks before this one - actual is what "
-            "really happened. Only players who actually played that week are "
-            "shown (backups/inactives are excluded). Sorted by biggest miss first."
-        )
-
-        min_games_filter = st.slider(
-            "Minimum games sampled (higher = mu backed by more real history)",
-            0, 8, 3,
-            help="Filters out rows where mu was based on very little (or zero) real "
-                 "prior data, so a 'big miss' actually reflects the model being wrong "
-                 "rather than just not having enough history yet.",
-        )
-        backtest_filtered = filtered[filtered["games_sampled"] >= min_games_filter] if "games_sampled" in filtered.columns else filtered
-
-        # Simplified view: no need to read sigma/miss/abs_miss as numbers.
-        # match_ratio = abs_miss / sigma (how many "typical swings" off the miss was).
-        # The whole row is colored green-to-pale based on this - dark green means
-        # mu closely tracked what actually happened, pale/white means it was a
-        # bigger surprise. Just look at the color, no math needed.
-        backtest_filtered = backtest_filtered.copy()
-        backtest_filtered["match_ratio"] = backtest_filtered.apply(
-            lambda r: (r["abs_miss"] / r["sigma"]) if pd.notna(r.get("sigma")) and r.get("sigma", 0) > 0 else np.nan,
-            axis=1,
+            "Only starters who actually played are shown, and only the games "
+            "where mu was meaningfully off (a line near mu would've been "
+            "mispriced) - close matches are filtered out automatically. "
+            "Sorted biggest surprise first."
         )
 
         display_cols = ["player_display_name", "team", "position", "prop_type", "mu", "actual", "miss"]
-        display_cols = [c for c in display_cols if c in backtest_filtered.columns]
-        backtest_sorted = backtest_filtered[display_cols + ["match_ratio"]].sort_values(
-            "match_ratio", ascending=True, na_position="last"
-        )
+        display_cols = [c for c in display_cols if c in filtered.columns]
+        backtest_sorted = filtered[display_cols + ["match_ratio"]].sort_values(
+            "match_ratio", ascending=False, na_position="last"
+        ) if "match_ratio" in filtered.columns else filtered[display_cols]
         display_only = backtest_sorted[display_cols]
 
+        # Normalize color scale to the ACTUAL range of match_ratio present in
+        # this filtered result set, not a fixed 0-3.0 scale - since results
+        # are now pre-filtered to match_ratio >= 2.0, a fixed scale calibrated
+        # for the old 0-3.0 range compressed everything into the dim tail end
+        # (that was the bug: every row looked uniformly dark because the
+        # "bright" part of the old scale had already been filtered out).
+        valid_ratios = backtest_sorted["match_ratio"].dropna() if "match_ratio" in backtest_sorted.columns else pd.Series(dtype=float)
+        ratio_min = valid_ratios.min() if not valid_ratios.empty else 0
+        ratio_max = valid_ratios.max() if not valid_ratios.empty else 1
+        ratio_range = max(ratio_max - ratio_min, 0.001)  # avoid divide-by-zero
+
         def _row_color(row):
-            ratio = backtest_sorted.loc[row.name, "match_ratio"]
+            ratio = backtest_sorted.loc[row.name, "match_ratio"] if "match_ratio" in backtest_sorted.columns else np.nan
             if pd.isna(ratio):
                 return [""] * len(row)
-            capped = min(ratio, 3.0)
-            intensity = max(0, 1 - (capped / 3.0))
+            # smallest surviving ratio (least extreme, but still past the
+            # threshold) = brightest; largest surviving ratio (most extreme
+            # outlier) = fades to background
+            intensity = max(0, 1 - ((ratio - ratio_min) / ratio_range))
             return [f"background-color: rgba(0, 140, 0, {intensity:.2f})"] * len(row)
 
         styled_backtest = display_only.style.apply(_row_color, axis=1)
         st.dataframe(styled_backtest, use_container_width=True)
-        st.caption("Brighter/more visible green = mu closely matched what actually happened, "
-                   "just like the MLB tool. Fading toward the dark background = bigger surprise.")
+        st.caption("Brighter green = closer to the significance threshold. Fading toward the dark background = the most extreme, rarest surprises.")
 
-        valid = backtest_filtered.dropna(subset=["mu", "actual"])
+        valid = filtered.dropna(subset=["mu", "actual"])
         if not valid.empty:
             mcol1, mcol2, mcol3 = st.columns(3)
             with mcol1:
@@ -137,7 +130,7 @@ if st.session_state.slate_df is not None and not st.session_state.slate_df.empty
             with mcol2:
                 st.metric("Mean miss (bias)", round(valid["miss"].mean(), 1))
             with mcol3:
-                st.metric("Rows with a real comparison", len(valid))
+                st.metric("Significant surprises found", len(valid))
 
     else:
         # -----------------------------------------------------------
