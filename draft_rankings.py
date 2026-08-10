@@ -190,7 +190,9 @@ def build_season_projection(player_gsis_id: str, position: str,
     games_played = len(history)
     ppg = per_game_points.mean()
 
-    projected_games = min(games_in_season, games_played + 2)
+    # project forward at the same per-game rate across a full season,
+    # capped at games_in_season (don't project beyond a real season length)
+    projected_games = min(games_in_season, games_played + 2)  # small bump assuming health, not full 17 blindly
     season_proj_points = round(ppg * projected_games, 1)
 
     return {
@@ -232,7 +234,14 @@ def compute_replacement_levels(projections_df: pd.DataFrame, league_settings: di
     """
     Computes the "replacement level" projected points at each position -
     the level of the last startable player league-wide, given THIS
-    league's team count and roster settings.
+    league's team count and roster settings. This is what makes rankings
+    actually specific to a 6-team league instead of generic industry
+    rankings built for a standard 10-12 team league.
+
+    FLEX spots are split proportionally across RB/WR/TE based on how often
+    each position tends to fill FLEX in practice (rough industry-standard
+    split: RB ~45%, WR ~45%, TE ~10%) since FLEX doesn't belong to one
+    position exclusively.
     """
     num_teams = league_settings["num_teams"]
     starters = league_settings["starters"]
@@ -266,7 +275,13 @@ def compute_replacement_levels(projections_df: pd.DataFrame, league_settings: di
 
 
 def compute_vor(projections_df: pd.DataFrame, replacement_levels: dict) -> pd.DataFrame:
-    """Value Over Replacement = projected points minus that position's replacement level."""
+    """
+    Value Over Replacement = projected points minus that position's
+    replacement level. This is the actual number to rank/draft by - raw
+    projected points alone misrank across positions (a low-scarcity
+    position's "good" player is worth less than a scarce position's
+    "good" player at the same raw point total).
+    """
     df = projections_df.copy()
     df["replacement_level"] = df["position"].map(replacement_levels)
     df["vor"] = df["season_proj_points"] - df["replacement_level"]
@@ -280,6 +295,10 @@ def build_defense_season_projection(team: str, player_stats_df: pd.DataFrame, sc
     pipeline before (calc_team_defense_fantasy_points existed but nothing
     ever called it in build_yahoo_style_rankings, so zero defenses showed
     up in rankings at all despite the league requiring 1 DEF starter).
+
+    Points allowed per game is derived from schedules_df (the opponent's
+    final score that game), since player_stats doesn't carry a points-
+    allowed field directly.
     """
     prior_season = projection_season - 1
     team_defense_stats = pull_team_defense_stats([prior_season])
@@ -324,7 +343,10 @@ def pull_draft_picks(years: list[int]) -> pd.DataFrame:
     given draft years.
 
     UNVERIFIED: nflreadpy's load_draft_picks() function and its exact
-    column names haven't been confirmed against real live output yet.
+    column names haven't been confirmed against real live output yet -
+    this follows the standard nflverse naming convention (round, pick,
+    gsis_id, position, season = draft year), same as every other function
+    in this build that needs live verification before fully trusting it.
     """
     if nfl is None:
         return pd.DataFrame()
@@ -343,11 +365,17 @@ def build_rookie_production_curve(position: str, current_season: int, player_sta
     """
     THE ROOKIE FIX: since a rookie has zero prior-NFL-season stats,
     build_season_projection() would return NaN for them and they'd be
-    silently skipped from rankings entirely. This uses REAL historical
-    data: for the past `lookback_years` draft classes at this position,
-    what did players drafted in each round actually score as rookies?
+    silently skipped from rankings entirely - meaning every incoming
+    rookie class was completely absent, a real gap for an actual draft.
 
-    Returns {round_number: avg_rookie_season_points}.
+    Instead of guessing, this uses REAL historical data: for the past
+    `lookback_years` draft classes at this position, what did players
+    drafted in each round actually score as rookies (real fantasy points,
+    real games)? This builds a genuine draft-capital-to-production curve
+    from real outcomes, not a fabricated estimate.
+
+    Returns {round_number: avg_rookie_season_points}. Round 8 = undrafted
+    (treated as replacement-level/waiver-wire value).
     """
     curve = {}
     for round_num in range(1, 8):
@@ -374,7 +402,14 @@ def build_rookie_production_curve(position: str, current_season: int, player_sta
 
 def build_rookie_season_projection(player_gsis_id: str, position: str, current_season: int,
                                     draft_picks_df: pd.DataFrame, production_curve: dict) -> dict:
-    """Projects an incoming rookie using the draft-capital production curve."""
+    """
+    Projects an incoming rookie using the draft-capital production curve
+    (build_rookie_production_curve) rather than skipping them entirely.
+    Clearly a rougher proxy than stats-based projections for veterans -
+    draft capital predicts opportunity/talent evaluation reasonably well
+    on average, but obviously can't capture individual situation/fit the
+    way real stats can once a player has actually played.
+    """
     pick_row = draft_picks_df[
         (draft_picks_df["season"] == current_season) & (draft_picks_df["gsis_id"] == player_gsis_id)
     ]
@@ -396,7 +431,18 @@ def build_rookie_season_projection(player_gsis_id: str, position: str, current_s
 # ---------------------------------------------------------------------------
 
 def get_bye_weeks(season: int, schedules_df: pd.DataFrame) -> dict:
-    """Derives each team's bye week from which week they're missing from the schedule."""
+    """
+    Derives each team's bye week: the week where that team has no game
+    scheduled at all that season. Schedules doesn't have an explicit
+    "bye_week" column, so this is computed from which weeks a team is
+    missing from both home_team and away_team.
+
+    NOTE: load_ff_rankings() (used in detect_risers) already includes a
+    real "bye" column directly per player - that's actually the simpler
+    source once a player is matched to FantasyPros data. This function
+    stays as a fallback for players not found in that data (e.g. someone
+    FantasyPros hasn't ranked yet).
+    """
     season_games = schedules_df[schedules_df["season"] == season]
     all_weeks = set(season_games["week"].unique())
     all_teams = pd.concat([season_games["home_team"], season_games["away_team"]]).unique()
@@ -413,8 +459,13 @@ def get_bye_weeks(season: int, schedules_df: pd.DataFrame) -> dict:
 
 def build_yahoo_style_rankings(season: int, league_settings: dict = None) -> pd.DataFrame:
     """
-    Builds the full draft ranking table in Yahoo's standard display format.
-    Ranked by VOR (value over replacement) for the GIVEN league_settings.
+    Builds the full draft ranking table in Yahoo's standard display format:
+    Rank | Player | Pos | Team | Bye | Proj Pts | Pos Rank
+
+    Ranked by VOR (value over replacement) for the GIVEN league_settings -
+    fully adjustable now (team count, roster composition, PPR value) rather
+    than fixed to one hardcoded league. Falls back to the default 6-team
+    example settings if none provided.
     """
     if league_settings is None:
         league_settings = LEAGUE_SETTINGS
@@ -426,6 +477,9 @@ def build_yahoo_style_rankings(season: int, league_settings: dict = None) -> pd.
     draft_picks_df = pull_draft_picks([season])
     bye_weeks = get_bye_weeks(season, schedules_df)
 
+    # Build rookie production curves once per position (real historical
+    # draft-round-to-production data), used as a fallback for any player
+    # with zero prior-season history (rookies) instead of skipping them.
     rookie_curves = {
         pos: build_rookie_production_curve(pos, season, player_stats_df, draft_picks_df, ppr_value)
         for pos in ["QB", "RB", "WR", "TE"]
@@ -449,13 +503,16 @@ def build_yahoo_style_rankings(season: int, league_settings: dict = None) -> pd.
 
         is_rookie_projection = False
         if pd.isna(proj["season_proj_points"]) and position in rookie_curves and not draft_picks_df.empty:
+            # THE ROOKIE FIX: no prior-season stats means this is likely a
+            # rookie (or a player who didn't play last season) - use the
+            # draft-capital production curve instead of skipping them.
             rookie_proj = build_rookie_season_projection(gsis_id, position, season, draft_picks_df, rookie_curves[position])
             if pd.notna(rookie_proj["season_proj_points"]):
                 proj = rookie_proj
                 is_rookie_projection = True
 
         if pd.isna(proj["season_proj_points"]):
-            continue
+            continue  # genuinely no data to project from either way - skip rather than guess
 
         rows.append({
             "gsis_id": gsis_id,
@@ -473,6 +530,9 @@ def build_yahoo_style_rankings(season: int, league_settings: dict = None) -> pd.
     if projections_df.empty:
         return projections_df
 
+    # Add team DEFENSES - this was completely missing before (the scoring
+    # function existed but nothing ever called it here), so zero defenses
+    # showed up in rankings despite the league requiring 1 DEF starter.
     all_teams = rosters_df[rosters_df["season"] == season]["team"].dropna().unique().tolist()
     def_rows = []
     for team in all_teams:
@@ -480,7 +540,7 @@ def build_yahoo_style_rankings(season: int, league_settings: dict = None) -> pd.
         if pd.isna(proj["season_proj_points"]):
             continue
         def_rows.append({
-            "gsis_id": f"DEF_{team}",
+            "gsis_id": f"DEF_{team}",  # synthetic ID since defenses aren't individual players
             "player": f"{team} DEF",
             "position": "DEF",
             "team": team,
@@ -492,6 +552,15 @@ def build_yahoo_style_rankings(season: int, league_settings: dict = None) -> pd.
     if def_rows:
         projections_df = pd.concat([projections_df, pd.DataFrame(def_rows)], ignore_index=True)
 
+    # Flag position competition (e.g. Kamara/Etienne both landing on the same
+    # Saints backfield): when 2+ players at the same position on the same
+    # CURRENT-season team both have a real prior-season track record, their
+    # individual projections are each based on their OWN last-season workload
+    # as if they'd keep it entirely - but they're about to split one team's
+    # worth of volume. We deliberately do NOT try to guess the exact split
+    # (that's genuinely uncertain, even for real analysts, and a fabricated
+    # number would look more rigorous than it is) - instead this just flags
+    # it so you can manually discount rather than trust an inflated number.
     def _flag_competition(row):
         teammates = projections_df[
             (projections_df["team"] == row["team"])
@@ -525,28 +594,58 @@ def build_yahoo_style_rankings(season: int, league_settings: dict = None) -> pd.
 # ---------------------------------------------------------------------------
 
 def get_snake_pick_numbers(num_teams: int, draft_position: int, total_rounds: int) -> list:
-    """Computes YOUR overall pick number in each round of a snake draft."""
+    """
+    Computes YOUR overall pick number in each round of a snake draft.
+    Snake draft alternates direction each round: Round 1 goes 1->num_teams,
+    Round 2 goes num_teams->1, Round 3 goes 1->num_teams again, etc.
+
+    Example: 6-team league, drafting 3rd -> picks are 3, 10, 15, 22, 27, 34...
+    """
     picks = []
     for round_num in range(1, total_rounds + 1):
-        if round_num % 2 == 1:
+        if round_num % 2 == 1:  # odd round - normal order
             overall_pick = (round_num - 1) * num_teams + draft_position
-        else:
+        else:  # even round - reversed order
             overall_pick = (round_num - 1) * num_teams + (num_teams - draft_position + 1)
         picks.append({"round": round_num, "overall_pick": overall_pick})
     return picks
 
 
 def build_snake_draft_targets(rankings_df: pd.DataFrame, league_settings: dict,
-                               num_targets_per_round: int = 5) -> pd.DataFrame:
-    """For each of YOUR picks in a snake draft, shows the top remaining candidates by VOR."""
+                               num_targets_per_round: int = 5,
+                               sort_column: str = "vor", sort_ascending: bool = False) -> pd.DataFrame:
+    """
+    For each of YOUR picks in a snake draft, shows the top remaining
+    candidates at that point in the draft.
+
+    FIX: previously always sorted by pure stats-only "vor", completely
+    bypassing the blended_rank correction (which combines our stats with
+    FantasyPros public consensus to catch situational blind spots our
+    stats-only model can't see - e.g. a player whose target share is about
+    to jump because a teammate left in free agency, like Egbuka after
+    Mike Evans signed with the 49ers). That meant the snake draft
+    simulation could show a real riser going far too late, even though
+    the Full Rankings view (which DOES apply the blend) would rank them
+    more reasonably. sort_column/sort_ascending now let the caller pass
+    "blended_score" (ascending=True, since lower = better there) instead
+    of always defaulting to "vor" (descending, higher = better).
+
+    SIMPLIFYING ASSUMPTION FLAGGED: to know who's "still available" at your
+    pick, this simulates every OTHER team's pick as "take the best remaining
+    player by the same sort_column" - a reasonable default, but real
+    drafters have positional needs, personal preferences, and reach for
+    sleepers, so actual availability at your real draft will differ from
+    this simulation.
+    """
     num_teams = league_settings["num_teams"]
     draft_position = league_settings["draft_position"]
     starters = league_settings["starters"]
     total_rounds = sum(starters.values()) + league_settings["bench"]
 
     your_picks = get_snake_pick_numbers(num_teams, draft_position, total_rounds)
+    your_pick_numbers = {p["overall_pick"] for p in your_picks}
 
-    pool = rankings_df.sort_values("vor", ascending=False).reset_index(drop=True).copy()
+    pool = rankings_df.sort_values(sort_column, ascending=sort_ascending).reset_index(drop=True).copy()
     drafted_gsis_ids = set()
 
     results = []
@@ -555,6 +654,7 @@ def build_snake_draft_targets(rankings_df: pd.DataFrame, league_settings: dict,
         round_num = round_info["round"]
         target_pick = round_info["overall_pick"]
 
+        # simulate every pick leading up to (and not including) your pick
         while overall_pick_counter < target_pick - 1:
             overall_pick_counter += 1
             remaining = pool[~pool["gsis_id"].isin(drafted_gsis_ids)]
@@ -563,6 +663,7 @@ def build_snake_draft_targets(rankings_df: pd.DataFrame, league_settings: dict,
             top_pick = remaining.iloc[0]
             drafted_gsis_ids.add(top_pick["gsis_id"])
 
+        # now show top remaining candidates at YOUR pick
         remaining = pool[~pool["gsis_id"].isin(drafted_gsis_ids)]
         top_candidates = remaining.head(num_targets_per_round)
 
@@ -577,6 +678,8 @@ def build_snake_draft_targets(rankings_df: pd.DataFrame, league_settings: dict,
                 "vor": candidate["vor"],
             })
 
+        # advance simulation assuming you take the top remaining player,
+        # so later rounds' availability keeps making sense
         overall_pick_counter += 1
         if not remaining.empty:
             drafted_gsis_ids.add(remaining.iloc[0]["gsis_id"])
@@ -585,7 +688,29 @@ def build_snake_draft_targets(rankings_df: pd.DataFrame, league_settings: dict,
 
 
 def detect_risers(rankings_df: pd.DataFrame, season: int) -> pd.DataFrame:
-    """Compares our internally-computed rank against FantasyPros consensus."""
+    """
+    Compares our internally-computed overall_rank against FantasyPros
+    consensus rank (via nflreadpy's load_ff_rankings()) to flag players
+    our model ranks meaningfully HIGHER than public consensus does - i.e.
+    potential risers/undervalued players the public hasn't caught up to.
+
+    CONFIRMED real load_ff_rankings() columns: player, pos, team, bye, ecr
+    (Expert Consensus Rank - the real rank field), player_owned_yahoo
+    (actual real Yahoo ownership % - genuinely useful "public perception"
+    signal, arguably better than a generic ADP for this purpose).
+
+    NOTE: this is FantasyPros consensus (ecr), not Yahoo's own ADP
+    specifically (no free source found for Yahoo ADP directly) - flagged
+    as an honest substitute. player_owned_yahoo IS real Yahoo data though,
+    included as a secondary signal.
+
+    FIX: FantasyPros' own data already has a column literally called
+    "rank_delta" (their own metric, not ours) - our computed delta is
+    renamed to our_rank_delta to avoid a merge collision/overwrite.
+
+    our_rank_delta = ecr - our_rank. A large POSITIVE value means we rank
+    them much higher (earlier) than public consensus does - a riser.
+    """
     if nfl is None:
         return rankings_df.assign(fantasypros_ecr=np.nan, our_rank_delta=np.nan)
 
@@ -594,11 +719,21 @@ def detect_risers(rankings_df: pd.DataFrame, season: int) -> pd.DataFrame:
     except Exception:
         return rankings_df.assign(fantasypros_ecr=np.nan, our_rank_delta=np.nan)
 
+    # FIX: load_ff_rankings() has MULTIPLE rows per player (rankings get
+    # re-published with different scrape_date snapshots through the
+    # offseason). Merging without deduplicating first multiplies every row
+    # in rankings_df once per matching FantasyPros row - this was causing
+    # each player to show up repeated 5x (or however many snapshots exist).
+    # Keep only the most recent snapshot per player before merging.
     if "scrape_date" in ff_rankings.columns:
         ff_rankings = ff_rankings.sort_values("scrape_date").drop_duplicates(subset=["player"], keep="last")
     else:
         ff_rankings = ff_rankings.drop_duplicates(subset=["player"], keep="last")
 
+    # FIX: normalize names before matching, so suffix variations (e.g. our
+    # roster data saying "Travis Etienne" vs FantasyPros saying "Travis
+    # Etienne Jr.") don't silently fail to match and fall back to
+    # stats-only without any warning.
     def _normalize_name(name):
         if pd.isna(name):
             return name
@@ -624,7 +759,23 @@ def detect_risers(rankings_df: pd.DataFrame, season: int) -> pd.DataFrame:
 
 
 def build_draft_rankings_backtest(test_season: int, league_settings: dict = None) -> pd.DataFrame:
-    """Tests the stats-only projection against a real completed season."""
+    """
+    Tests the STATS-ONLY portion of the draft methodology by building
+    projections "as if drafting" for test_season (using test_season-1
+    stats + test_season rosters - the exact same logic build_yahoo_style_
+    rankings uses for a real upcoming draft), then comparing against REAL
+    test_season performance.
+
+    HONEST LIMITATION FLAGGED: this can only validate the pure stats-based
+    projection, NOT the blended_rank from compute_blended_rankings().
+    load_ff_rankings() only returns TODAY'S live FantasyPros snapshot -
+    there's no free historical archive of what FantasyPros said before a
+    past season, so there's no way to reconstruct what the blend would
+    have said for a prior draft. This tells you whether our own
+    historical-rate projection tends to be accurate on its own - useful
+    context for deciding how much weight to give it vs. public consensus,
+    but not a direct test of the blend itself.
+    """
     if league_settings is None:
         league_settings = LEAGUE_SETTINGS
     ppr_value = league_settings.get("ppr_value", 1.0)
@@ -662,7 +813,23 @@ def build_draft_rankings_backtest(test_season: int, league_settings: dict = None
 
 
 def compute_blended_rankings(rankings_df: pd.DataFrame, our_weight: float = 0.5) -> pd.DataFrame:
-    """Blends our stats-based rank with FantasyPros consensus rank."""
+    """
+    Blends our pure stats-based rank (overall_rank, built entirely from last
+    season's rate stats) with FantasyPros consensus rank (fantasypros_ecr) -
+    since public consensus DOES account for things our historical-rate model
+    structurally can't: new coordinators, scheme fits, offseason situational
+    buzz, injury recovery outlook, etc. Rather than pretend our stats-only
+    model captures those things, this leans on public expert knowledge as a
+    genuine input to correct for it, not just a comparison metric.
+
+    our_weight: 0.0 = pure FantasyPros consensus, 1.0 = pure our stats-only
+    rank, 0.5 = even blend (default). Rows with no FantasyPros match fall
+    back to our own rank alone (can't blend with a missing value).
+
+    Adds blended_rank as a new sortable column - the recommended default
+    view, since it corrects for the known situational blind spot while
+    still keeping our_rank_delta/overall_rank visible for transparency.
+    """
     df = rankings_df.copy()
     if "fantasypros_ecr" not in df.columns:
         df["blended_rank"] = df["overall_rank"]
@@ -673,7 +840,7 @@ def compute_blended_rankings(rankings_df: pd.DataFrame, our_weight: float = 0.5)
     def _blend(row):
         our_pct = row["overall_rank"] / max_rank
         if pd.isna(row.get("fantasypros_ecr")):
-            return row["overall_rank"]
+            return row["overall_rank"]  # no public data to blend with - use our rank alone
         public_pct = row["fantasypros_ecr"] / max_rank
         blended_pct = (our_weight * our_pct) + ((1 - our_weight) * public_pct)
         return blended_pct * max_rank
