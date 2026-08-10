@@ -167,12 +167,23 @@ if mode == "Draft Rankings":
         elif view == "Round-by-Round Targets (snake draft)":
             st.subheader(f"Your picks — drafting #{current_settings['draft_position']} in a {current_settings['num_teams']}-team snake draft")
             st.caption(
-                "Assumes every other team drafts best-remaining-VOR each pick - a "
-                "reasonable planning baseline, not a guarantee of your real draft. "
-                "Top 5 remaining candidates shown at each of your picks."
+                "FIXED: this now uses the SAME blended ranking (our stats + FantasyPros "
+                "consensus) as the Full Rankings view, instead of pure stats-only VOR. "
+                "Previously this bypassed the blend entirely, which could show a real "
+                "riser (e.g. a receiver whose role just expanded because a teammate left "
+                "in free agency) going far too late. Assumes every other team also drafts "
+                "off the blended ranking each pick - a reasonable planning baseline, not "
+                "a guarantee of your real draft."
             )
+            snake_blend_weight = st.slider(
+                "Blend weight: pure stats ← → public consensus", 0.0, 1.0, 0.5, 0.1, key="snake_blend_weight",
+            )
+            rankings_for_snake = compute_blended_rankings(rankings, our_weight=snake_blend_weight)
             with st.spinner("Simulating snake draft..."):
-                targets = build_snake_draft_targets(rankings, current_settings)
+                targets = build_snake_draft_targets(
+                    rankings_for_snake, current_settings,
+                    sort_column="blended_score", sort_ascending=True,
+                )
             if not targets.empty:
                 for round_num in sorted(targets["round"].unique()):
                     round_targets = targets[targets["round"] == round_num]
@@ -360,7 +371,8 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
 
         base_display_cols = ["player_display_name", "team", "position", "prop_type",
                               "mu", "sigma", "opponent", "opp_dominant_coverage",
-                              "opp_dominant_coverage_pct", "opp_man_pct", "opp_zone_pct",
+                              "opp_dominant_coverage_pct", "opp_num_elevated_coverages",
+                              "opp_man_pct", "opp_zone_pct",
                               "quality_score", "line", "p_over", "edge"]
         # Include the full individual coverage-type breakdown AND every
         # advanced metric grade (QB/WR/TE/RB own performance grades, plus
