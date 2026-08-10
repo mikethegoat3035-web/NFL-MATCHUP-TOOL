@@ -99,11 +99,6 @@ def pull_rosters(years: list[int]) -> pd.DataFrame:
     return df.to_pandas()
 
 
-def pull_depth_charts(years: list[int]) -> pd.DataFrame:
-    df = nfl.load_depth_charts(seasons=years)
-    return df.to_pandas()
-
-
 # ---------------------------------------------------------------------------
 # 2. COVERAGE % AGGREGATION (per defense, by team)
 # ---------------------------------------------------------------------------
@@ -618,17 +613,14 @@ def calc_kicking_mu(kicker_player_stats_row: dict) -> dict:
 
 def calc_offense_fantasy_points(player_stats_row: dict, ppr_value: float = 1.0) -> float:
     """
-    Full PPR offensive fantasy scoring, using confirmed real player_stats columns:
-      passing_yards, passing_tds, passing_interceptions,
-      rushing_yards, rushing_tds,
-      receptions, receiving_yards, receiving_tds,
-      rushing_fumbles_lost, receiving_fumbles_lost, sack_fumbles_lost,
-      passing_2pt_conversions, rushing_2pt_conversions, receiving_2pt_conversions
+    Offensive fantasy scoring, using confirmed real player_stats columns.
+    ppr_value is now adjustable: 1.0 = full PPR, 0.5 = half PPR, 0.0 = standard
+    (no reception points) - previously hardcoded to full PPR only.
 
-    Scoring rules (as provided):
+    Scoring rules (as provided, with receptions now adjustable):
       Passing Yards: 0.04/yd | Passing TD: 4 | INT: -1
       Rushing Yards: 0.1/yd | Rushing TD: 6
-      Receptions: 1 (Full PPR) | Receiving Yards: 0.1/yd | Receiving TD: 6
+      Receptions: ppr_value (default 1.0/Full PPR) | Receiving Yards: 0.1/yd | Receiving TD: 6
       Fumbles Lost: -1 | 2-Point Conversion: 2
       Offensive Fumble Recovery TD: 6 | Kick/Punt/FG Return TD: 6
 
@@ -739,6 +731,379 @@ def calc_quality_score(matchup_exploit_strength: float, sample_size_games: int,
     return round(min(base + sample_bonus + coverage_bonus, 100), 1)
 
 
+def build_player_coverage_efficiency(player_gsis_id: str, role: str, season: int,
+                                      participation_df: pd.DataFrame, pbp_df: pd.DataFrame,
+                                      min_plays_per_bucket: int = 8) -> dict:
+    """
+    Computes a player's REAL historical efficiency (yards per play) against
+    man coverage vs zone coverage specifically, using their own play-level
+    history - not an approximation, an actual data-driven split.
+
+    role: "receiver" or "passer". Joins participation_df (which carries
+    defense_man_zone_type per play) to pbp_df on (game_id, play_id) - same
+    join fix already used in build_coverage_profile() - then filters to
+    plays where this specific player was the receiver/passer.
+
+    Returns {"man_ypp": x, "zone_ypp": y, "overall_ypp": z,
+             "man_plays": n, "zone_plays": n} - ypp = yards per play.
+    Buckets with fewer than min_plays_per_bucket plays return NaN for that
+    bucket (too small a sample to trust a real split), and the caller
+    should fall back to no adjustment in that case rather than react to
+    noise.
+    """
+    merged = participation_df.merge(
+        pbp_df[["game_id", "play_id", "defteam", "posteam",
+                "receiver_player_id", "receiving_yards",
+                "passer_player_id", "passing_yards"]],
+        left_on=["nflverse_game_id", "play_id"],
+        right_on=["game_id", "play_id"],
+        how="left",
+    )
+
+    player_col = "receiver_player_id" if role == "receiver" else "passer_player_id"
+    yards_col = "receiving_yards" if role == "receiver" else "passing_yards"
+
+    player_plays = merged[
+        (merged[player_col] == player_gsis_id) & merged["defense_man_zone_type"].notna()
+    ]
+
+    def _bucket_avg(coverage_type):
+        bucket = player_plays[player_plays["defense_man_zone_type"] == coverage_type]
+        n = len(bucket)
+        if n < min_plays_per_bucket:
+            return np.nan, n
+        return round(bucket[yards_col].mean(), 2), n
+
+    man_avg, man_n = _bucket_avg("Man")
+    zone_avg, zone_n = _bucket_avg("Zone")
+    overall_avg = round(player_plays[yards_col].mean(), 2) if len(player_plays) > 0 else np.nan
+
+    return {
+        "man_ypp": man_avg, "zone_ypp": zone_avg, "overall_ypp": overall_avg,
+        "man_plays": man_n, "zone_plays": zone_n,
+    }
+
+
+def calc_coverage_adjusted_mu(base_mu: float, coverage_efficiency: dict,
+                               opp_man_pct: float, opp_zone_pct: float,
+                               max_adjustment: float = 0.3) -> float:
+    """
+    Actually ADJUSTS mu based on the player's real man/zone efficiency split
+    and this week's specific opponent's man/zone tendency - not just a
+    quality_score side signal, a real change to the projection itself.
+
+    If either bucket lacks enough plays to trust (NaN from
+    build_player_coverage_efficiency), falls back to base_mu unadjusted
+    rather than react to a small, noisy sample.
+
+    Adjustment is capped at +/- max_adjustment (default 30%) so a single
+    favorable/unfavorable matchup can't swing mu to an unrealistic degree
+    even with a real, decent-sized sample behind it.
+    """
+    man_ypp = coverage_efficiency.get("man_ypp")
+    zone_ypp = coverage_efficiency.get("zone_ypp")
+    overall_ypp = coverage_efficiency.get("overall_ypp")
+
+    if pd.isna(man_ypp) or pd.isna(zone_ypp) or pd.isna(overall_ypp) or overall_ypp == 0:
+        return base_mu  # not enough real data to trust an adjustment
+
+    expected_ypp_this_matchup = (opp_man_pct * man_ypp) + (opp_zone_pct * zone_ypp)
+    multiplier = expected_ypp_this_matchup / overall_ypp
+    multiplier = max(1 - max_adjustment, min(1 + max_adjustment, multiplier))
+
+    return round(base_mu * multiplier, 2)
+
+
+def get_opponent_this_week(team: str, season: int, week: int, schedules_df: pd.DataFrame) -> str:
+    """
+    Looks up who a team plays this week, using schedules_df's home_team/away_team.
+    Returns None if the team has a bye or isn't found.
+    """
+    game = schedules_df[
+        (schedules_df["season"] == season) & (schedules_df["week"] == week)
+        & ((schedules_df["home_team"] == team) | (schedules_df["away_team"] == team))
+    ]
+    if game.empty:
+        return None
+    g = game.iloc[0]
+    return g["away_team"] if g["home_team"] == team else g["home_team"]
+
+
+def get_full_coverage_breakdown(coverage_row: dict) -> dict:
+    """
+    Returns the FULL individual coverage-type breakdown (Cover 1 %, Cover 2 %,
+    Cover 3 %, Cover 4 %, Cover 6 %, etc. - whichever coverage labels actually
+    appear in the charted data), not just the single dominant one. Each
+    specific coverage type gets its own real percentage from
+    build_coverage_profile(), e.g. "Cover 1: 19%, Cover 2: 17.5%" - this
+    surfaces all of them, prefixed opp_cov_<type>_pct, so the full grading
+    is visible, not just whichever one happens to be highest.
+    """
+    if not coverage_row:
+        return {}
+    excluded = {"defteam", "n_plays", "man_pct", "zone_pct"}
+    return {
+        f"opp_cov_{k.replace('_pct', '')}": v
+        for k, v in coverage_row.items()
+        if k.endswith("_pct") and k not in excluded and pd.notna(v)
+    }
+
+
+def get_player_grades(gsis_id: str, metrics_df: pd.DataFrame) -> dict:
+    """
+    Looks up a player's row in an advanced-metrics table (built by
+    build_qb_advanced_metrics/build_receiver_advanced_metrics/
+    build_rb_advanced_metrics) and returns only the *_grade columns plus
+    their raw values, ready to merge into a scanner row.
+    """
+    if metrics_df is None or metrics_df.empty or "gsis_id" not in metrics_df.columns:
+        return {}
+    match = metrics_df[metrics_df["gsis_id"] == gsis_id]
+    if match.empty:
+        return {}
+    row = match.iloc[0].to_dict()
+    return {k: v for k, v in row.items() if k != "gsis_id" and pd.notna(v)}
+
+
+def get_defense_grades(team: str, def_metrics_df: pd.DataFrame) -> dict:
+    """Same idea as get_player_grades(), but for the defense-metrics table (keyed by defteam)."""
+    if def_metrics_df is None or def_metrics_df.empty or "defteam" not in def_metrics_df.columns:
+        return {}
+    match = def_metrics_df[def_metrics_df["defteam"] == team]
+    if match.empty:
+        return {}
+    row = match.iloc[0].to_dict()
+    return {f"opp_{k}": v for k, v in row.items() if k != "defteam" and pd.notna(v)}
+
+
+def calc_percentile_grade(value: float, comparison_series: pd.Series) -> float:
+    """
+    Generic 0-100 percentile grade for ANY metric against its league-wide
+    distribution this season - one reusable function instead of hand-coded
+    grading logic per stat, so every advanced metric gets the same
+    consistent, color-codable treatment.
+    """
+    if pd.isna(value) or comparison_series.dropna().empty:
+        return np.nan
+    valid = comparison_series.dropna()
+    return round((valid < value).mean() * 100, 1)
+
+
+def build_qb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFrame,
+                               ngs_pass_df: pd.DataFrame, participation_df: pd.DataFrame,
+                               pbp_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    QB advanced metrics: EPA/play, CPOE, success rate, passer_rating, aDOT,
+    aggressiveness, air-EPA vs YAC-EPA split, pressure rate faced.
+    Uses weeks BEFORE the target week only (same leak-avoidance as mu).
+    Each metric gets a 0-100 percentile grade against this season's QBs.
+    """
+    hist_stats = player_stats_df[
+        (player_stats_df["season"] == season) & (player_stats_df["week"] < week)
+        & (player_stats_df["position"] == "QB")
+    ]
+    if hist_stats.empty:
+        return pd.DataFrame()
+
+    agg = hist_stats.groupby("gsis_id").agg(
+        passing_epa=("passing_epa", "mean"),
+        passing_yards=("passing_yards", "sum"),
+        attempts=("attempts", "sum"),
+    ).reset_index()
+
+    hist_ngs = ngs_pass_df[(ngs_pass_df["season"] == season) & (ngs_pass_df["week"] < week)]
+    ngs_agg = hist_ngs.groupby("player_gsis_id").agg(
+        cpoe=("completion_percentage_above_expectation", "mean"),
+        adot=("avg_intended_air_yards", "mean"),
+        aggressiveness=("aggressiveness", "mean"),
+        passer_rating=("passer_rating", "mean"),
+    ).reset_index().rename(columns={"player_gsis_id": "gsis_id"})
+
+    hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week) & (pbp_df["play_type"] == "pass")]
+    pbp_agg = hist_pbp.groupby("passer_player_id").agg(
+        success_rate=("success", "mean"),
+        air_epa=("air_epa", "mean"),
+        yac_epa=("yac_epa", "mean"),
+    ).reset_index().rename(columns={"passer_player_id": "gsis_id"})
+
+    merged = agg.merge(ngs_agg, on="gsis_id", how="left").merge(pbp_agg, on="gsis_id", how="left")
+
+    for col in ["passing_epa", "cpoe", "success_rate", "passer_rating", "adot", "aggressiveness"]:
+        if col in merged.columns:
+            merged[f"{col}_grade"] = merged[col].apply(lambda v: calc_percentile_grade(v, merged[col]))
+
+    return merged
+
+
+def build_receiver_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFrame,
+                                     ngs_rec_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    WR/TE advanced metrics: target_share, air_yards_share, wopr, racr,
+    receiving_epa (season-aggregated, already in player_stats), separation,
+    cushion, catch_percentage, YAC-over-expected.
+    """
+    hist_stats = player_stats_df[
+        (player_stats_df["season"] == season) & (player_stats_df["week"] < week)
+        & (player_stats_df["position"].isin(["WR", "TE", "RB"]))
+    ]
+    if hist_stats.empty:
+        return pd.DataFrame()
+
+    agg = hist_stats.groupby("gsis_id").agg(
+        target_share=("target_share", "mean"),
+        air_yards_share=("air_yards_share", "mean"),
+        wopr=("wopr", "mean"),
+        racr=("racr", "mean"),
+        receiving_epa=("receiving_epa", "mean"),
+    ).reset_index()
+
+    hist_ngs = ngs_rec_df[(ngs_rec_df["season"] == season) & (ngs_rec_df["week"] < week)]
+    ngs_agg = hist_ngs.groupby("player_gsis_id").agg(
+        avg_separation=("avg_separation", "mean"),
+        avg_cushion=("avg_cushion", "mean"),
+        catch_percentage=("catch_percentage", "mean"),
+        yac_above_expectation=("avg_yac_above_expectation", "mean"),
+    ).reset_index().rename(columns={"player_gsis_id": "gsis_id"})
+
+    merged = agg.merge(ngs_agg, on="gsis_id", how="left")
+
+    for col in ["target_share", "wopr", "racr", "receiving_epa", "avg_separation",
+                "catch_percentage", "yac_above_expectation"]:
+        if col in merged.columns:
+            merged[f"{col}_grade"] = merged[col].apply(lambda v: calc_percentile_grade(v, merged[col]))
+
+    return merged
+
+
+def build_rb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFrame,
+                               ngs_rush_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    RB advanced metrics: rushing_epa (season-aggregated), rush_yards_over_
+    expected_per_att, efficiency, avg_time_to_los, percent_attempts_gte_
+    eight_defenders (box rate faced).
+    """
+    hist_stats = player_stats_df[
+        (player_stats_df["season"] == season) & (player_stats_df["week"] < week)
+        & (player_stats_df["position"] == "RB")
+    ]
+    if hist_stats.empty:
+        return pd.DataFrame()
+
+    agg = hist_stats.groupby("gsis_id").agg(
+        rushing_epa=("rushing_epa", "mean"),
+    ).reset_index()
+
+    hist_ngs = ngs_rush_df[(ngs_rush_df["season"] == season) & (ngs_rush_df["week"] < week)]
+    ngs_agg = hist_ngs.groupby("player_gsis_id").agg(
+        rush_yards_over_expected_per_att=("rush_yards_over_expected_per_att", "mean"),
+        efficiency=("efficiency", "mean"),
+        avg_time_to_los=("avg_time_to_los", "mean"),
+        box_stack_pct_faced=("percent_attempts_gte_eight_defenders", "mean"),
+    ).reset_index().rename(columns={"player_gsis_id": "gsis_id"})
+
+    merged = agg.merge(ngs_agg, on="gsis_id", how="left")
+
+    for col in ["rushing_epa", "rush_yards_over_expected_per_att", "efficiency"]:
+        if col in merged.columns:
+            merged[f"{col}_grade"] = merged[col].apply(lambda v: calc_percentile_grade(v, merged[col]))
+
+    return merged
+
+
+def build_defense_advanced_metrics(season: int, week: int, pbp_df: pd.DataFrame,
+                                    participation_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    DEF advanced metrics: EPA allowed per play, split pass defense vs run
+    defense - this is the real free equivalent of DVOA (DVOA itself is
+    Football Outsiders/FTN proprietary, not available for free). Also
+    success rate allowed and pressure rate generated.
+    """
+    hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)]
+    if hist_pbp.empty:
+        return pd.DataFrame()
+
+    pass_plays = hist_pbp[hist_pbp["play_type"] == "pass"]
+    run_plays = hist_pbp[hist_pbp["play_type"] == "run"]
+
+    pass_def = pass_plays.groupby("defteam").agg(
+        pass_epa_allowed=("epa", "mean"),
+        pass_success_rate_allowed=("success", "mean"),
+    ).reset_index()
+    run_def = run_plays.groupby("defteam").agg(
+        run_epa_allowed=("epa", "mean"),
+        run_success_rate_allowed=("success", "mean"),
+    ).reset_index()
+
+    merged = pass_def.merge(run_def, on="defteam", how="outer")
+
+    hist_participation = participation_df.merge(
+        hist_pbp[["game_id", "play_id", "defteam"]],
+        left_on=["nflverse_game_id", "play_id"], right_on=["game_id", "play_id"], how="inner",
+    )
+    if "was_pressure" in hist_participation.columns:
+        pressure_rate = hist_participation.groupby("defteam")["was_pressure"].mean().reset_index()
+        pressure_rate.columns = ["defteam", "pressure_rate_generated"]
+        merged = merged.merge(pressure_rate, on="defteam", how="left")
+
+    for col in ["pass_epa_allowed", "run_epa_allowed", "pressure_rate_generated"]:
+        if col in merged.columns:
+            # NOTE: for *_allowed metrics, LOWER is better defensively, so
+            # grade is inverted (100 - percentile) to keep "high grade = good defense"
+            # consistent with how every other grade in this tool works.
+            if "allowed" in col:
+                merged[f"{col}_grade"] = merged[col].apply(
+                    lambda v: 100 - calc_percentile_grade(v, merged[col]) if pd.notna(v) else np.nan
+                )
+            else:
+                merged[f"{col}_grade"] = merged[col].apply(lambda v: calc_percentile_grade(v, merged[col]))
+
+    return merged
+
+
+def calc_coverage_quality_score(coverage_row: dict) -> dict:
+    """
+    Builds a real (though modest) quality_score contribution from the
+    opponent defense's coverage tendency, now that coverage % is actually
+    computed and available (previously calc_quality_score's
+    matchup_exploit_strength parameter was just an unused placeholder).
+
+    HONEST SCOPE: this measures how LOPSIDED/PREDICTABLE a defense's
+    coverage tendency is (e.g. a defense that runs Cover 3 70% of the time
+    is more scheme-defined and exploitable by a team that knows how to
+    attack it, vs a defense that mixes coverages closer to evenly). This is
+    NOT a player-specific "does THIS receiver beat THIS coverage" fit -
+    that would need NGS separation/YAC split by coverage type, which isn't
+    currently pulled into the weekly scanner. This is a real, useful signal
+    on its own (predictability = exploitable), just not the more precise
+    player-fit version.
+    """
+    if coverage_row is None:
+        return {"dominant_coverage": None, "dominant_coverage_pct": np.nan, "man_zone_lean": None}
+
+    coverage_type_cols = {
+        k: v for k, v in coverage_row.items()
+        if k.endswith("_pct") and k not in ("man_pct", "zone_pct") and pd.notna(v)
+    }
+    if coverage_type_cols:
+        dominant_coverage = max(coverage_type_cols, key=coverage_type_cols.get)
+        dominant_pct = coverage_type_cols[dominant_coverage]
+    else:
+        dominant_coverage, dominant_pct = None, np.nan
+
+    man_pct = coverage_row.get("man_pct", np.nan)
+    zone_pct = coverage_row.get("zone_pct", np.nan)
+    if pd.notna(man_pct) and pd.notna(zone_pct):
+        man_zone_lean = "Man-heavy" if man_pct > zone_pct else "Zone-heavy"
+    else:
+        man_zone_lean = None
+
+    return {
+        "dominant_coverage": dominant_coverage,
+        "dominant_coverage_pct": dominant_pct,
+        "man_zone_lean": man_zone_lean,
+    }
+
+
 def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     """
     Pulls and merges every data source needed for one week's slate, returning
@@ -746,11 +1111,13 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     to score. This does NOT include lines - lines are entered/adjusted
     manually per row in the Streamlit UI, same as the MLB tool's adjustable
     Best Edges table (avoids repeating the unreliable Underdog auto-pull
-    issue; PrizePicks auto-pull decided against too - staying fully manual
-    for lines).
+    issue; PrizePicks auto-pull can be tested later once this core scanner
+    is proven out).
 
     Returns columns including (not exhaustive):
-      gsis_id, player_display_name, team, position, prop_type, mu, sigma
+      gsis_id, player_display_name, team, position, prop_type,
+      mu, sigma_estimate, quality_score, games_sampled,
+      team_changed, use_depth_chart_estimate
     """
     schedules_df = pull_schedules([season])
     rosters_df = pull_rosters([season])
@@ -768,6 +1135,20 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     explosive_rates = build_explosive_rates(pbp_df)
     fallback_sigmas = build_league_fallback_sigmas(player_stats_df, season, week)
     fallback_mus = build_league_fallback_mus(player_stats_df, season, week)
+
+    # Filter to weeks BEFORE the target week only, for the same reason
+    # calc_prop_mu does - using this week's own plays to predict this
+    # week's own result would be data leakage, not a real projection.
+    pbp_history_df = pbp_df[pbp_df["week"] < week]
+
+    # Advanced metrics tables - computed once per scan, merged into each
+    # position's rows below. Each metric gets a 0-100 percentile grade
+    # against this season's league-wide distribution (calc_percentile_grade),
+    # so everything is color-codable the same consistent way.
+    qb_metrics = build_qb_advanced_metrics(season, week, player_stats_df, ngs_pass_df, participation_df, pbp_history_df)
+    rec_metrics = build_receiver_advanced_metrics(season, week, player_stats_df, ngs_rec_df)
+    rb_metrics = build_rb_advanced_metrics(season, week, player_stats_df, ngs_rush_df)
+    def_metrics = build_defense_advanced_metrics(season, week, pbp_history_df, participation_df)
 
     this_week_games = schedules_df[
         (schedules_df["season"] == season) & (schedules_df["week"] == week)
@@ -790,6 +1171,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     qb_pool = week_rosters[week_rosters["position"] == "QB"]
     for _, qb in qb_pool.iterrows():
         gsis_id = qb.get("gsis_id")
+        team = qb.get("team")
         mu = calc_prop_mu(
             gsis_id, "passing_yards", player_stats_df, season, week,
             league_fallback_mu=fallback_mus.get(("QB", "passing_yards")),
@@ -798,10 +1180,47 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             gsis_id, "passing_yards", player_stats_df, season, week,
             league_fallback_sigma=fallback_sigmas.get(("QB", "passing_yards")),
         )
+
+        opponent = get_opponent_this_week(team, season, week, schedules_df)
+        opp_coverage_row = None
+        if opponent is not None and not coverage_profile.empty:
+            match = coverage_profile[coverage_profile["defteam"] == opponent]
+            if not match.empty:
+                opp_coverage_row = match.iloc[0].to_dict()
+        coverage_info = calc_coverage_quality_score(opp_coverage_row)
+        n_plays = opp_coverage_row.get("n_plays", 0) if opp_coverage_row else 0
+        exploit_strength = (coverage_info["dominant_coverage_pct"] or 0)
+        quality_score = calc_quality_score(
+            matchup_exploit_strength=exploit_strength,
+            sample_size_games=min(n_plays / 60, 10),  # rough plays-to-games conversion
+            coverage_confidence=min(n_plays / 300, 1.0),
+        )
+
+        # ACTUAL mu adjustment (not just a quality_score side signal) using
+        # this QB's own real man/zone efficiency split from their play
+        # history, weighted by this specific opponent's man/zone tendency.
+        adjusted_mu = mu
+        if pd.notna(mu) and opp_coverage_row:
+            man_pct = opp_coverage_row.get("man_pct")
+            zone_pct = opp_coverage_row.get("zone_pct")
+            if pd.notna(man_pct) and pd.notna(zone_pct):
+                coverage_eff = build_player_coverage_efficiency(
+                    gsis_id, "passer", season, participation_df, pbp_history_df
+                )
+                adjusted_mu = calc_coverage_adjusted_mu(mu, coverage_eff, man_pct, zone_pct)
+
         rows.append({
             "gsis_id": gsis_id, "player_display_name": qb.get("full_name"),
-            "team": qb.get("team"), "position": "QB", "prop_type": "pass_yards",
-            "mu": mu, "sigma": sigma,
+            "team": team, "position": "QB", "prop_type": "pass_yards",
+            "mu": adjusted_mu, "mu_before_coverage_adj": mu, "sigma": sigma, "opponent": opponent,
+            "opp_man_pct": opp_coverage_row.get("man_pct") if opp_coverage_row else np.nan,
+            "opp_zone_pct": opp_coverage_row.get("zone_pct") if opp_coverage_row else np.nan,
+            "opp_dominant_coverage": coverage_info["dominant_coverage"],
+            "opp_dominant_coverage_pct": coverage_info["dominant_coverage_pct"],
+            "quality_score": quality_score,
+            **get_full_coverage_breakdown(opp_coverage_row),
+            **get_player_grades(gsis_id, qb_metrics),
+            **get_defense_grades(opponent, def_metrics),
         })
 
     # --- Rushing props ---
@@ -818,10 +1237,13 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             league_fallback_sigma=fallback_sigmas.get((position, "rushing_yards")),
         )
         if pd.notna(mu):  # skip QBs/RBs with no real rushing history at all
+            rb_opponent = get_opponent_this_week(rb.get("team"), season, week, schedules_df)
             rows.append({
                 "gsis_id": gsis_id, "player_display_name": rb.get("full_name"),
                 "team": rb.get("team"), "position": position, "prop_type": "rush_yards",
-                "mu": mu, "sigma": sigma,
+                "mu": mu, "sigma": sigma, "opponent": rb_opponent,
+                **get_player_grades(gsis_id, rb_metrics),
+                **get_defense_grades(rb_opponent, def_metrics),
             })
 
     # --- Receiving props ---
@@ -829,6 +1251,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     for _, wr in rec_pool.iterrows():
         gsis_id = wr.get("gsis_id")
         position = wr.get("position")
+        team = wr.get("team")
         mu = calc_prop_mu(
             gsis_id, "receiving_yards", player_stats_df, season, week,
             league_fallback_mu=fallback_mus.get((position, "receiving_yards")),
@@ -838,10 +1261,44 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             league_fallback_sigma=fallback_sigmas.get((position, "receiving_yards")),
         )
         if pd.notna(mu):
+            opponent = get_opponent_this_week(team, season, week, schedules_df)
+            opp_coverage_row = None
+            if opponent is not None and not coverage_profile.empty:
+                match = coverage_profile[coverage_profile["defteam"] == opponent]
+                if not match.empty:
+                    opp_coverage_row = match.iloc[0].to_dict()
+            coverage_info = calc_coverage_quality_score(opp_coverage_row)
+            n_plays = opp_coverage_row.get("n_plays", 0) if opp_coverage_row else 0
+            exploit_strength = (coverage_info["dominant_coverage_pct"] or 0)
+            quality_score = calc_quality_score(
+                matchup_exploit_strength=exploit_strength,
+                sample_size_games=min(n_plays / 60, 10),
+                coverage_confidence=min(n_plays / 300, 1.0),
+            )
+
+            # ACTUAL mu adjustment using this receiver's own real man/zone
+            # efficiency split, weighted by this specific opponent's tendency.
+            adjusted_mu = mu
+            man_pct = opp_coverage_row.get("man_pct") if opp_coverage_row else None
+            zone_pct = opp_coverage_row.get("zone_pct") if opp_coverage_row else None
+            if pd.notna(man_pct) and pd.notna(zone_pct):
+                coverage_eff = build_player_coverage_efficiency(
+                    gsis_id, "receiver", season, participation_df, pbp_history_df
+                )
+                adjusted_mu = calc_coverage_adjusted_mu(mu, coverage_eff, man_pct, zone_pct)
+
             rows.append({
                 "gsis_id": gsis_id, "player_display_name": wr.get("full_name"),
-                "team": wr.get("team"), "position": position, "prop_type": "rec_yards",
-                "mu": mu, "sigma": sigma,
+                "team": team, "position": position, "prop_type": "rec_yards",
+                "mu": adjusted_mu, "mu_before_coverage_adj": mu, "sigma": sigma, "opponent": opponent,
+                "opp_man_pct": opp_coverage_row.get("man_pct") if opp_coverage_row else np.nan,
+                "opp_zone_pct": opp_coverage_row.get("zone_pct") if opp_coverage_row else np.nan,
+                "opp_dominant_coverage": coverage_info["dominant_coverage"],
+                "opp_dominant_coverage_pct": coverage_info["dominant_coverage_pct"],
+                **get_full_coverage_breakdown(opp_coverage_row),
+                "quality_score": quality_score,
+                **get_player_grades(gsis_id, rec_metrics),
+                **get_defense_grades(opponent, def_metrics),
             })
 
     # --- Fantasy points (offense: QB, RB, WR, TE) ---
@@ -899,6 +1356,11 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
         })
 
     return pd.DataFrame(rows)
+
+
+def pull_depth_charts(years: list[int]) -> pd.DataFrame:
+    df = nfl.load_depth_charts(seasons=years)
+    return df.to_pandas()
 
 
 def calc_prop_mu(player_gsis_id: str, prop_column: str, player_stats_df: pd.DataFrame,
@@ -1157,13 +1619,12 @@ def backtest_week(season: int, week: int) -> pd.DataFrame:
          noise, on top of the existing "must have a real player_stats
          entry" filter).
       2. Filters to STARTERS ONLY at each position, using depth_charts'
-         position-specific pos_rank thresholds (see get_starters_for_week()
-         for the flagged assumption on pos_rank values).
-      3. Returns ONLY the BEST (biggest) discrepancies - match_ratio >= 2.0,
-         meaning the result was more than double that player's normal
-         week-to-week swing. Close matches (mu ≈ actual) aren't useful for
-         spotting mispriced-line opportunities, since a line near mu
-         would've been a coinflip either way.
+         pos_rank == 1 (see get_starters_for_week() for the flagged
+         assumption on pos_rank values).
+      3. Returns ONLY significant discrepancies (match_ratio >= 1.0) -
+         close matches (mu ≈ actual) aren't useful for spotting mispriced-
+         line opportunities, since a line near mu would've been a coinflip
+         either way. Only the big over/underperformances matter here.
 
     Returns columns: player_display_name, team, position, prop_type, mu,
     sigma, actual, miss, abs_miss, match_ratio, games_sampled - sorted by
