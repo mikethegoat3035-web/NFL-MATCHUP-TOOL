@@ -9,7 +9,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from nfl_model_combined import scan_full_slate_nfl, rescore_quality_mu_row_nfl, backtest_week
-from draft_rankings import build_yahoo_style_rankings, detect_risers, build_league_settings, build_snake_draft_targets
+from draft_rankings import (
+    build_yahoo_style_rankings, detect_risers, build_league_settings,
+    build_snake_draft_targets, compute_blended_rankings, build_draft_rankings_backtest,
+)
 
 st.set_page_config(page_title="NFL Matchup Tool", layout="wide")
 st.title("NFL Matchup Tool")
@@ -29,7 +32,16 @@ mode = st.radio(
 
 col1, col2 = st.columns(2)
 with col1:
-    season = st.number_input("Season", min_value=2020, max_value=2030, value=2025, step=1)
+    if mode == "Draft Rankings":
+        season = st.number_input(
+            "Draft season", min_value=2020, max_value=2030, value=2026, step=1,
+            help="This is the season you're drafting FOR. Projections are built from "
+                 "the completed prior season's per-game rates (season-1), applied to "
+                 "the CURRENT roster for this season - so 2026 rankings use 2025 stats "
+                 "but 2026 rosters (reflecting trades/signings like Etienne to NO).",
+        )
+    else:
+        season = st.number_input("Season", min_value=2020, max_value=2030, value=2025, step=1)
 with col2:
     if mode == "Draft Rankings":
         st.caption("Draft Rankings uses the prior completed season as the projection basis - "
@@ -106,9 +118,53 @@ if mode == "Draft Rankings":
         rankings = st.session_state.draft_rankings_df.copy()
         current_settings = st.session_state.get("league_settings", league_settings)
 
-        view = st.radio("View", ["Full Rankings", "Round-by-Round Targets (snake draft)"], horizontal=True)
+        view = st.radio(
+            "View",
+            ["Full Rankings", "Round-by-Round Targets (snake draft)", "Test Projection Accuracy (backtest)"],
+            horizontal=True,
+        )
 
-        if view == "Round-by-Round Targets (snake draft)":
+        if view == "Test Projection Accuracy (backtest)":
+            st.subheader("How accurate is the stats-only projection historically?")
+            st.caption(
+                "Tests ONLY the pure stats-based projection (last season's rate stats "
+                "projected forward) against a real completed season - NOT the blended "
+                "FantasyPros portion, since there's no free historical archive of past "
+                "FantasyPros rankings to test that part against. This tells you how much "
+                "to trust the stats side of the blend, not the blend itself."
+            )
+            test_season = st.number_input(
+                "Test season (projects using test_season-1 stats, compares to real test_season results)",
+                min_value=2021, max_value=2025, value=2025, step=1,
+            )
+            if st.button("Run projection backtest"):
+                with st.spinner(f"Building {test_season} projections and comparing to real results..."):
+                    try:
+                        backtest_results = build_draft_rankings_backtest(test_season, current_settings)
+                        st.session_state.draft_backtest_df = backtest_results
+                    except Exception as e:
+                        st.error(f"Backtest failed: {e}")
+                        st.session_state.draft_backtest_df = None
+
+            if st.session_state.get("draft_backtest_df") is not None and not st.session_state.draft_backtest_df.empty:
+                bt = st.session_state.draft_backtest_df
+                valid_bt = bt.dropna(subset=["actual_season_points"])
+                if not valid_bt.empty:
+                    bcol1, bcol2 = st.columns(2)
+                    with bcol1:
+                        st.metric("Mean absolute miss (season pts)", round(valid_bt["projection_miss"].abs().mean(), 1))
+                    with bcol2:
+                        st.metric("Players compared", len(valid_bt))
+                bt_display = bt[[
+                    "player", "position", "team", "season_proj_points",
+                    "actual_season_points", "actual_games_played", "projection_miss",
+                ]]
+                styled_bt = bt_display.style.background_gradient(
+                    subset=["projection_miss"], cmap="RdYlGn_r"
+                )
+                st.dataframe(styled_bt, use_container_width=True)
+
+        elif view == "Round-by-Round Targets (snake draft)":
             st.subheader(f"Your picks — drafting #{current_settings['draft_position']} in a {current_settings['num_teams']}-team snake draft")
             st.caption(
                 "Assumes every other team drafts best-remaining-VOR each pick - a "
@@ -122,28 +178,38 @@ if mode == "Draft Rankings":
                     round_targets = targets[targets["round"] == round_num]
                     pick_num = round_targets["your_overall_pick"].iloc[0]
                     st.markdown(f"**Round {round_num} (overall pick #{pick_num})**")
-                    st.dataframe(
-                        round_targets[["player", "position", "team", "season_proj_points", "vor"]],
-                        use_container_width=True, hide_index=True,
-                    )
+                    round_display = round_targets[["player", "position", "team", "season_proj_points", "vor"]]
+                    styled_round = round_display.style.background_gradient(subset=["vor"], cmap="Greens")
+                    st.dataframe(styled_round, use_container_width=True, hide_index=True)
             else:
                 st.info("No targets generated - check league settings.")
 
         else:
             st.subheader("Draft Rankings — Yahoo-style board")
             st.caption(
-                "Ranked by Value Over Replacement (VOR) for your league settings above - "
-                "not generic industry rankings. our_rank_delta shows how much higher we "
-                "rank a player than FantasyPros consensus (ecr) - a big positive number "
-                "means a potential riser the public hasn't caught up to yet."
+                "blended_rank combines our pure stats-based rank (last season's rate "
+                "stats only) with FantasyPros public consensus, since public rankings "
+                "DO account for things ours can't see - new coordinators, scheme fits, "
+                "offseason situational buzz. Adjust the slider to weight one side more."
             )
+
+            blend_weight = st.slider(
+                "Blend weight: pure stats ← → public consensus", 0.0, 1.0, 0.5, 0.1,
+                help="0.0 = pure FantasyPros consensus, 1.0 = pure our stats-only "
+                     "ranking, 0.5 = even blend (recommended default).",
+            )
+            rankings = compute_blended_rankings(rankings, our_weight=blend_weight)
 
             dcol1, dcol2 = st.columns(2)
             with dcol1:
                 positions_available = ["All"] + sorted(rankings["position"].dropna().unique().tolist())
                 pos_filter = st.selectbox("Position", positions_available, key="draft_pos_filter")
             with dcol2:
-                sort_by = st.selectbox("Sort by", ["Overall Rank (VOR)", "Biggest Risers (our_rank_delta)"], key="draft_sort")
+                sort_by = st.selectbox(
+                    "Sort by",
+                    ["Blended Rank (recommended)", "Pure Stats (VOR)", "Biggest Risers (our_rank_delta)"],
+                    key="draft_sort",
+                )
 
             display_rankings = rankings.copy()
             if pos_filter != "All":
@@ -151,16 +217,28 @@ if mode == "Draft Rankings":
 
             if sort_by == "Biggest Risers (our_rank_delta)":
                 display_rankings = display_rankings.sort_values("our_rank_delta", ascending=False, na_position="last")
-            else:
+            elif sort_by == "Pure Stats (VOR)":
                 display_rankings = display_rankings.sort_values("overall_rank", ascending=True)
+            else:
+                display_rankings = display_rankings.sort_values("blended_rank", ascending=True)
 
             display_cols = [
-                "overall_rank", "player", "pos_rank_label", "team", "bye",
+                "blended_rank", "overall_rank", "player", "pos_rank_label", "team", "bye",
                 "season_proj_points", "vor", "ppg_prior", "games_played_prior",
-                "fantasypros_ecr", "our_rank_delta",
+                "shares_backfield_with", "fantasypros_ecr", "our_rank_delta",
             ]
             display_cols = [c for c in display_cols if c in display_rankings.columns]
-            st.dataframe(display_rankings[display_cols], use_container_width=True)
+            display_final = display_rankings[display_cols]
+
+            # Color-coded like the MLB/Scan tool: brighter green = better VOR
+            # (stronger stats-based value), so you can see at a glance which
+            # rows are backed by strong underlying production regardless of
+            # where blended_rank puts them.
+            if "vor" in display_final.columns:
+                styled_rankings = display_final.style.background_gradient(subset=["vor"], cmap="Greens")
+                st.dataframe(styled_rankings, use_container_width=True)
+            else:
+                st.dataframe(display_final, use_container_width=True)
     else:
         st.info("Click 'Build Draft Rankings' to generate your league-specific board.")
 
