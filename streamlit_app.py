@@ -224,7 +224,7 @@ if mode == "Draft Rankings":
 
             display_cols = [
                 "blended_rank", "overall_rank", "player", "pos_rank_label", "team", "bye",
-                "season_proj_points", "vor", "ppg_prior", "games_played_prior",
+                "season_proj_points", "vor", "ppg_prior", "games_played_prior", "is_rookie_projection",
                 "shares_backfield_with", "fantasypros_ecr", "our_rank_delta",
             ]
             display_cols = [c for c in display_cols if c in display_rankings.columns]
@@ -358,15 +358,41 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         if min_edge_filter > 0:
             scored_df = scored_df[scored_df["edge"].fillna(0) >= min_edge_filter]
 
-        display_cols = ["player_display_name", "team", "position", "prop_type",
-                         "mu", "sigma", "line", "p_over", "edge"]
+        base_display_cols = ["player_display_name", "team", "position", "prop_type",
+                              "mu", "sigma", "opponent", "opp_dominant_coverage",
+                              "opp_dominant_coverage_pct", "opp_man_pct", "opp_zone_pct",
+                              "quality_score", "line", "p_over", "edge"]
+        # Include the full individual coverage-type breakdown AND every
+        # advanced metric grade (QB/WR/TE/RB own performance grades, plus
+        # opponent defense grades) - column names vary by what's actually
+        # available for a given player/week, so these are picked up
+        # dynamically rather than hardcoded.
+        cov_breakdown_cols = sorted([c for c in scored_df.columns if c.startswith("opp_cov_")])
+        grade_cols = sorted([c for c in scored_df.columns if c.endswith("_grade")])
+        display_cols = base_display_cols + grade_cols + cov_breakdown_cols
         display_cols = [c for c in display_cols if c in scored_df.columns]
         scan_sorted = scored_df[display_cols].sort_values("edge", ascending=False, na_position="last")
-        # Color-coded like the MLB tool: brighter/darker green = stronger edge/p_over.
-        styled_scan = scan_sorted.style.background_gradient(
-            subset=[c for c in ["edge", "p_over"] if c in scan_sorted.columns], cmap="Greens"
-        )
+        # Color-coded: edge/p_over use the MLB tool's green scale. Every
+        # coverage % column and every advanced metric grade (0-100 scale,
+        # already normalized so higher = always better/more notable) is
+        # ALSO color-coded the same way - brighter green = higher grade.
+        gradient_cols = [c for c in (["edge", "p_over", "opp_man_pct", "opp_zone_pct",
+                                       "opp_dominant_coverage_pct", "quality_score"]
+                                      + grade_cols + cov_breakdown_cols)
+                          if c in scan_sorted.columns]
+        styled_scan = scan_sorted.style.background_gradient(subset=gradient_cols, cmap="Greens")
         st.dataframe(styled_scan, use_container_width=True)
+        if "opp_dominant_coverage" in scan_sorted.columns:
+            st.caption(
+                "opp_cov_* columns show the opponent defense's FULL coverage breakdown "
+                "(e.g. Cover 1 19%, Cover 2 17.5%, etc.). *_grade columns are 0-100 "
+                "percentile grades against this season's league-wide distribution - "
+                "player grades (EPA, target share, separation, etc.) and opponent "
+                "defense grades (pass/run EPA allowed, pressure rate) are both included. "
+                "Defense 'allowed' grades are inverted so high = good defense, consistent "
+                "with every other grade. mu itself is adjusted using each player's real "
+                "man/zone efficiency split (see mu_before_coverage_adj to compare)."
+            )
 
 elif mode != "Draft Rankings":
     st.info("Click the button above to load this week's props.")
