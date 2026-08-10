@@ -9,7 +9,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from nfl_model_combined import scan_full_slate_nfl, rescore_quality_mu_row_nfl, backtest_week
-from draft_rankings import build_yahoo_style_rankings, detect_risers
+from draft_rankings import build_yahoo_style_rankings, detect_risers, build_league_settings, build_snake_draft_targets
 
 st.set_page_config(page_title="NFL Matchup Tool", layout="wide")
 st.title("NFL Matchup Tool")
@@ -46,12 +46,38 @@ if "draft_rankings_df" not in st.session_state:
     st.session_state.draft_rankings_df = None
 
 if mode == "Draft Rankings":
+    st.subheader("League Settings")
+    lcol1, lcol2, lcol3, lcol4 = st.columns(4)
+    with lcol1:
+        num_teams = st.number_input("Number of teams", min_value=2, max_value=20, value=6, step=1)
+        draft_position = st.number_input("Your draft position", min_value=1, max_value=num_teams, value=3, step=1)
+    with lcol2:
+        ppr_label = st.selectbox("Scoring", ["Full PPR", "Half PPR", "Standard (no PPR)"])
+        ppr_value = {"Full PPR": 1.0, "Half PPR": 0.5, "Standard (no PPR)": 0.0}[ppr_label]
+    with lcol3:
+        qb_slots = st.number_input("QB slots", min_value=0, max_value=3, value=1, step=1)
+        rb_slots = st.number_input("RB slots", min_value=0, max_value=5, value=2, step=1)
+        wr_slots = st.number_input("WR slots", min_value=0, max_value=5, value=2, step=1)
+        te_slots = st.number_input("TE slots", min_value=0, max_value=3, value=1, step=1)
+    with lcol4:
+        flex_slots = st.number_input("FLEX slots", min_value=0, max_value=6, value=3, step=1)
+        def_slots = st.number_input("DEF slots", min_value=0, max_value=2, value=1, step=1)
+        k_slots = st.number_input("K slots", min_value=0, max_value=2, value=1, step=1)
+        bench_slots = st.number_input("Bench slots", min_value=0, max_value=15, value=6, step=1)
+
+    league_settings = build_league_settings(
+        num_teams=num_teams, draft_position=draft_position,
+        qb=qb_slots, rb=rb_slots, wr=wr_slots, te=te_slots, flex=flex_slots,
+        def_=def_slots, k=k_slots, bench=bench_slots, ppr_value=ppr_value,
+    )
+
     if st.button("Build Draft Rankings", type="primary"):
         with st.spinner(f"Building season projections and rankings for {season}..."):
             try:
-                rankings = build_yahoo_style_rankings(season)
+                rankings = build_yahoo_style_rankings(season, league_settings)
                 rankings = detect_risers(rankings, season)
                 st.session_state.draft_rankings_df = rankings
+                st.session_state.league_settings = league_settings
                 st.success(f"Ranked {len(rankings)} players.")
             except Exception as e:
                 st.error(f"Draft rankings failed: {e}")
@@ -78,39 +104,63 @@ else:
 if mode == "Draft Rankings":
     if st.session_state.draft_rankings_df is not None and not st.session_state.draft_rankings_df.empty:
         rankings = st.session_state.draft_rankings_df.copy()
+        current_settings = st.session_state.get("league_settings", league_settings)
 
-        st.subheader("Draft Rankings — 6-team, full PPR, 1QB/2RB/2WR/1TE/3FLEX/1DEF/1K/6BN")
-        st.caption(
-            "Ranked by Value Over Replacement (VOR) for your specific 6-team, "
-            "1QB/2RB/2WR/1TE/3FLEX/1DEF/1K/6BN full-PPR league - not generic "
-            "industry rankings. our_rank_delta shows how much higher we rank a "
-            "player than FantasyPros consensus (ecr) - a big positive number "
-            "means a potential riser the public hasn't caught up to yet."
-        )
+        view = st.radio("View", ["Full Rankings", "Round-by-Round Targets (snake draft)"], horizontal=True)
 
-        dcol1, dcol2 = st.columns(2)
-        with dcol1:
-            positions_available = ["All"] + sorted(rankings["position"].dropna().unique().tolist())
-            pos_filter = st.selectbox("Position", positions_available, key="draft_pos_filter")
-        with dcol2:
-            sort_by = st.selectbox("Sort by", ["Overall Rank (VOR)", "Biggest Risers (our_rank_delta)"], key="draft_sort")
+        if view == "Round-by-Round Targets (snake draft)":
+            st.subheader(f"Your picks — drafting #{current_settings['draft_position']} in a {current_settings['num_teams']}-team snake draft")
+            st.caption(
+                "Assumes every other team drafts best-remaining-VOR each pick - a "
+                "reasonable planning baseline, not a guarantee of your real draft. "
+                "Top 5 remaining candidates shown at each of your picks."
+            )
+            with st.spinner("Simulating snake draft..."):
+                targets = build_snake_draft_targets(rankings, current_settings)
+            if not targets.empty:
+                for round_num in sorted(targets["round"].unique()):
+                    round_targets = targets[targets["round"] == round_num]
+                    pick_num = round_targets["your_overall_pick"].iloc[0]
+                    st.markdown(f"**Round {round_num} (overall pick #{pick_num})**")
+                    st.dataframe(
+                        round_targets[["player", "position", "team", "season_proj_points", "vor"]],
+                        use_container_width=True, hide_index=True,
+                    )
+            else:
+                st.info("No targets generated - check league settings.")
 
-        display_rankings = rankings.copy()
-        if pos_filter != "All":
-            display_rankings = display_rankings[display_rankings["position"] == pos_filter]
-
-        if sort_by == "Biggest Risers (our_rank_delta)":
-            display_rankings = display_rankings.sort_values("our_rank_delta", ascending=False, na_position="last")
         else:
-            display_rankings = display_rankings.sort_values("overall_rank", ascending=True)
+            st.subheader("Draft Rankings — Yahoo-style board")
+            st.caption(
+                "Ranked by Value Over Replacement (VOR) for your league settings above - "
+                "not generic industry rankings. our_rank_delta shows how much higher we "
+                "rank a player than FantasyPros consensus (ecr) - a big positive number "
+                "means a potential riser the public hasn't caught up to yet."
+            )
 
-        display_cols = [
-            "overall_rank", "player", "pos_rank_label", "team", "bye",
-            "season_proj_points", "vor", "ppg_prior", "games_played_prior",
-            "fantasypros_ecr", "our_rank_delta",
-        ]
-        display_cols = [c for c in display_cols if c in display_rankings.columns]
-        st.dataframe(display_rankings[display_cols], use_container_width=True)
+            dcol1, dcol2 = st.columns(2)
+            with dcol1:
+                positions_available = ["All"] + sorted(rankings["position"].dropna().unique().tolist())
+                pos_filter = st.selectbox("Position", positions_available, key="draft_pos_filter")
+            with dcol2:
+                sort_by = st.selectbox("Sort by", ["Overall Rank (VOR)", "Biggest Risers (our_rank_delta)"], key="draft_sort")
+
+            display_rankings = rankings.copy()
+            if pos_filter != "All":
+                display_rankings = display_rankings[display_rankings["position"] == pos_filter]
+
+            if sort_by == "Biggest Risers (our_rank_delta)":
+                display_rankings = display_rankings.sort_values("our_rank_delta", ascending=False, na_position="last")
+            else:
+                display_rankings = display_rankings.sort_values("overall_rank", ascending=True)
+
+            display_cols = [
+                "overall_rank", "player", "pos_rank_label", "team", "bye",
+                "season_proj_points", "vor", "ppg_prior", "games_played_prior",
+                "fantasypros_ecr", "our_rank_delta",
+            ]
+            display_cols = [c for c in display_cols if c in display_rankings.columns]
+            st.dataframe(display_rankings[display_cols], use_container_width=True)
     else:
         st.info("Click 'Build Draft Rankings' to generate your league-specific board.")
 
