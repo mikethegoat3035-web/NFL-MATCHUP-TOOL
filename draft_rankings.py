@@ -172,6 +172,7 @@ def build_season_projection(player_gsis_id: str, position: str,
     prior_season = projection_season - 1
     history = player_stats_df[
         (player_stats_df["gsis_id"] == player_gsis_id) & (player_stats_df["season"] == prior_season)
+        & (player_stats_df["season_type"] == "REG")
     ]
     if history.empty:
         return {"season_proj_points": np.nan, "games_played_prior": 0, "ppg_prior": np.nan}
@@ -198,6 +199,7 @@ def build_kicker_season_projection(player_gsis_id: str, player_stats_df: pd.Data
     prior_season = projection_season - 1
     history = player_stats_df[
         (player_stats_df["gsis_id"] == player_gsis_id) & (player_stats_df["season"] == prior_season)
+        & (player_stats_df["season_type"] == "REG")
     ]
     if history.empty:
         return {"season_proj_points": np.nan, "games_played_prior": 0, "ppg_prior": np.nan}
@@ -361,6 +363,28 @@ def build_yahoo_style_rankings(season: int, league_settings: dict = None) -> pd.
     if projections_df.empty:
         return projections_df
 
+    # Flag position competition (e.g. Kamara/Etienne both landing on the same
+    # Saints backfield): when 2+ players at the same position on the same
+    # CURRENT-season team both have a real prior-season track record, their
+    # individual projections are each based on their OWN last-season workload
+    # as if they'd keep it entirely - but they're about to split one team's
+    # worth of volume. We deliberately do NOT try to guess the exact split
+    # (that's genuinely uncertain, even for real analysts, and a fabricated
+    # number would look more rigorous than it is) - instead this just flags
+    # it so you can manually discount rather than trust an inflated number.
+    def _flag_competition(row):
+        teammates = projections_df[
+            (projections_df["team"] == row["team"])
+            & (projections_df["position"] == row["position"])
+            & (projections_df["gsis_id"] != row["gsis_id"])
+            & (projections_df["games_played_prior"] >= 6)
+        ]
+        if row["games_played_prior"] < 6 or teammates.empty:
+            return None
+        return ", ".join(teammates["player"].tolist())
+
+    projections_df["shares_backfield_with"] = projections_df.apply(_flag_competition, axis=1)
+
     replacement_levels = compute_replacement_levels(projections_df, league_settings)
     vor_df = compute_vor(projections_df, replacement_levels)
 
@@ -370,8 +394,9 @@ def build_yahoo_style_rankings(season: int, league_settings: dict = None) -> pd.
     vor_df["pos_rank_label"] = vor_df["position"] + vor_df["pos_rank"].astype(str)
 
     return vor_df[[
-        "overall_rank", "player", "position", "pos_rank_label", "team", "bye",
+        "gsis_id", "overall_rank", "player", "position", "pos_rank_label", "team", "bye",
         "season_proj_points", "vor", "ppg_prior", "games_played_prior",
+        "shares_backfield_with",
     ]]
 
 
@@ -500,11 +525,132 @@ def detect_risers(rankings_df: pd.DataFrame, season: int) -> pd.DataFrame:
     except Exception:
         return rankings_df.assign(fantasypros_ecr=np.nan, our_rank_delta=np.nan)
 
+    # FIX: load_ff_rankings() has MULTIPLE rows per player (rankings get
+    # re-published with different scrape_date snapshots through the
+    # offseason). Merging without deduplicating first multiplies every row
+    # in rankings_df once per matching FantasyPros row - this was causing
+    # each player to show up repeated 5x (or however many snapshots exist).
+    # Keep only the most recent snapshot per player before merging.
+    if "scrape_date" in ff_rankings.columns:
+        ff_rankings = ff_rankings.sort_values("scrape_date").drop_duplicates(subset=["player"], keep="last")
+    else:
+        ff_rankings = ff_rankings.drop_duplicates(subset=["player"], keep="last")
+
+    # FIX: normalize names before matching, so suffix variations (e.g. our
+    # roster data saying "Travis Etienne" vs FantasyPros saying "Travis
+    # Etienne Jr.") don't silently fail to match and fall back to
+    # stats-only without any warning.
+    def _normalize_name(name):
+        if pd.isna(name):
+            return name
+        name = str(name).strip()
+        for suffix in [" Jr.", " Jr", " Sr.", " Sr", " II", " III", " IV"]:
+            if name.endswith(suffix):
+                name = name[: -len(suffix)].strip()
+        return name.replace(".", "").replace("'", "").lower()
+
+    rankings_df = rankings_df.copy()
+    ff_rankings = ff_rankings.copy()
+    rankings_df["_merge_key"] = rankings_df["player"].apply(_normalize_name)
+    ff_rankings["_merge_key"] = ff_rankings["player"].apply(_normalize_name)
+
     merged = rankings_df.merge(
-        ff_rankings[["player", "ecr", "player_owned_yahoo"]],
-        left_on="player", right_on="player", how="left"
-    )
+        ff_rankings[["_merge_key", "ecr", "player_owned_yahoo"]],
+        on="_merge_key", how="left"
+    ).drop(columns=["_merge_key"])
     merged = merged.rename(columns={"ecr": "fantasypros_ecr"})
     merged["our_rank_delta"] = merged["fantasypros_ecr"] - merged["overall_rank"]
 
     return merged.sort_values("our_rank_delta", ascending=False)
+
+
+def build_draft_rankings_backtest(test_season: int, league_settings: dict = None) -> pd.DataFrame:
+    """
+    Tests the STATS-ONLY portion of the draft methodology by building
+    projections "as if drafting" for test_season (using test_season-1
+    stats + test_season rosters - the exact same logic build_yahoo_style_
+    rankings uses for a real upcoming draft), then comparing against REAL
+    test_season performance.
+
+    HONEST LIMITATION FLAGGED: this can only validate the pure stats-based
+    projection, NOT the blended_rank from compute_blended_rankings().
+    load_ff_rankings() only returns TODAY'S live FantasyPros snapshot -
+    there's no free historical archive of what FantasyPros said before a
+    past season, so there's no way to reconstruct what the blend would
+    have said for a prior draft. This tells you whether our own
+    historical-rate projection tends to be accurate on its own - useful
+    context for deciding how much weight to give it vs. public consensus,
+    but not a direct test of the blend itself.
+    """
+    if league_settings is None:
+        league_settings = LEAGUE_SETTINGS
+    ppr_value = league_settings.get("ppr_value", 1.0)
+
+    projected = build_yahoo_style_rankings(test_season, league_settings)
+    if projected.empty:
+        return projected
+
+    player_stats_df = pull_player_stats([test_season])
+    actual_season = player_stats_df[
+        (player_stats_df["season"] == test_season) & (player_stats_df["season_type"] == "REG")
+    ]
+
+    def _actual_points(gsis_id, position):
+        history = actual_season[actual_season["gsis_id"] == gsis_id]
+        if history.empty:
+            return np.nan, 0
+        if position == "K":
+            pts = history.apply(lambda r: calc_kicker_fantasy_points(r.to_dict()), axis=1).sum()
+        else:
+            pts = history.apply(lambda r: calc_offense_fantasy_points(r.to_dict(), ppr_value), axis=1).sum()
+        return round(pts, 1), len(history)
+
+    actual_points_list, actual_games_list = [], []
+    for _, row in projected.iterrows():
+        pts, games = _actual_points(row["gsis_id"], row["position"])
+        actual_points_list.append(pts)
+        actual_games_list.append(games)
+
+    projected["actual_season_points"] = actual_points_list
+    projected["actual_games_played"] = actual_games_list
+    projected["projection_miss"] = projected["season_proj_points"] - projected["actual_season_points"]
+
+    return projected.sort_values("projection_miss", key=lambda s: s.abs(), ascending=False)
+
+
+def compute_blended_rankings(rankings_df: pd.DataFrame, our_weight: float = 0.5) -> pd.DataFrame:
+    """
+    Blends our pure stats-based rank (overall_rank, built entirely from last
+    season's rate stats) with FantasyPros consensus rank (fantasypros_ecr) -
+    since public consensus DOES account for things our historical-rate model
+    structurally can't: new coordinators, scheme fits, offseason situational
+    buzz, injury recovery outlook, etc. Rather than pretend our stats-only
+    model captures those things, this leans on public expert knowledge as a
+    genuine input to correct for it, not just a comparison metric.
+
+    our_weight: 0.0 = pure FantasyPros consensus, 1.0 = pure our stats-only
+    rank, 0.5 = even blend (default). Rows with no FantasyPros match fall
+    back to our own rank alone (can't blend with a missing value).
+
+    Adds blended_rank as a new sortable column - the recommended default
+    view, since it corrects for the known situational blind spot while
+    still keeping our_rank_delta/overall_rank visible for transparency.
+    """
+    df = rankings_df.copy()
+    if "fantasypros_ecr" not in df.columns:
+        df["blended_rank"] = df["overall_rank"]
+        return df
+
+    max_rank = max(df["overall_rank"].max(), df["fantasypros_ecr"].max(skipna=True))
+
+    def _blend(row):
+        our_pct = row["overall_rank"] / max_rank
+        if pd.isna(row.get("fantasypros_ecr")):
+            return row["overall_rank"]  # no public data to blend with - use our rank alone
+        public_pct = row["fantasypros_ecr"] / max_rank
+        blended_pct = (our_weight * our_pct) + ((1 - our_weight) * public_pct)
+        return blended_pct * max_rank
+
+    df["blended_score"] = df.apply(_blend, axis=1)
+    df["blended_rank"] = df["blended_score"].rank(method="min").astype(int)
+    return df.sort_values("blended_rank")
