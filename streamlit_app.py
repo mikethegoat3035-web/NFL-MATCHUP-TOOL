@@ -189,7 +189,8 @@ if mode == "Draft Rankings":
                     round_targets = targets[targets["round"] == round_num]
                     pick_num = round_targets["your_overall_pick"].iloc[0]
                     st.markdown(f"**Round {round_num} (overall pick #{pick_num})**")
-                    round_display = round_targets[["player", "position", "team", "season_proj_points", "vor"]]
+                    round_display = round_targets[["player", "position", "team", "season_proj_points",
+                                                     "vor", "blended_rank", "overall_rank", "fantasypros_ecr"]]
                     styled_round = round_display.style.background_gradient(subset=["vor"], cmap="Greens")
                     st.dataframe(styled_round, use_container_width=True, hide_index=True)
             else:
@@ -343,6 +344,21 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
             "edge/p_over recompute automatically once you enter a line."
         )
 
+        if week is not None and week <= 3:
+            st.warning(
+                f"Week {week}: most players are still leaning on prior-season fallback data "
+                "(mu needs 2 real current-season games, sigma needs 3). Check the "
+                "data_confidence column per row before trusting a number - don't assume "
+                "everyone has switched over to real 2026 data yet."
+            )
+        elif week is not None and week == 4:
+            st.info(
+                "Week 4 (~end of September): most returning players should now be on real "
+                "current-season data for mu and sigma. Time to start trusting 2026 numbers "
+                "over last season's - but still check data_confidence for traded players "
+                "and rookies, who may need longer."
+            )
+
         edited = st.data_editor(
             filtered,
             column_config={
@@ -370,7 +386,8 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
             scored_df = scored_df[scored_df["edge"].fillna(0) >= min_edge_filter]
 
         base_display_cols = ["player_display_name", "team", "position", "prop_type",
-                              "mu", "sigma", "opponent", "opp_dominant_coverage",
+                              "mu", "sigma", "data_confidence", "games_sampled_current",
+                              "opponent", "opp_dominant_coverage",
                               "opp_dominant_coverage_pct", "opp_num_elevated_coverages",
                               "opp_man_pct", "opp_zone_pct",
                               "quality_score", "line", "p_over", "edge"]
