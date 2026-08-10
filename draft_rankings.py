@@ -129,12 +129,20 @@ def calc_points_allowed_bucket_score(points_allowed: float) -> int:
 
 def calc_team_defense_fantasy_points(defense_row: dict, points_allowed: float = None) -> float:
     """
-    Standard Yahoo-default DEF scoring:
-      Sack: 1 | INT: 2 | Fumble Recovery: 2 | Safety: 2
-      Defensive/Return TD: 6 | Points allowed: tiered (see above)
+    CONFIRMED against user's actual Yahoo league scoring settings (screenshots
+    checked): Sack 1, INT 2, Fumble Recovery 2, TD 6, Safety 2, Block Kick 2,
+    Kickoff/Punt Return TD 6, Points Allowed tiers 10/7/4/1/0/-1/-4 for
+    0/1-6/7-13/14-20/21-27/28-34/35+ - all confirmed exact matches to
+    real league settings except Block Kick, which is now added.
 
-    UNVERIFIED: matches Yahoo's common default, but not confirmed against
-    this specific league's actual scoring settings - flag to double check.
+    HONEST FLAG: block_kicks is NOT a confirmed real column in player_stats -
+    our earlier column diagnostic never checked for a blocked-kick stat
+    specifically. It may not exist as a pre-aggregated column at all (blocked
+    kicks might only be derivable from pbp's field_goal_result/punt_blocked
+    play-level flags, which would need a separate aggregation function). This
+    uses .get() with a default of 0, so it silently contributes nothing if
+    the column doesn't exist rather than crashing - but that also means
+    block kicks may not actually be counted until this is verified/built out.
     """
     r = defense_row
     points = 0.0
@@ -143,6 +151,7 @@ def calc_team_defense_fantasy_points(defense_row: dict, points_allowed: float = 
     points += r.get("def_fumbles", 0) * 2
     points += r.get("def_safeties", 0) * 2
     points += (r.get("def_tds", 0) + r.get("fumble_recovery_tds", 0) + r.get("special_teams_tds", 0)) * 6
+    points += r.get("block_kicks", 0) * 2  # UNVERIFIED column - see docstring
     if points_allowed is not None:
         points += calc_points_allowed_bucket_score(points_allowed)
     return round(points, 2)
@@ -279,8 +288,57 @@ def compute_vor(projections_df: pd.DataFrame, replacement_levels: dict) -> pd.Da
     return df
 
 
+def build_defense_season_projection(team: str, player_stats_df: pd.DataFrame, schedules_df: pd.DataFrame,
+                                     projection_season: int, games_in_season: int = 17) -> dict:
+    """
+    Season-long DEF projection - was completely missing from the rankings
+    pipeline before (calc_team_defense_fantasy_points existed but nothing
+    ever called it in build_yahoo_style_rankings, so zero defenses showed
+    up in rankings at all despite the league requiring 1 DEF starter).
+
+    Points allowed per game is derived from schedules_df (the opponent's
+    final score that game), since player_stats doesn't carry a points-
+    allowed field directly.
+    """
+    prior_season = projection_season - 1
+    team_defense_stats = pull_team_defense_stats([prior_season])
+    team_games = team_defense_stats[
+        (team_defense_stats["team"] == team) & (team_defense_stats["season"] == prior_season)
+    ]
+    if team_games.empty:
+        return {"season_proj_points": np.nan, "games_played_prior": 0, "ppg_prior": np.nan}
+
+    season_games = schedules_df[schedules_df["season"] == prior_season]
+
+    def _points_allowed(week):
+        game = season_games[
+            ((season_games["home_team"] == team) | (season_games["away_team"] == team))
+            & (season_games["week"] == week)
+        ]
+        if game.empty:
+            return None
+        g = game.iloc[0]
+        return g["away_score"] if g["home_team"] == team else g["home_score"]
+
+    weekly_points = []
+    for _, row in team_games.iterrows():
+        pa = _points_allowed(row["week"])
+        weekly_points.append(calc_team_defense_fantasy_points(row.to_dict(), pa))
+
+    games_played = len(weekly_points)
+    ppg = sum(weekly_points) / games_played if games_played else np.nan
+    projected_games = min(games_in_season, games_played + 2)
+    season_proj_points = round(ppg * projected_games, 1) if pd.notna(ppg) else np.nan
+
+    return {
+        "season_proj_points": season_proj_points,
+        "games_played_prior": games_played,
+        "ppg_prior": round(ppg, 2) if pd.notna(ppg) else np.nan,
+    }
+
+
 # ---------------------------------------------------------------------------
-# 4. YAHOO-STYLE RANKING TABLE
+# 5. YAHOO-STYLE RANKING TABLE
 # ---------------------------------------------------------------------------
 
 def get_bye_weeks(season: int, schedules_df: pd.DataFrame) -> dict:
@@ -362,6 +420,28 @@ def build_yahoo_style_rankings(season: int, league_settings: dict = None) -> pd.
     projections_df = pd.DataFrame(rows)
     if projections_df.empty:
         return projections_df
+
+    # Add team DEFENSES - this was completely missing before (the scoring
+    # function existed but nothing ever called it here), so zero defenses
+    # showed up in rankings despite the league requiring 1 DEF starter.
+    all_teams = rosters_df[rosters_df["season"] == season]["team"].dropna().unique().tolist()
+    def_rows = []
+    for team in all_teams:
+        proj = build_defense_season_projection(team, player_stats_df, schedules_df, season)
+        if pd.isna(proj["season_proj_points"]):
+            continue
+        def_rows.append({
+            "gsis_id": f"DEF_{team}",  # synthetic ID since defenses aren't individual players
+            "player": f"{team} DEF",
+            "position": "DEF",
+            "team": team,
+            "bye": bye_weeks.get(team),
+            "season_proj_points": proj["season_proj_points"],
+            "games_played_prior": proj["games_played_prior"],
+            "ppg_prior": proj["ppg_prior"],
+        })
+    if def_rows:
+        projections_df = pd.concat([projections_df, pd.DataFrame(def_rows)], ignore_index=True)
 
     # Flag position competition (e.g. Kamara/Etienne both landing on the same
     # Saints backfield): when 2+ players at the same position on the same
