@@ -676,6 +676,9 @@ def build_snake_draft_targets(rankings_df: pd.DataFrame, league_settings: dict,
                 "team": candidate["team"],
                 "season_proj_points": candidate["season_proj_points"],
                 "vor": candidate["vor"],
+                "blended_rank": candidate.get("blended_rank"),
+                "overall_rank": candidate.get("overall_rank"),
+                "fantasypros_ecr": candidate.get("fantasypros_ecr"),
             })
 
         # advance simulation assuming you take the top remaining player,
@@ -753,6 +756,38 @@ def detect_risers(rankings_df: pd.DataFrame, season: int) -> pd.DataFrame:
         on="_merge_key", how="left"
     ).drop(columns=["_merge_key"])
     merged = merged.rename(columns={"ecr": "fantasypros_ecr"})
+
+    # FALLBACK MATCHING: if the exact normalized name didn't match (still
+    # NaN), try a looser "first initial + last name" match before giving up
+    # entirely. Exact-name matching can silently fail on minor spelling/
+    # formatting differences between our roster data and FantasyPros -
+    # this catches more real matches instead of leaving a player unblended
+    # (which was one of two suspected causes of players like Lamb/Egbuka/
+    # Rice showing up unrealistically late in round-by-round targeting).
+    def _loose_key(name):
+        if pd.isna(name):
+            return name
+        parts = _normalize_name(name).split()
+        if len(parts) < 2:
+            return _normalize_name(name)
+        return f"{parts[0][0]}_{parts[-1]}"  # first initial + last name
+
+    still_missing = merged["fantasypros_ecr"].isna()
+    if still_missing.any():
+        rankings_df["_loose_key"] = rankings_df["player"].apply(_loose_key)
+        ff_rankings["_loose_key"] = ff_rankings["player"].apply(_loose_key)
+        loose_lookup = ff_rankings.drop_duplicates(subset=["_loose_key"])[
+            ["_loose_key", "ecr", "player_owned_yahoo"]
+        ].rename(columns={"ecr": "fantasypros_ecr_loose", "player_owned_yahoo": "player_owned_yahoo_loose"})
+
+        merged = merged.merge(
+            rankings_df[["gsis_id", "_loose_key"]], on="gsis_id", how="left"
+        ).merge(loose_lookup, on="_loose_key", how="left").drop(columns=["_loose_key"])
+
+        merged["fantasypros_ecr"] = merged["fantasypros_ecr"].fillna(merged["fantasypros_ecr_loose"])
+        merged["player_owned_yahoo"] = merged["player_owned_yahoo"].fillna(merged["player_owned_yahoo_loose"])
+        merged = merged.drop(columns=["fantasypros_ecr_loose", "player_owned_yahoo_loose"])
+
     merged["our_rank_delta"] = merged["fantasypros_ecr"] - merged["overall_rank"]
 
     return merged.sort_values("our_rank_delta", ascending=False)
@@ -815,20 +850,21 @@ def build_draft_rankings_backtest(test_season: int, league_settings: dict = None
 def compute_blended_rankings(rankings_df: pd.DataFrame, our_weight: float = 0.5) -> pd.DataFrame:
     """
     Blends our pure stats-based rank (overall_rank, built entirely from last
-    season's rate stats) with FantasyPros consensus rank (fantasypros_ecr) -
-    since public consensus DOES account for things our historical-rate model
-    structurally can't: new coordinators, scheme fits, offseason situational
-    buzz, injury recovery outlook, etc. Rather than pretend our stats-only
-    model captures those things, this leans on public expert knowledge as a
-    genuine input to correct for it, not just a comparison metric.
+    season's rate stats) with FantasyPros consensus rank (fantasypros_ecr).
 
-    our_weight: 0.0 = pure FantasyPros consensus, 1.0 = pure our stats-only
-    rank, 0.5 = even blend (default). Rows with no FantasyPros match fall
-    back to our own rank alone (can't blend with a missing value).
+    ADAPTIVE WEIGHTING FIX: a flat 50/50 blend wasn't correcting severely
+    tanked stats-only ranks (e.g. a player coming off an injury-shortened
+    season, or a rookie whose situation just improved) - the correction was
+    too weak to overcome a large gap. A big disagreement between our stats
+    rank and public consensus is ITSELF evidence that situational factors
+    our stats-only model can't see (injury recovery outlook, new role, new
+    scheme) are likely driving the difference - so the bigger the gap, the
+    more weight shifts toward public consensus, up to a floor of 20% our
+    stats weight even for extreme disagreements (never fully abandons our
+    own signal entirely).
 
-    Adds blended_rank as a new sortable column - the recommended default
-    view, since it corrects for the known situational blind spot while
-    still keeping our_rank_delta/overall_rank visible for transparency.
+    our_weight is now the BASE weight used when our rank and FantasyPros
+    roughly agree - it gets reduced automatically as disagreement grows.
     """
     df = rankings_df.copy()
     if "fantasypros_ecr" not in df.columns:
@@ -842,7 +878,12 @@ def compute_blended_rankings(rankings_df: pd.DataFrame, our_weight: float = 0.5)
         if pd.isna(row.get("fantasypros_ecr")):
             return row["overall_rank"]  # no public data to blend with - use our rank alone
         public_pct = row["fantasypros_ecr"] / max_rank
-        blended_pct = (our_weight * our_pct) + ((1 - our_weight) * public_pct)
+
+        # adaptive weight: shrink our_weight as disagreement grows
+        disagreement = abs(our_pct - public_pct)  # 0 = perfect agreement, up to ~1 = max disagreement
+        adaptive_weight = max(our_weight * (1 - disagreement), 0.2 * our_weight)
+
+        blended_pct = (adaptive_weight * our_pct) + ((1 - adaptive_weight) * public_pct)
         return blended_pct * max_rank
 
     df["blended_score"] = df.apply(_blend, axis=1)
