@@ -616,7 +616,7 @@ def calc_kicking_mu(kicker_player_stats_row: dict) -> dict:
 # 5b. FANTASY POINTS CALCULATION (offense + kicker)
 # ---------------------------------------------------------------------------
 
-def calc_offense_fantasy_points(player_stats_row: dict) -> float:
+def calc_offense_fantasy_points(player_stats_row: dict, ppr_value: float = 1.0) -> float:
     """
     Full PPR offensive fantasy scoring, using confirmed real player_stats columns:
       passing_yards, passing_tds, passing_interceptions,
@@ -643,7 +643,7 @@ def calc_offense_fantasy_points(player_stats_row: dict) -> float:
     points += r.get("passing_interceptions", 0) * -1
     points += r.get("rushing_yards", 0) * 0.1
     points += r.get("rushing_tds", 0) * 6
-    points += r.get("receptions", 0) * 1
+    points += r.get("receptions", 0) * ppr_value
     points += r.get("receiving_yards", 0) * 0.1
     points += r.get("receiving_tds", 0) * 6
 
