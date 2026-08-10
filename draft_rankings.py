@@ -34,22 +34,32 @@ from nfl_model_combined import (
 
 
 # ---------------------------------------------------------------------------
-# LEAGUE SETTINGS
+# LEAGUE SETTINGS - now fully adjustable, not a fixed constant
 # ---------------------------------------------------------------------------
 
-LEAGUE_SETTINGS = {
-    "num_teams": 6,
-    "starters": {
-        "QB": 1,
-        "RB": 2,
-        "WR": 2,
-        "TE": 1,
-        "FLEX": 3,   # RB/WR/TE eligible
-        "DEF": 1,
-        "K": 1,
-    },
-    "bench": 6,
-}
+def build_league_settings(num_teams: int = 6, draft_position: int = 3,
+                           qb: int = 1, rb: int = 2, wr: int = 2, te: int = 1,
+                           flex: int = 3, def_: int = 1, k: int = 1, bench: int = 6,
+                           ppr_value: float = 1.0) -> dict:
+    """
+    Builds a league settings dict from adjustable parameters - replaces the
+    old hardcoded LEAGUE_SETTINGS constant so every draft-relevant setting
+    (roster composition, team count, PPR value, draft slot) can be changed
+    per-league from the UI instead of being fixed to one specific league.
+    """
+    return {
+        "num_teams": num_teams,
+        "draft_position": draft_position,
+        "starters": {"QB": qb, "RB": rb, "WR": wr, "TE": te, "FLEX": flex, "DEF": def_, "K": k},
+        "bench": bench,
+        "ppr_value": ppr_value,
+    }
+
+
+# Default settings matching the league originally described - kept as a
+# fallback / example, but build_yahoo_style_rankings() now takes settings
+# as a parameter rather than always using this fixed dict.
+LEAGUE_SETTINGS = build_league_settings()
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +154,7 @@ def calc_team_defense_fantasy_points(defense_row: dict, points_allowed: float = 
 
 def build_season_projection(player_gsis_id: str, position: str,
                              player_stats_df: pd.DataFrame, projection_season: int,
-                             games_in_season: int = 17) -> dict:
+                             games_in_season: int = 17, ppr_value: float = 1.0) -> dict:
     """
     Builds a FULL-SEASON projection for draft purposes, using last season's
     per-game rate stats projected forward across a full season - genuinely
@@ -156,6 +166,8 @@ def build_season_projection(player_gsis_id: str, position: str,
     Uses the player's most recent completed season (projection_season - 1)
     as the rate basis. Games played is capped at the games they actually
     played (injury-shortened seasons don't get inflated to a full 17).
+    ppr_value is now passed through to scoring so PPR/half-PPR/standard
+    leagues get correctly different projections, not just full PPR always.
     """
     prior_season = projection_season - 1
     history = player_stats_df[
@@ -164,7 +176,7 @@ def build_season_projection(player_gsis_id: str, position: str,
     if history.empty:
         return {"season_proj_points": np.nan, "games_played_prior": 0, "ppg_prior": np.nan}
 
-    per_game_points = history.apply(lambda r: calc_offense_fantasy_points(r.to_dict()), axis=1)
+    per_game_points = history.apply(lambda r: calc_offense_fantasy_points(r.to_dict(), ppr_value), axis=1)
     games_played = len(history)
     ppg = per_game_points.mean()
 
@@ -296,15 +308,20 @@ def get_bye_weeks(season: int, schedules_df: pd.DataFrame) -> dict:
     return bye_weeks
 
 
-def build_yahoo_style_rankings(season: int) -> pd.DataFrame:
+def build_yahoo_style_rankings(season: int, league_settings: dict = None) -> pd.DataFrame:
     """
     Builds the full draft ranking table in Yahoo's standard display format:
     Rank | Player | Pos | Team | Bye | Proj Pts | Pos Rank
 
-    Ranked by VOR (value over replacement) for THIS specific league's
-    6-team, 1QB/2RB/2WR/1TE/3FLEX/1DEF/1K/6BN settings - not generic
-    industry rankings.
+    Ranked by VOR (value over replacement) for the GIVEN league_settings -
+    fully adjustable now (team count, roster composition, PPR value) rather
+    than fixed to one hardcoded league. Falls back to the default 6-team
+    example settings if none provided.
     """
+    if league_settings is None:
+        league_settings = LEAGUE_SETTINGS
+    ppr_value = league_settings.get("ppr_value", 1.0)
+
     player_stats_df = pull_player_stats([season - 1])
     rosters_df = pull_rosters([season])
     schedules_df = pull_schedules([season])
@@ -324,7 +341,7 @@ def build_yahoo_style_rankings(season: int) -> pd.DataFrame:
         if position == "K":
             proj = build_kicker_season_projection(gsis_id, player_stats_df, season)
         else:
-            proj = build_season_projection(gsis_id, position, player_stats_df, season)
+            proj = build_season_projection(gsis_id, position, player_stats_df, season, ppr_value=ppr_value)
 
         if pd.isna(proj["season_proj_points"]):
             continue  # no prior-season data to project from - skip rather than guess
@@ -344,7 +361,7 @@ def build_yahoo_style_rankings(season: int) -> pd.DataFrame:
     if projections_df.empty:
         return projections_df
 
-    replacement_levels = compute_replacement_levels(projections_df, LEAGUE_SETTINGS)
+    replacement_levels = compute_replacement_levels(projections_df, league_settings)
     vor_df = compute_vor(projections_df, replacement_levels)
 
     vor_df = vor_df.sort_values("vor", ascending=False).reset_index(drop=True)
@@ -359,8 +376,97 @@ def build_yahoo_style_rankings(season: int) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 5. RISER DETECTION - our rank vs FantasyPros public consensus
+# 5b. SNAKE DRAFT - your pick number each round, and who to target
 # ---------------------------------------------------------------------------
+
+def get_snake_pick_numbers(num_teams: int, draft_position: int, total_rounds: int) -> list:
+    """
+    Computes YOUR overall pick number in each round of a snake draft.
+    Snake draft alternates direction each round: Round 1 goes 1->num_teams,
+    Round 2 goes num_teams->1, Round 3 goes 1->num_teams again, etc.
+
+    Example: 6-team league, drafting 3rd -> picks are 3, 10, 15, 22, 27, 34...
+    """
+    picks = []
+    for round_num in range(1, total_rounds + 1):
+        if round_num % 2 == 1:  # odd round - normal order
+            overall_pick = (round_num - 1) * num_teams + draft_position
+        else:  # even round - reversed order
+            overall_pick = (round_num - 1) * num_teams + (num_teams - draft_position + 1)
+        picks.append({"round": round_num, "overall_pick": overall_pick})
+    return picks
+
+
+def build_snake_draft_targets(rankings_df: pd.DataFrame, league_settings: dict,
+                               num_targets_per_round: int = 5) -> pd.DataFrame:
+    """
+    For each of YOUR picks in a snake draft, shows the top remaining
+    candidates by VOR at that point in the draft.
+
+    SIMPLIFYING ASSUMPTION FLAGGED: to know who's "still available" at your
+    pick, this simulates every OTHER team's pick as "take the best remaining
+    player by VOR" - a reasonable default, but real drafters have positional
+    needs, personal preferences, and reach for sleepers, so actual
+    availability at your real draft will differ from this simulation. This
+    is a realistic *starting point* to plan around, not a guarantee of
+    exactly who'll be there.
+
+    For picks that land on YOU, we don't force a single pick - instead we
+    show the top num_targets_per_round remaining players so you can choose,
+    then assume (for the sake of continuing the simulation into later
+    rounds) that you take the #1 remaining VOR player before simulating
+    forward - same simplifying logic applied to your own pick as everyone
+    else's, just so later-round availability keeps making sense.
+    """
+    num_teams = league_settings["num_teams"]
+    draft_position = league_settings["draft_position"]
+    starters = league_settings["starters"]
+    total_rounds = sum(starters.values()) + league_settings["bench"]
+
+    your_picks = get_snake_pick_numbers(num_teams, draft_position, total_rounds)
+    your_pick_numbers = {p["overall_pick"] for p in your_picks}
+
+    pool = rankings_df.sort_values("vor", ascending=False).reset_index(drop=True).copy()
+    drafted_gsis_ids = set()
+
+    results = []
+    overall_pick_counter = 0
+    for round_info in your_picks:
+        round_num = round_info["round"]
+        target_pick = round_info["overall_pick"]
+
+        # simulate every pick leading up to (and not including) your pick
+        while overall_pick_counter < target_pick - 1:
+            overall_pick_counter += 1
+            remaining = pool[~pool["gsis_id"].isin(drafted_gsis_ids)]
+            if remaining.empty:
+                break
+            top_pick = remaining.iloc[0]
+            drafted_gsis_ids.add(top_pick["gsis_id"])
+
+        # now show top remaining candidates at YOUR pick
+        remaining = pool[~pool["gsis_id"].isin(drafted_gsis_ids)]
+        top_candidates = remaining.head(num_targets_per_round)
+
+        for _, candidate in top_candidates.iterrows():
+            results.append({
+                "round": round_num,
+                "your_overall_pick": target_pick,
+                "player": candidate["player"],
+                "position": candidate["position"],
+                "team": candidate["team"],
+                "season_proj_points": candidate["season_proj_points"],
+                "vor": candidate["vor"],
+            })
+
+        # advance simulation assuming you take the top remaining player,
+        # so later rounds' availability keeps making sense
+        overall_pick_counter += 1
+        if not remaining.empty:
+            drafted_gsis_ids.add(remaining.iloc[0]["gsis_id"])
+
+    return pd.DataFrame(results)
+
 
 def detect_risers(rankings_df: pd.DataFrame, season: int) -> pd.DataFrame:
     """
