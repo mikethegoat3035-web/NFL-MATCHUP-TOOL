@@ -425,4 +425,3 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
 
 elif mode != "Draft Rankings":
     st.info("Click the button above to load this week's props.")
-
