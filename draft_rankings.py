@@ -852,39 +852,48 @@ def compute_blended_rankings(rankings_df: pd.DataFrame, our_weight: float = 0.5)
     Blends our pure stats-based rank (overall_rank, built entirely from last
     season's rate stats) with FantasyPros consensus rank (fantasypros_ecr).
 
-    ADAPTIVE WEIGHTING FIX: a flat 50/50 blend wasn't correcting severely
-    tanked stats-only ranks (e.g. a player coming off an injury-shortened
-    season, or a rookie whose situation just improved) - the correction was
-    too weak to overcome a large gap. A big disagreement between our stats
-    rank and public consensus is ITSELF evidence that situational factors
-    our stats-only model can't see (injury recovery outlook, new role, new
-    scheme) are likely driving the difference - so the bigger the gap, the
-    more weight shifts toward public consensus, up to a floor of 20% our
-    stats weight even for extreme disagreements (never fully abandons our
-    own signal entirely).
+    REAL BUG FIXED (found via live test: CeeDee Lamb overall_rank=42,
+    fantasypros_ecr=5.54, but blended_rank only moved to 39 - barely any
+    correction at all). The old formula compared ranks as PERCENTAGES OF
+    THE TOTAL POOL (e.g. 42/250 vs 5.54/250) - when both ranks are small
+    numbers near the top of the board, that percentage gap looks tiny even
+    though the real difference (42nd vs 5th) is enormous. This meant the
+    adaptive weighting barely engaged for exactly the players you'd notice
+    most - elite guys with a rough prior season. This bug applied to EVERY
+    player near the top of the board, not just one - the fix below is a
+    per-row calculation applied uniformly across the whole rankings table.
 
-    our_weight is now the BASE weight used when our rank and FantasyPros
-    roughly agree - it gets reduced automatically as disagreement grows.
+    FIXED: now uses the RATIO between the two ranks (worse_rank / better_rank)
+    instead of a percentage-of-max difference. A ratio of 1.0 = perfect
+    agreement; Lamb's case (42 vs 5.54) is a ~7.6x ratio - correctly read as
+    extreme disagreement regardless of where in the list it happens. Also
+    blends the RAW ranks directly now (not percentage-of-max), which is
+    simpler and behaves consistently at every point in the rankings, not
+    just at the extremes.
+
+    our_weight is the BASE weight when ranks roughly agree (ratio near 1.0);
+    it shrinks toward a floor (15% of base) as the ratio grows, capping out
+    at a ratio of 5x (i.e. one rank being 5x worse than the other is already
+    treated as maximum disagreement).
     """
     df = rankings_df.copy()
     if "fantasypros_ecr" not in df.columns:
         df["blended_rank"] = df["overall_rank"]
         return df
 
-    max_rank = max(df["overall_rank"].max(), df["fantasypros_ecr"].max(skipna=True))
-
     def _blend(row):
-        our_pct = row["overall_rank"] / max_rank
+        our_rank = row["overall_rank"]
         if pd.isna(row.get("fantasypros_ecr")):
-            return row["overall_rank"]  # no public data to blend with - use our rank alone
-        public_pct = row["fantasypros_ecr"] / max_rank
+            return our_rank  # no public data to blend with - use our rank alone
+        public_rank = row["fantasypros_ecr"]
 
-        # adaptive weight: shrink our_weight as disagreement grows
-        disagreement = abs(our_pct - public_pct)  # 0 = perfect agreement, up to ~1 = max disagreement
-        adaptive_weight = max(our_weight * (1 - disagreement), 0.2 * our_weight)
+        better = min(our_rank, public_rank)
+        worse = max(our_rank, public_rank)
+        ratio = worse / max(better, 1)
+        disagreement_factor = min((ratio - 1) / 4.0, 1.0)  # ratio of 5x+ = max disagreement
 
-        blended_pct = (adaptive_weight * our_pct) + ((1 - adaptive_weight) * public_pct)
-        return blended_pct * max_rank
+        adaptive_weight = max(our_weight * (1 - disagreement_factor), 0.15 * our_weight)
+        return (adaptive_weight * our_rank) + ((1 - adaptive_weight) * public_rank)
 
     df["blended_score"] = df.apply(_blend, axis=1)
     df["blended_rank"] = df["blended_score"].rank(method="min").astype(int)
