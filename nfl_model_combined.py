@@ -24,6 +24,7 @@ can safely join/filter on `gsis_id` consistently across all tables.
 
 import pandas as pd
 import numpy as np
+import functools
 
 try:
     import nflreadpy as nfl
@@ -32,15 +33,52 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# 0. IN-PROCESS PULL CACHE
+#
+# PERFORMANCE FIX: build_season_accuracy_report() calls build_weekly_slate()
+# once per week in a loop (16-17 times for a full season). Every pull_*
+# function below re-fetches the SAME season-level data (pbp, participation,
+# ftn, ngs, etc.) on every single call, since that data doesn't change
+# week-to-week within a season - this was a genuine redundant-network-call
+# bug (a full season report was re-downloading the entire season's raw
+# data 16-17x over), not just "the data is naturally big/slow." This
+# decorator makes every pull_* function fetch each unique argument
+# combination exactly ONCE per process; repeat calls (e.g. every week of
+# the season loop asking for the same season's pbp) hit the in-memory
+# cache instead of hitting the network again. A fresh Streamlit run/rerun
+# starts with an empty cache naturally, so this never serves stale data
+# across separate scans - only within the SAME run's redundant re-asks.
+# ---------------------------------------------------------------------------
+
+_PULL_CACHE: dict = {}
+
+
+def _cache_pull(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        hashable_args = tuple(tuple(a) if isinstance(a, list) else a for a in args)
+        hashable_kwargs = tuple(sorted(
+            (k, tuple(v) if isinstance(v, list) else v) for k, v in kwargs.items()
+        ))
+        key = (func.__name__, hashable_args, hashable_kwargs)
+        if key not in _PULL_CACHE:
+            _PULL_CACHE[key] = func(*args, **kwargs)
+        return _PULL_CACHE[key]
+    return wrapper
+
+
+# ---------------------------------------------------------------------------
 # 1. DATA PULL FUNCTIONS
 # ---------------------------------------------------------------------------
 
+@_cache_pull
 def pull_pbp(years: list[int]) -> pd.DataFrame:
     """Play-by-play data for the given seasons, converted to pandas."""
     df = nfl.load_pbp(seasons=years)
     return df.to_pandas()
 
 
+@_cache_pull
 def pull_ngs(stat_type: str, years: list[int]) -> pd.DataFrame:
     """
     stat_type: 'passing', 'rushing', or 'receiving'
@@ -50,6 +88,7 @@ def pull_ngs(stat_type: str, years: list[int]) -> pd.DataFrame:
     return df.to_pandas()
 
 
+@_cache_pull
 def pull_player_stats(years: list[int]) -> pd.DataFrame:
     """
     Game-level player stats (targets, receptions, rush att, pass yds, etc.).
@@ -64,12 +103,14 @@ def pull_player_stats(years: list[int]) -> pd.DataFrame:
     return df
 
 
+@_cache_pull
 def pull_snap_counts(years: list[int]) -> pd.DataFrame:
     """Snap counts by player/game - used as a route-participation / opportunity proxy."""
     df = nfl.load_snap_counts(seasons=years)
     return df.to_pandas()
 
 
+@_cache_pull
 def pull_ftn_charting(years: list[int]) -> pd.DataFrame:
     """
     FTN manual charting data (free, 2022-onward).
@@ -80,6 +121,7 @@ def pull_ftn_charting(years: list[int]) -> pd.DataFrame:
     return df.to_pandas()
 
 
+@_cache_pull
 def pull_participation(years: list[int]) -> pd.DataFrame:
     """
     Participation data - carries defense_man_zone_type, defense_coverage_type,
@@ -89,11 +131,13 @@ def pull_participation(years: list[int]) -> pd.DataFrame:
     return df.to_pandas()
 
 
+@_cache_pull
 def pull_schedules(years: list[int]) -> pd.DataFrame:
     df = nfl.load_schedules(seasons=years)
     return df.to_pandas()
 
 
+@_cache_pull
 def pull_rosters(years: list[int]) -> pd.DataFrame:
     df = nfl.load_rosters(seasons=years)
     return df.to_pandas()
@@ -1917,6 +1961,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+@_cache_pull
 def pull_depth_charts(years: list[int]) -> pd.DataFrame:
     df = nfl.load_depth_charts(seasons=years)
     return df.to_pandas()
