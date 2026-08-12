@@ -10,7 +10,7 @@ Data sources (all free, via nflreadpy):
   - load_snap_counts()      -> snap share / route participation proxy
   - load_ftn_charting()     -> FTN charting: coverage type, man/zone, box count, motion, play-action
   - load_participation()    -> also carries defense_man_zone_type / defense_coverage_type, time_to_throw, was_pressure
-
+a
 NOTE: nflreadpy returns Polars DataFrames. We convert to pandas immediately
 after each pull so the rest of the codebase (styling, Streamlit, scoring)
 stays consistent with the pandas-based MLB tool.
@@ -777,7 +777,7 @@ def calc_quality_score(matchup_exploit_strength: float, sample_size_games: int,
 
 def build_player_coverage_efficiency(player_gsis_id: str, role: str, season: int,
                                       participation_df: pd.DataFrame, pbp_df: pd.DataFrame,
-                                      min_plays_per_bucket: int = 8, current_team: str = None,
+                                      min_plays_per_bucket: int = 14, current_team: str = None,
                                       prior_participation_df: pd.DataFrame = None,
                                       prior_pbp_df: pd.DataFrame = None) -> dict:
     """
@@ -861,7 +861,7 @@ def build_player_coverage_efficiency(player_gsis_id: str, role: str, season: int
 
 def calc_coverage_adjusted_mu(base_mu: float, coverage_efficiency: dict,
                                opp_man_pct: float, opp_zone_pct: float,
-                               max_adjustment: float = 0.3) -> float:
+                               max_adjustment: float = 0.2) -> float:
     """
     Actually ADJUSTS mu based on the player's real man/zone efficiency split
     and this week's specific opponent's man/zone tendency - not just a
@@ -871,9 +871,19 @@ def calc_coverage_adjusted_mu(base_mu: float, coverage_efficiency: dict,
     build_player_coverage_efficiency), falls back to base_mu unadjusted
     rather than react to a small, noisy sample.
 
-    Adjustment is capped at +/- max_adjustment (default 30%) so a single
-    favorable/unfavorable matchup can't swing mu to an unrealistic degree
-    even with a real, decent-sized sample behind it.
+    TIGHTENED per real 2025 backtest results: adjustment_direction_accuracy
+    (did this adjustment move mu toward the real result more often than
+    not) came back at 48.4% across 7,641 real rows - worse than a coinflip.
+    min_plays_per_bucket raised from 8 to 14 (build_player_coverage_
+    efficiency requires more real history before trusting a man/zone split
+    enough to adjust mu at all) and max_adjustment tightened from 30% to
+    20% (limits how much damage a still-imperfect signal can do even when
+    it does fire). This limits the blast radius of a proven-unreliable
+    mechanism; it is NOT a verified fix of whatever is actually causing the
+    wrong-direction calls, since the data used to find this problem didn't
+    include enough detail to diagnose the root cause. Re-run
+    build_season_accuracy_report() on the same weeks after this change to
+    see whether direction accuracy actually improves.
     """
     man_ypp = coverage_efficiency.get("man_ypp")
     zone_ypp = coverage_efficiency.get("zone_ypp")
@@ -1330,7 +1340,7 @@ def calc_box_quality_score(box_row: dict, box_profile_df: pd.DataFrame = None,
 
 def build_player_rush_box_efficiency(player_gsis_id: str, season: int,
                                       ftn_df: pd.DataFrame, pbp_df: pd.DataFrame,
-                                      min_plays_per_bucket: int = 8, current_team: str = None,
+                                      min_plays_per_bucket: int = 14, current_team: str = None,
                                       prior_ftn_df: pd.DataFrame = None,
                                       prior_pbp_df: pd.DataFrame = None) -> dict:
     """
@@ -1389,7 +1399,7 @@ def build_player_rush_box_efficiency(player_gsis_id: str, season: int,
 
 
 def calc_box_adjusted_mu(base_mu: float, box_efficiency: dict, opp_stacked_pct: float,
-                          max_adjustment: float = 0.3) -> float:
+                          max_adjustment: float = 0.2) -> float:
     """
     Real mu adjustment (not just a quality_score side signal), same shape
     as calc_coverage_adjusted_mu(): uses this RB's own real light-vs-stacked
@@ -1542,17 +1552,38 @@ def calc_role_verification_score(role_trend: dict, min_games: int = 2) -> float:
 
 def calc_blended_matchup_strength(structural_exploit: float, grade_exploit: float,
                                    role_verification_score: float,
-                                   structural_weight: float = 0.5) -> float:
+                                   structural_weight: float = 0.5,
+                                   matchup_weight: float = 0.35) -> float:
     """
     Combines the structural tendency signal (coverage-elevation or
     box-count exploit strength, 0-1) with the grade-based crosswalk signal
     (calc_grade_matchup_strength, 0-1) into one matchup signal, then blends
-    that 60/40 with the role-verification score - the same 60/40 real-role
-    check MLB's lineup_verification_score() applies on top of pure
-    pitcher-vs-hitter matchup data. Degrades gracefully: a missing
-    structural or grade component just reweights across whatever IS
-    available; a completely absent matchup signal falls back to neutral
-    (0.5) rather than zeroing the whole score out.
+    that with the role-verification score.
+
+    REWEIGHTED per real 2025 backtest results (build_season_accuracy_report):
+    role_verification_score showed a real, strong effect (fading-role rows
+    missed by ~37.6 yards on average vs ~21.5 for steady/growing-role rows -
+    nearly 2x), while adjustment_direction_accuracy (whether the coverage/
+    box-driven mu adjustment moved toward the real result) came back at
+    48.4% across 7,641 real rows - WORSE than a coinflip. That's real
+    evidence the structural+grade matchup_signal isn't earning the 60%
+    weight it originally had, and role_verification_score deserves more
+    than its original 40%. matchup_weight now defaults to 0.35 (was 0.6),
+    role_verification gets the remaining 0.65 (was 0.4).
+
+    NOT a claim that the root cause inside the coverage/box logic itself
+    has been found and fixed - the backtest export used to find this
+    didn't include mu_before_coverage_adj/mu_before_box_adj, so WHY the
+    adjustment is wrong that often isn't diagnosed yet, only THAT it is.
+    This reweighting is a data-justified damage-limitation move (trust the
+    proven signal more, the unproven/underperforming one less), not a
+    verified root-cause fix. Re-run build_season_accuracy_report on the
+    same week range after this change to see whether it actually helped.
+
+    Degrades gracefully: a missing structural or grade component just
+    reweights across whatever IS available; a completely absent matchup
+    signal falls back to neutral (0.5) rather than zeroing the whole score
+    out.
     """
     parts = [(structural_exploit, structural_weight), (grade_exploit, 1 - structural_weight)]
     valid = [(v, w) for v, w in parts if pd.notna(v)]
@@ -1564,7 +1595,7 @@ def calc_blended_matchup_strength(structural_exploit: float, grade_exploit: floa
 
     if pd.isna(role_verification_score):
         return round(matchup_signal, 3)
-    return round(matchup_signal * 0.6 + role_verification_score * 0.4, 3)
+    return round(matchup_signal * matchup_weight + role_verification_score * (1 - matchup_weight), 3)
 
 
 def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
