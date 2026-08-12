@@ -424,8 +424,18 @@ elif st.session_state.show_season_report and st.session_state.season_report is n
                 "quality_score isn't earning its keep as currently weighted."
             )
             st.dataframe(
-                report["by_quality_tier"].style.background_gradient(subset=["mean_abs_miss"], cmap="RdYlGn_r"),
+                report["by_quality_tier"].style.background_gradient(
+                    subset=["mean_abs_miss", "mean_match_ratio"], cmap="RdYlGn_r"
+                ),
                 width='stretch',
+            )
+            st.caption(
+                "Color both columns for a reason: mean_abs_miss alone can mislead - it's "
+                "naturally bigger for high-volume players regardless of tier, so a tier full "
+                "of bell-cow RBs can look green without actually being more accurate. "
+                "mean_match_ratio (miss scaled to that player's own normal variance) is the "
+                "real apples-to-apples check - if IT climbs (gets worse/redder) as the tier "
+                "goes up, quality_score is overconfident at the top even if raw miss looks fine."
             )
 
         if not report["role_verification_check"].empty:
