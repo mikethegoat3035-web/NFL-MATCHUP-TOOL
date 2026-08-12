@@ -1937,13 +1937,32 @@ def calc_box_adjusted_mu(base_mu: float, box_efficiency: dict, opp_stacked_pct: 
 #     single reused composite score was the confirmed bug).
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# FEATURE FLAGS - isolating untested additions from scoring after a real
+# regression (2025 backtest: quality_score tiers came back completely
+# INVERTED, <40 tier most accurate, 80-100 tier least accurate, after the
+# play-action/personnel crosswalks were added). These were never validated
+# against real data before being wired into quality_score, and multiple
+# changes landed in the same round in violation of the agreed one-change-
+# at-a-time process - these flags let the play-action/personnel signals
+# stay computed and visible (still show up as display columns) WITHOUT
+# affecting quality_score, so the reweighting fix and these new crosswalks
+# can be tested in isolation instead of as one tangled change. Flip back
+# to True only after re-testing shows each one is actually net-positive.
+# ---------------------------------------------------------------------------
+ENABLE_PLAYACTION_IN_QUALITY_SCORE = False
+ENABLE_PERSONNEL_IN_QUALITY_SCORE = False
+
+
 PROP_METRIC_CROSSWALK = {
     "pass_yards": {
         "offense_grades": ["passing_epa_grade", "cpoe_grade", "success_rate_grade", "adot_grade",
-                            "explosive_20plus_rate_grade", "pa_rate_grade", "pa_epa_diff_grade",
-                            "pressure_rate_faced_grade", "proe_grade"],
+                            "explosive_20plus_rate_grade"]
+                           + (["pa_rate_grade", "pa_epa_diff_grade", "pressure_rate_faced_grade", "proe_grade"]
+                              if ENABLE_PLAYACTION_IN_QUALITY_SCORE else []),
         "defense_grades": ["opp_pass_epa_allowed_grade", "opp_pressure_rate_generated_grade",
-                            "opp_pass_explosive_allowed_rate_grade", "opp_pa_epa_allowed_grade"],
+                            "opp_pass_explosive_allowed_rate_grade"]
+                          + (["opp_pa_epa_allowed_grade"] if ENABLE_PLAYACTION_IN_QUALITY_SCORE else []),
     },
     "rush_yards": {
         "offense_grades": ["rushing_epa_grade", "rush_yards_over_expected_per_att_grade", "efficiency_grade",
@@ -1955,7 +1974,8 @@ PROP_METRIC_CROSSWALK = {
                             "avg_separation_grade", "yac_above_expectation_grade",
                             "explosive_15plus_rate_grade"],
         "defense_grades": ["opp_pass_epa_allowed_grade", "opp_pressure_rate_generated_grade",
-                            "opp_pass_explosive_allowed_rate_grade", "opp_pa_epa_allowed_grade"],
+                            "opp_pass_explosive_allowed_rate_grade"]
+                          + (["opp_pa_epa_allowed_grade"] if ENABLE_PLAYACTION_IN_QUALITY_SCORE else []),
     },
 }
 
@@ -2288,7 +2308,11 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
         playaction_info = calc_playaction_exploit_strength(
             qb_pa_row, def_pa_row, coverage_pa_crosswalk, opponent, coverage_info.get("dominant_coverage")
         )
-        structural_parts = [v for v in [coverage_info.get("exploit_strength"), playaction_info.get("exploit_strength")] if pd.notna(v)]
+        # GATED per ENABLE_PLAYACTION_IN_QUALITY_SCORE - still computed and
+        # still attached to the row below for visibility, just excluded
+        # from scoring until validated (see feature-flag note above).
+        pa_exploit_for_scoring = playaction_info.get("exploit_strength") if ENABLE_PLAYACTION_IN_QUALITY_SCORE else np.nan
+        structural_parts = [v for v in [coverage_info.get("exploit_strength"), pa_exploit_for_scoring] if pd.notna(v)]
         combined_structural_exploit = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
 
         # ACTUAL mu adjustment (not just a quality_score side signal) using
@@ -2464,7 +2488,10 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             personnel_info = calc_personnel_exploit_strength(
                 team, offense_personnel_tendency, opponent, defense_personnel_allowed
             )
-            structural_parts = [v for v in [coverage_info.get("exploit_strength"), personnel_info.get("exploit_strength")] if pd.notna(v)]
+            # GATED per ENABLE_PERSONNEL_IN_QUALITY_SCORE - same isolation
+            # treatment as the play-action gate above.
+            personnel_exploit_for_scoring = personnel_info.get("exploit_strength") if ENABLE_PERSONNEL_IN_QUALITY_SCORE else np.nan
+            structural_parts = [v for v in [coverage_info.get("exploit_strength"), personnel_exploit_for_scoring] if pd.notna(v)]
             combined_structural_exploit = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
 
             # ACTUAL mu adjustment using this receiver's own real man/zone
