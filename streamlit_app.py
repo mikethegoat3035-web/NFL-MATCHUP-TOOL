@@ -8,15 +8,83 @@ same workflow as the MLB tool's adjustable Best Edges table.
 import streamlit as st
 import pandas as pd
 import numpy as np
-from nfl_model_combined import scan_full_slate_nfl, rescore_quality_mu_row_nfl, backtest_week
+from nfl_model_combined import (
+    scan_full_slate_nfl, rescore_quality_mu_row_nfl, backtest_week, build_season_accuracy_report,
+)
 from draft_rankings import (
     build_yahoo_style_rankings, detect_risers, build_league_settings,
     build_snake_draft_targets, compute_blended_rankings, build_draft_rankings_backtest,
 )
 
-st.set_page_config(page_title="NFL Matchup Tool", layout="wide")
-st.title("NFL Matchup Tool")
-st.caption("Scan a week's slate, then type in lines per row to get live edge/probability.")
+st.set_page_config(page_title="Dallas Cowboys Matchup Tool", layout="wide", page_icon="⭐")
+
+# -----------------------------------------------------------------------
+# COWBOYS THEME - navy/silver/white color scheme + navy star accents.
+# This only restyles chrome (header, buttons, tabs, dataframe accents) -
+# the scanner itself still covers every NFL team/matchup; it doesn't
+# change what data is pulled or how anything is scored. No team logos/
+# wordmarks are used (would be copyrighted team IP), just the color
+# palette and a plain unicode star for the visual accent.
+# -----------------------------------------------------------------------
+COWBOYS_NAVY = "#041E42"
+COWBOYS_SILVER = "#869397"
+COWBOYS_WHITE = "#FFFFFF"
+COWBOYS_ACCENT_BLUE = "#7F9695"
+
+st.markdown(f"""
+<style>
+    .stApp {{
+        background-color: {COWBOYS_WHITE};
+    }}
+    [data-testid="stHeader"] {{
+        background-color: {COWBOYS_NAVY};
+    }}
+    h1, h2, h3 {{
+        color: {COWBOYS_NAVY} !important;
+    }}
+    .stRadio > label, .stNumberInput > label, .stSelectbox > label {{
+        color: {COWBOYS_NAVY} !important;
+        font-weight: 600;
+    }}
+    div.stButton > button {{
+        background-color: {COWBOYS_NAVY};
+        color: {COWBOYS_WHITE};
+        border: 1px solid {COWBOYS_SILVER};
+        border-radius: 6px;
+        font-weight: 600;
+    }}
+    div.stButton > button:hover {{
+        background-color: {COWBOYS_SILVER};
+        color: {COWBOYS_NAVY};
+        border: 1px solid {COWBOYS_NAVY};
+    }}
+    [data-testid="stMetricValue"] {{
+        color: {COWBOYS_NAVY};
+    }}
+    .cowboys-banner {{
+        background: linear-gradient(90deg, {COWBOYS_NAVY} 0%, {COWBOYS_SILVER} 100%);
+        padding: 14px 20px;
+        border-radius: 8px;
+        margin-bottom: 12px;
+    }}
+    .cowboys-banner h1 {{
+        color: {COWBOYS_WHITE} !important;
+        margin: 0;
+        font-size: 28px;
+    }}
+    .cowboys-banner p {{
+        color: {COWBOYS_WHITE} !important;
+        margin: 2px 0 0 0;
+        opacity: 0.9;
+    }}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown(
+    '<div class="cowboys-banner"><h1>\u2605 Dallas Cowboys Matchup Tool</h1>'
+    '<p>Scan a week\'s slate across the league, then type in lines per row for live edge/probability.</p></div>',
+    unsafe_allow_html=True,
+)
 
 # -----------------------------------------------------------------------
 # Season / week selection
@@ -56,6 +124,10 @@ if "backtest_mode" not in st.session_state:
     st.session_state.backtest_mode = False
 if "draft_rankings_df" not in st.session_state:
     st.session_state.draft_rankings_df = None
+if "season_report" not in st.session_state:
+    st.session_state.season_report = None
+if "show_season_report" not in st.session_state:
+    st.session_state.show_season_report = False
 
 if mode == "Draft Rankings":
     st.subheader("League Settings")
@@ -96,19 +168,42 @@ if mode == "Draft Rankings":
                 st.session_state.draft_rankings_df = None
 else:
     button_label = "Run backtest" if mode.startswith("Backtest") else "Scan full slate"
-    if st.button(button_label, type="primary"):
-        with st.spinner(f"Pulling and scoring Week {week}, {season}..."):
-            try:
-                if mode.startswith("Backtest"):
-                    st.session_state.slate_df = backtest_week(season, week)
-                    st.session_state.backtest_mode = True
-                else:
-                    st.session_state.slate_df = scan_full_slate_nfl(season, week)
-                    st.session_state.backtest_mode = False
-                st.success(f"Loaded {len(st.session_state.slate_df)} prop rows.")
-            except Exception as e:
-                st.error(f"{'Backtest' if mode.startswith('Backtest') else 'Scan'} failed: {e}")
-                st.session_state.slate_df = None
+    if mode.startswith("Backtest"):
+        btn_col1, btn_col2 = st.columns(2)
+    else:
+        btn_col1 = st.container()
+        btn_col2 = None
+
+    with btn_col1:
+        if st.button(button_label, type="primary"):
+            with st.spinner(f"Pulling and scoring Week {week}, {season}..."):
+                try:
+                    if mode.startswith("Backtest"):
+                        st.session_state.slate_df = backtest_week(season, week)
+                        st.session_state.backtest_mode = True
+                        st.session_state.show_season_report = False
+                    else:
+                        st.session_state.slate_df = scan_full_slate_nfl(season, week)
+                        st.session_state.backtest_mode = False
+                        st.session_state.show_season_report = False
+                    st.success(f"Loaded {len(st.session_state.slate_df)} prop rows.")
+                except Exception as e:
+                    st.error(f"{'Backtest' if mode.startswith('Backtest') else 'Scan'} failed: {e}")
+                    st.session_state.slate_df = None
+
+    if btn_col2 is not None:
+        with btn_col2:
+            if st.button("Run Full-Season Readiness Report", type="secondary"):
+                with st.spinner(f"Scoring every completed week of {season} against real results - this pulls the full season, may take a while..."):
+                    try:
+                        st.session_state.season_report = build_season_accuracy_report(season)
+                        st.session_state.backtest_mode = True
+                        st.session_state.show_season_report = True
+                        n_rows = len(st.session_state.season_report["raw"])
+                        st.success(f"Scored {n_rows} rows across the completed weeks of {season}.")
+                    except Exception as e:
+                        st.error(f"Season readiness report failed: {e}")
+                        st.session_state.season_report = None
 
 # -----------------------------------------------------------------------
 # DRAFT RANKINGS DISPLAY
@@ -255,6 +350,111 @@ if mode == "Draft Rankings":
         st.info("Click 'Build Draft Rankings' to generate your league-specific board.")
 
 # -----------------------------------------------------------------------
+# SEASON READINESS REPORT DISPLAY
+# -----------------------------------------------------------------------
+elif st.session_state.show_season_report and st.session_state.season_report is not None:
+    report = st.session_state.season_report
+    raw = report["raw"]
+
+    if raw.empty:
+        st.warning("No scoreable rows came back for this season - check that the season has completed weeks with real player_stats data.")
+    else:
+        st.subheader(f"Season Readiness Report — {season}")
+        st.caption(
+            "Every starter row across every completed week, mu vs real result - not just "
+            "the biggest surprises. This is the pre-season calibration check: is "
+            "quality_score actually predictive, are the coverage/box mu adjustments "
+            "moving mu the right direction more than a coinflip, and is accuracy uneven "
+            "across any prop type or position. There's no free historical NFL prop-line "
+            "archive, so edge/lean itself can't be backtested against a real market line "
+            "- these are the checks that ARE possible without one."
+        )
+
+        rcol1, rcol2, rcol3 = st.columns(3)
+        with rcol1:
+            st.metric("Total scored rows", len(raw))
+        with rcol2:
+            st.metric("Mean absolute miss (all rows)", round(raw["abs_miss"].mean(), 1))
+        with rcol3:
+            adj_acc = report["adjustment_direction_accuracy"]
+            st.metric(
+                "mu-adjustment direction accuracy",
+                f"{adj_acc:.1%}" if pd.notna(adj_acc) else "n/a",
+                help="Of rows where the coverage/box adjustment actually moved mu, the % "
+                     "of the time that move was toward the real result. Should clear 50% "
+                     "by a real margin - if it doesn't, the adjustment isn't adding signal "
+                     "as currently weighted.",
+            )
+
+        st.markdown("**Accuracy by prop type** — is any specific prop systematically worse?")
+        st.dataframe(
+            report["by_prop_type"].style.background_gradient(subset=["mean_abs_miss"], cmap="RdYlGn_r"),
+            use_container_width=True,
+        )
+
+        st.markdown("**Accuracy by position**")
+        st.dataframe(
+            report["by_position"].style.background_gradient(subset=["mean_abs_miss"], cmap="RdYlGn_r"),
+            use_container_width=True,
+        )
+
+        if not report["by_quality_tier"].empty:
+            st.markdown(
+                "**Is quality_score actually predictive?** Higher tiers should show "
+                "tighter/more favorable misses than lower tiers - if they don't, "
+                "quality_score isn't earning its keep as currently weighted."
+            )
+            st.dataframe(
+                report["by_quality_tier"].style.background_gradient(subset=["mean_abs_miss"], cmap="RdYlGn_r"),
+                use_container_width=True,
+            )
+
+        if not report["role_verification_check"].empty:
+            st.markdown("**Does the role-verification trend signal add real accuracy?**")
+            st.dataframe(report["role_verification_check"], use_container_width=True)
+
+        with st.expander("Every scored row (raw)"):
+            st.dataframe(raw, use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("**Filtered check** — set your own floor and see if it actually tightens the miss")
+        st.caption(
+            "games_sampled here means weeks of real history behind that row, scaled for a "
+            "17-game season - not the same '10' MLB used for a 162-game season. edge isn't "
+            "filterable here since there's no real line in a backtest row to compute it from."
+        )
+        fcol_q, fcol_g = st.columns(2)
+        with fcol_q:
+            min_quality_check = st.slider("Minimum quality_score", 0, 100, 70, 5, key="readiness_quality_filter")
+        with fcol_g:
+            min_games_check = st.slider("Minimum games_sampled", 0, 17, 3, 1, key="readiness_games_filter")
+
+        check_cols = [c for c in ["player_display_name", "team", "position", "prop_type", "week",
+                                   "mu", "actual", "miss", "abs_miss", "sigma", "match_ratio",
+                                   "quality_score", "games_sampled"] if c in raw.columns]
+        filtered_check = raw[
+            (raw["quality_score"].fillna(0) >= min_quality_check)
+            & (raw["games_sampled"].fillna(0) >= min_games_check)
+        ][check_cols].sort_values("quality_score", ascending=False, na_position="last")
+
+        if filtered_check.empty:
+            st.info("No rows clear that floor - try lowering it.")
+        else:
+            fchk1, fchk2 = st.columns(2)
+            with fchk1:
+                st.metric(f"Rows at quality_score>={min_quality_check}", len(filtered_check))
+            with fchk2:
+                st.metric("Mean absolute miss (this subset)", round(filtered_check["abs_miss"].mean(), 1))
+            st.caption(
+                "Compare this mean absolute miss to the overall mean absolute miss above - if "
+                f"this quality_score>={min_quality_check} subset isn't meaningfully tighter than "
+                "the all-rows number, quality_score isn't separating good matchups from bad ones "
+                "yet at this threshold."
+            )
+            styled_check = filtered_check.style.background_gradient(subset=["abs_miss"], cmap="RdYlGn_r")
+            st.dataframe(styled_check, use_container_width=True)
+
+# -----------------------------------------------------------------------
 # Filters + editable table (Scan / Backtest modes)
 # -----------------------------------------------------------------------
 elif st.session_state.slate_df is not None and not st.session_state.slate_df.empty:
@@ -390,7 +590,10 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                               "opponent", "opp_dominant_coverage",
                               "opp_dominant_coverage_pct", "opp_num_elevated_coverages",
                               "opp_man_pct", "opp_zone_pct",
-                              "quality_score", "line", "p_over", "edge"]
+                              "opp_box_stack_pct", "opp_box_elevated",
+                              "quality_score", "grade_matchup_strength",
+                              "role_verification_score", "role_trend_ratio",
+                              "line", "p_over", "edge"]
         # Include the full individual coverage-type breakdown AND every
         # advanced metric grade (QB/WR/TE/RB own performance grades, plus
         # opponent defense grades) - column names vary by what's actually
@@ -402,11 +605,16 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         display_cols = [c for c in display_cols if c in scored_df.columns]
         scan_sorted = scored_df[display_cols].sort_values("edge", ascending=False, na_position="last")
         # Color-coded: edge/p_over use the MLB tool's green scale. Every
-        # coverage % column and every advanced metric grade (0-100 scale,
-        # already normalized so higher = always better/more notable) is
-        # ALSO color-coded the same way - brighter green = higher grade.
+        # coverage/box % column and every advanced metric grade (0-100
+        # scale, already normalized so higher = always better/more
+        # notable) is ALSO color-coded the same way - brighter green =
+        # higher grade. grade_matchup_strength/role_verification_score are
+        # 0-1 scale (not 0-100 like the raw grades) but still "higher =
+        # better", so the same gradient direction applies.
         gradient_cols = [c for c in (["edge", "p_over", "opp_man_pct", "opp_zone_pct",
-                                       "opp_dominant_coverage_pct", "quality_score"]
+                                       "opp_dominant_coverage_pct", "opp_box_stack_pct",
+                                       "quality_score", "grade_matchup_strength",
+                                       "role_verification_score"]
                                       + grade_cols + cov_breakdown_cols)
                           if c in scan_sorted.columns]
         styled_scan = scan_sorted.style.background_gradient(subset=gradient_cols, cmap="Greens")
@@ -414,13 +622,20 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         if "opp_dominant_coverage" in scan_sorted.columns:
             st.caption(
                 "opp_cov_* columns show the opponent defense's FULL coverage breakdown "
-                "(e.g. Cover 1 19%, Cover 2 17.5%, etc.). *_grade columns are 0-100 "
+                "(e.g. Cover 1 19%, Cover 2 17.5%, etc.); opp_box_stack_pct is the run-game "
+                "equivalent (share of plays with 7+ in the box). *_grade columns are 0-100 "
                 "percentile grades against this season's league-wide distribution - "
                 "player grades (EPA, target share, separation, etc.) and opponent "
                 "defense grades (pass/run EPA allowed, pressure rate) are both included. "
                 "Defense 'allowed' grades are inverted so high = good defense, consistent "
-                "with every other grade. mu itself is adjusted using each player's real "
-                "man/zone efficiency split (see mu_before_coverage_adj to compare)."
+                "with every other grade. quality_score now blends THREE signals: the "
+                "structural coverage/box-tendency exploit shown above, grade_matchup_strength "
+                "(this player's own skill grades vs the opponent's allowed grades, tailored "
+                "per prop type), and role_verification_score (whether this player's recent "
+                "real usage backs up their season-long role - see role_trend_ratio). mu "
+                "itself is separately adjusted using each player's real man/zone or "
+                "light-box/stacked-box efficiency split (see mu_before_coverage_adj / "
+                "mu_before_box_adj to compare)."
             )
 
 elif mode != "Draft Rankings":
