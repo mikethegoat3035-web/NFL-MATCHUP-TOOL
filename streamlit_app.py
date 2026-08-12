@@ -257,7 +257,7 @@ if mode == "Draft Rankings":
                 styled_bt = bt_display.style.background_gradient(
                     subset=["projection_miss"], cmap="RdYlGn_r"
                 )
-                st.dataframe(styled_bt, use_container_width=True)
+                st.dataframe(styled_bt, width='stretch')
 
         elif view == "Round-by-Round Targets (snake draft)":
             st.subheader(f"Your picks — drafting #{current_settings['draft_position']} in a {current_settings['num_teams']}-team snake draft")
@@ -287,7 +287,7 @@ if mode == "Draft Rankings":
                     round_display = round_targets[["player", "position", "team", "season_proj_points",
                                                      "vor", "blended_rank", "overall_rank", "fantasypros_ecr"]]
                     styled_round = round_display.style.background_gradient(subset=["vor"], cmap="Greens")
-                    st.dataframe(styled_round, use_container_width=True, hide_index=True)
+                    st.dataframe(styled_round, width='stretch', hide_index=True)
             else:
                 st.info("No targets generated - check league settings.")
 
@@ -343,9 +343,9 @@ if mode == "Draft Rankings":
             # where blended_rank puts them.
             if "vor" in display_final.columns:
                 styled_rankings = display_final.style.background_gradient(subset=["vor"], cmap="Greens")
-                st.dataframe(styled_rankings, use_container_width=True)
+                st.dataframe(styled_rankings, width='stretch')
             else:
-                st.dataframe(display_final, use_container_width=True)
+                st.dataframe(display_final, width='stretch')
     else:
         st.info("Click 'Build Draft Rankings' to generate your league-specific board.")
 
@@ -389,13 +389,13 @@ elif st.session_state.show_season_report and st.session_state.season_report is n
         st.markdown("**Accuracy by prop type** — is any specific prop systematically worse?")
         st.dataframe(
             report["by_prop_type"].style.background_gradient(subset=["mean_abs_miss"], cmap="RdYlGn_r"),
-            use_container_width=True,
+            width='stretch',
         )
 
         st.markdown("**Accuracy by position**")
         st.dataframe(
             report["by_position"].style.background_gradient(subset=["mean_abs_miss"], cmap="RdYlGn_r"),
-            use_container_width=True,
+            width='stretch',
         )
 
         if not report["by_quality_tier"].empty:
@@ -406,15 +406,15 @@ elif st.session_state.show_season_report and st.session_state.season_report is n
             )
             st.dataframe(
                 report["by_quality_tier"].style.background_gradient(subset=["mean_abs_miss"], cmap="RdYlGn_r"),
-                use_container_width=True,
+                width='stretch',
             )
 
         if not report["role_verification_check"].empty:
             st.markdown("**Does the role-verification trend signal add real accuracy?**")
-            st.dataframe(report["role_verification_check"], use_container_width=True)
+            st.dataframe(report["role_verification_check"], width='stretch')
 
         with st.expander("Every scored row (raw)"):
-            st.dataframe(raw, use_container_width=True)
+            st.dataframe(raw, width='stretch')
 
         st.markdown("---")
         st.markdown("**Filtered check** — set your own floor and see if it actually tightens the miss")
@@ -452,7 +452,7 @@ elif st.session_state.show_season_report and st.session_state.season_report is n
                 "yet at this threshold."
             )
             styled_check = filtered_check.style.background_gradient(subset=["abs_miss"], cmap="RdYlGn_r")
-            st.dataframe(styled_check, use_container_width=True)
+            st.dataframe(styled_check, width='stretch')
 
 # -----------------------------------------------------------------------
 # Filters + editable table (Scan / Backtest modes)
@@ -521,7 +521,7 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
             return [f"background-color: rgba(0, 140, 0, {intensity:.2f})"] * len(row)
 
         styled_backtest = display_only.style.apply(_row_color, axis=1)
-        st.dataframe(styled_backtest, use_container_width=True)
+        st.dataframe(styled_backtest, width='stretch')
         st.caption("Brighter green = closer to the significance threshold. Fading toward the dark background = the most extreme, rarest surprises.")
 
         valid = filtered.dropna(subset=["mu", "actual"])
@@ -566,7 +566,7 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
             },
             disabled=[c for c in filtered.columns if c not in ("line",)],
             num_rows="fixed",
-            use_container_width=True,
+            width='stretch',
             key="slate_editor",
         )
 
@@ -618,7 +618,7 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                                       + grade_cols + cov_breakdown_cols)
                           if c in scan_sorted.columns]
         styled_scan = scan_sorted.style.background_gradient(subset=gradient_cols, cmap="Greens")
-        st.dataframe(styled_scan, use_container_width=True)
+        st.dataframe(styled_scan, width='stretch')
         if "opp_dominant_coverage" in scan_sorted.columns:
             st.caption(
                 "opp_cov_* columns show the opponent defense's FULL coverage breakdown "
