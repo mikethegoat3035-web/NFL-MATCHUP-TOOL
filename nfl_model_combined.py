@@ -10,7 +10,7 @@ Data sources (all free, via nflreadpy):
   - load_snap_counts()      -> snap share / route participation proxy
   - load_ftn_charting()     -> FTN charting: coverage type, man/zone, box count, motion, play-action
   - load_participation()    -> also carries defense_man_zone_type / defense_coverage_type, time_to_throw, was_pressure
-a
+
 NOTE: nflreadpy returns Polars DataFrames. We convert to pandas immediately
 after each pull so the rest of the codebase (styling, Streamlit, scoring)
 stays consistent with the pandas-based MLB tool.
@@ -304,6 +304,411 @@ def build_explosive_rates(pbp_df: pd.DataFrame) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 3b. PLAY-ACTION TENDENCY + COVERAGE-SPECIFIC PLAY-ACTION VULNERABILITY
+#
+# Closes a real, previously-unused gap: FTN charting's is_play_action sat
+# in already-pulled data completely unwired. This isn't just "does this
+# team run play-action a lot" - it's the specific interaction requested:
+# does a defense's coverage mix (already tracked) get specifically worse
+# against play-action, AND does the offense in front of them both run PA
+# often AND actually perform well in it. Two separate offense/defense
+# profiles below, combined by calc_playaction_exploit_strength().
+# ---------------------------------------------------------------------------
+
+def build_qb_playaction_profile(season: int, week: int, pbp_df: pd.DataFrame,
+                                 ftn_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-QB play-action rate (share of his dropbacks that are play-action)
+    and play-action EFFECTIVENESS (his own EPA/play on PA snaps vs his own
+    EPA/play on non-PA snaps) - frequency and skill are graded separately,
+    since a QB can run PA constantly without being especially good at it,
+    or vice versa. Joins ftn_df (is_play_action) to pbp_df on
+    (game_id, play_id), same join fix used throughout this file for FTN/
+    participation data. Uses weeks BEFORE the target week only.
+    """
+    hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)
+                       & (pbp_df["play_type"] == "pass")]
+    if hist_pbp.empty:
+        return pd.DataFrame()
+
+    merged = hist_pbp.merge(
+        ftn_df[["nflverse_game_id", "nflverse_play_id", "is_play_action"]],
+        left_on=["game_id", "play_id"], right_on=["nflverse_game_id", "nflverse_play_id"], how="inner",
+    )
+    df = merged.dropna(subset=["passer_player_id", "is_play_action"])
+    if df.empty:
+        return pd.DataFrame()
+
+    agg = df.groupby(["passer_player_id", "is_play_action"]).agg(
+        epa=("epa", "mean"), n=("epa", "count"),
+    ).reset_index()
+
+    pa = agg[agg["is_play_action"] == True].rename(columns={"epa": "pa_epa", "n": "pa_plays"}).drop(columns=["is_play_action"])
+    non_pa = agg[agg["is_play_action"] == False].rename(columns={"epa": "non_pa_epa", "n": "non_pa_plays"}).drop(columns=["is_play_action"])
+
+    result = pa.merge(non_pa, on="passer_player_id", how="outer").rename(columns={"passer_player_id": "gsis_id"})
+    total_plays = result[["pa_plays", "non_pa_plays"]].fillna(0).sum(axis=1)
+    result["pa_rate"] = (result["pa_plays"].fillna(0) / total_plays).where(total_plays > 0)
+    result["pa_epa_diff"] = result["pa_epa"] - result["non_pa_epa"]  # how much better/worse he is IN play-action vs his own baseline
+
+    for col in ["pa_rate", "pa_epa_diff"]:
+        result[f"{col}_grade"] = result[col].apply(lambda v: calc_percentile_grade(v, result[col]))
+
+    return result
+
+
+def build_defense_playaction_allowed(season: int, week: int, pbp_df: pd.DataFrame,
+                                      ftn_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-defense play-action-allowed EPA vs non-PA-allowed EPA - the
+    OVERALL (not coverage-specific) play-action vulnerability signal, used
+    as a fallback when a team's dominant coverage doesn't have enough
+    charted PA-specific plays yet (see build_coverage_playaction_crosswalk).
+    """
+    hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)
+                       & (pbp_df["play_type"] == "pass")]
+    if hist_pbp.empty:
+        return pd.DataFrame()
+
+    merged = hist_pbp.merge(
+        ftn_df[["nflverse_game_id", "nflverse_play_id", "is_play_action"]],
+        left_on=["game_id", "play_id"], right_on=["nflverse_game_id", "nflverse_play_id"], how="inner",
+    )
+    df = merged.dropna(subset=["defteam", "is_play_action"])
+    if df.empty:
+        return pd.DataFrame()
+
+    agg = df.groupby(["defteam", "is_play_action"]).agg(epa=("epa", "mean")).reset_index()
+    pa = agg[agg["is_play_action"] == True].rename(columns={"epa": "pa_epa_allowed"}).drop(columns=["is_play_action"])
+    non_pa = agg[agg["is_play_action"] == False].rename(columns={"epa": "non_pa_epa_allowed"}).drop(columns=["is_play_action"])
+    result = pa.merge(non_pa, on="defteam", how="outer")
+    result["pa_vulnerability_gap"] = result["pa_epa_allowed"] - result["non_pa_epa_allowed"]  # positive = allows MORE in PA than normal
+
+    # allowed metric: lower is better defensively, same inversion convention as every other *_allowed grade in this file
+    result["pa_epa_allowed_grade"] = result["pa_epa_allowed"].apply(
+        lambda v: 100 - calc_percentile_grade(v, result["pa_epa_allowed"]) if pd.notna(v) else np.nan
+    )
+    return result
+
+
+def build_coverage_playaction_crosswalk(season: int, week: int, participation_df: pd.DataFrame,
+                                         ftn_df: pd.DataFrame, pbp_df: pd.DataFrame,
+                                         min_plays: int = 15) -> pd.DataFrame:
+    """
+    The actual requested interaction: per (defteam, coverage_type),
+    EPA allowed SPECIFICALLY on play-action plays run against that
+    coverage - e.g. does THIS defense's Cover 3 specifically get
+    exploited by play-action, not just "is this defense bad against PA
+    in general." Joins participation's coverage type + ftn's
+    is_play_action on the SAME play (both keyed off nflverse_game_id,
+    with participation's play id column named `play_id` and ftn's named
+    `nflverse_play_id` - a real naming mismatch between the two tables,
+    matched explicitly here), then pulls in defteam/epa from pbp.
+
+    Rows below min_plays are dropped (not returned as NaN) - a coverage
+    type a defense rarely plays on PA specifically doesn't have a
+    trustworthy sample yet, and the caller should fall back to the
+    overall (non-coverage-specific) play-action-allowed signal instead
+    (see calc_playaction_exploit_strength).
+    """
+    hist_participation = participation_df.dropna(subset=["defense_coverage_type"])
+    merged = hist_participation.merge(
+        ftn_df[["nflverse_game_id", "nflverse_play_id", "is_play_action"]],
+        left_on=["nflverse_game_id", "play_id"], right_on=["nflverse_game_id", "nflverse_play_id"], how="inner",
+    )
+    merged = merged.merge(
+        pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)][["game_id", "play_id", "defteam", "epa"]],
+        left_on=["nflverse_game_id", "play_id"], right_on=["game_id", "play_id"], how="inner",
+    )
+    df = merged[(merged["is_play_action"] == True) & merged["defteam"].notna()]
+    if df.empty:
+        return pd.DataFrame()
+
+    result = df.groupby(["defteam", "defense_coverage_type"]).agg(
+        pa_epa_allowed_in_coverage=("epa", "mean"), n_pa_plays=("epa", "count"),
+    ).reset_index()
+    result = result[result["n_pa_plays"] >= min_plays]
+    if result.empty:
+        return result
+
+    result["pa_epa_allowed_in_coverage_grade"] = result["pa_epa_allowed_in_coverage"].apply(
+        lambda v: 100 - calc_percentile_grade(v, result["pa_epa_allowed_in_coverage"]) if pd.notna(v) else np.nan
+    )
+    return result
+
+
+def calc_playaction_exploit_strength(qb_pa_row: dict, def_pa_row: dict,
+                                      coverage_pa_crosswalk_df: pd.DataFrame,
+                                      defteam: str, dominant_coverage: str) -> dict:
+    """
+    Combines the offense side (does this QB run PA often AND perform well
+    in it) with the defense side (is this specific defense - ideally in
+    its SPECIFIC dominant coverage, falling back to its overall PA-allowed
+    number if that coverage doesn't have a trustworthy PA-specific sample
+    yet - vulnerable to play-action) into one 0-1 exploit signal. This is
+    the real interaction requested: coverage tendency x play-action
+    tendency x play-action-specific vulnerability, not any of those three
+    in isolation.
+    """
+    offense_vals = [
+        qb_pa_row.get("pa_rate_grade") if qb_pa_row else None,
+        qb_pa_row.get("pa_epa_diff_grade") if qb_pa_row else None,
+    ]
+    offense_vals = [v for v in offense_vals if pd.notna(v)]
+    offense_component = (sum(offense_vals) / len(offense_vals) / 100) if offense_vals else np.nan
+
+    # Prefer the coverage-specific number; fall back to the defense's
+    # overall PA-allowed grade if that specific coverage lacks a sample.
+    coverage_specific_grade = np.nan
+    if not coverage_pa_crosswalk_df.empty and dominant_coverage is not None:
+        match = coverage_pa_crosswalk_df[
+            (coverage_pa_crosswalk_df["defteam"] == defteam)
+            & (coverage_pa_crosswalk_df["defense_coverage_type"] == dominant_coverage)
+        ]
+        if not match.empty:
+            coverage_specific_grade = match.iloc[0].get("pa_epa_allowed_in_coverage_grade")
+
+    if pd.notna(coverage_specific_grade):
+        defense_grade = coverage_specific_grade
+        used_coverage_specific = True
+    else:
+        defense_grade = def_pa_row.get("pa_epa_allowed_grade") if def_pa_row else np.nan
+        used_coverage_specific = False
+
+    defense_component = (1 - (defense_grade / 100)) if pd.notna(defense_grade) else np.nan
+
+    if pd.isna(offense_component) and pd.isna(defense_component):
+        return {"exploit_strength": np.nan, "used_coverage_specific_playaction_data": used_coverage_specific}
+    if pd.isna(offense_component):
+        return {"exploit_strength": round(defense_component, 3), "used_coverage_specific_playaction_data": used_coverage_specific}
+    if pd.isna(defense_component):
+        return {"exploit_strength": round(offense_component, 3), "used_coverage_specific_playaction_data": used_coverage_specific}
+    return {
+        "exploit_strength": round(offense_component * 0.5 + defense_component * 0.5, 3),
+        "used_coverage_specific_playaction_data": used_coverage_specific,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 3c. QB PRESSURE / TIME-TO-THROW PROFILE (own-side counterpart to the
+#     defense's existing pressure_rate_generated - was one-sided before,
+#     nothing on the QB's own side to pair against it)
+# ---------------------------------------------------------------------------
+
+def build_qb_pressure_profile(season: int, week: int, participation_df: pd.DataFrame,
+                               pbp_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    This QB's own pressure-rate-faced and average time-to-throw, joined
+    from participation_df (was_pressure, time_to_throw) via pbp for the
+    passer id. pressure_rate_faced is graded INVERTED (lower pressure
+    faced = better QB play/protection = higher grade), same convention as
+    every other *_allowed/faced metric in this file. avg_time_to_throw is
+    included for context but NOT graded directionally - a fast release
+    isn't unambiguously better or worse than a longer-developing deep
+    shot, unlike pressure faced which is unambiguous.
+    """
+    hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week) & (pbp_df["play_type"] == "pass")]
+    if hist_pbp.empty:
+        return pd.DataFrame()
+
+    merged = participation_df.merge(
+        hist_pbp[["game_id", "play_id", "passer_player_id"]],
+        left_on=["nflverse_game_id", "play_id"], right_on=["game_id", "play_id"], how="inner",
+    )
+    df = merged.dropna(subset=["passer_player_id"])
+    if df.empty or "was_pressure" not in df.columns:
+        return pd.DataFrame()
+
+    agg_dict = {"pressure_rate_faced": ("was_pressure", "mean")}
+    if "time_to_throw" in df.columns:
+        agg_dict["avg_time_to_throw"] = ("time_to_throw", "mean")
+
+    result = df.groupby("passer_player_id").agg(**agg_dict).reset_index().rename(columns={"passer_player_id": "gsis_id"})
+    result["pressure_rate_faced_grade"] = result["pressure_rate_faced"].apply(
+        lambda v: 100 - calc_percentile_grade(v, result["pressure_rate_faced"]) if pd.notna(v) else np.nan
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 3d. PROE (PASS RATE OVER EXPECTED) - previously flagged as not built,
+#     raw attempt volume used as a rougher stand-in. Expected pass rate is
+#     computed as the league-wide average pass rate for each (down,
+#     distance-bucket) situation, rather than a full trained model - a
+#     real, defensible free-data baseline, not the exact proprietary PROE
+#     methodology (which uses a trained model on score/time/etc. too).
+# ---------------------------------------------------------------------------
+
+def build_proe_profile(season: int, week: int, pbp_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-team PROE: actual pass rate minus the league-wide expected pass
+    rate for the same (down, distance-bucket) situations this team faced,
+    isolating real play-calling aggressiveness from the confound of a
+    team just facing more/fewer obvious passing downs. distance-bucket:
+    short (<=3), medium (4-7), long (8+). Only 1st/2nd/3rd/4th down,
+    normal (non-garbage-time-only) plays with a real down/ydstogo value.
+    """
+    hist_pbp = pbp_df[
+        (pbp_df["season"] == season) & (pbp_df["week"] < week)
+        & (pbp_df["play_type"].isin(["pass", "run"]))
+        & pbp_df["down"].notna() & pbp_df["ydstogo"].notna()
+    ].copy()
+    if hist_pbp.empty:
+        return pd.DataFrame()
+
+    hist_pbp["distance_bucket"] = pd.cut(
+        hist_pbp["ydstogo"], bins=[-0.1, 3, 7, 100], labels=["short", "medium", "long"]
+    )
+    hist_pbp["is_pass"] = (hist_pbp["play_type"] == "pass").astype(int)
+
+    league_expected = hist_pbp.groupby(["down", "distance_bucket"], observed=True)["is_pass"].mean().rename("expected_pass_rate")
+    hist_pbp = hist_pbp.merge(league_expected, on=["down", "distance_bucket"], how="left")
+
+    result = hist_pbp.groupby("posteam").agg(
+        actual_pass_rate=("is_pass", "mean"),
+        expected_pass_rate=("expected_pass_rate", "mean"),
+        n_plays=("is_pass", "count"),
+    ).reset_index()
+    result["proe"] = result["actual_pass_rate"] - result["expected_pass_rate"]
+    result["proe_grade"] = result["proe"].apply(lambda v: calc_percentile_grade(v, result["proe"]))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 3e. MOTION / NO-HUDDLE TENDENCY (display/context only - NOT wired into
+#     quality_score, since neither has a paired "defense specifically
+#     struggles against motion/no-huddle" metric to combine it with the
+#     way play-action does. Flagged honestly rather than wired in on a
+#     guess; a genuine future addition would need the same paired
+#     offense-tendency x defense-vulnerability treatment PA just got.)
+# ---------------------------------------------------------------------------
+
+def build_motion_tendency_profile(season: int, week: int, ftn_df: pd.DataFrame,
+                                   pbp_df: pd.DataFrame) -> pd.DataFrame:
+    """Per-offense motion rate and no-huddle rate - real, free, previously entirely unused FTN columns."""
+    hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)]
+    merged = ftn_df.merge(
+        hist_pbp[["game_id", "play_id", "posteam"]],
+        left_on=["nflverse_game_id", "nflverse_play_id"], right_on=["game_id", "play_id"], how="inner",
+    )
+    df = merged.dropna(subset=["posteam"])
+    if df.empty:
+        return pd.DataFrame()
+
+    agg_dict = {}
+    if "is_motion" in df.columns:
+        agg_dict["motion_rate"] = ("is_motion", "mean")
+    if "is_no_huddle" in df.columns:
+        agg_dict["no_huddle_rate"] = ("is_no_huddle", "mean")
+    if not agg_dict:
+        return pd.DataFrame()
+
+    return df.groupby("posteam").agg(**agg_dict).reset_index()
+
+
+# ---------------------------------------------------------------------------
+# 3f. PERSONNEL GROUPING TENDENCY + VULNERABILITY (11/12/21 personnel etc.)
+#
+# Direct analog to the play-action crosswalk above, using offense_personnel/
+# defense_personnel - confirmed real participation_df columns that sat
+# completely unused. Same real question as PA: does this offense line up
+# in one specific personnel grouping most of the time, and is THIS
+# opponent specifically bad against that exact grouping (not just bad in
+# general).
+# ---------------------------------------------------------------------------
+
+def build_offense_personnel_tendency(season: int, week: int, participation_df: pd.DataFrame,
+                                      pbp_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Per-team DOMINANT offense personnel grouping (e.g. '11 Personnel',
+    whatever the real charted label is) and how often they actually use
+    it - the offense-tendency half of the crosswalk. Same join pattern
+    used throughout this file for participation data: nflverse_game_id +
+    play_id -> pbp's game_id + play_id for posteam.
+    """
+    hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)]
+    merged = participation_df.merge(
+        hist_pbp[["game_id", "play_id", "posteam"]],
+        left_on=["nflverse_game_id", "play_id"], right_on=["game_id", "play_id"], how="inner",
+    )
+    df = merged.dropna(subset=["posteam", "offense_personnel"])
+    if df.empty:
+        return pd.DataFrame()
+
+    counts = df.groupby(["posteam", "offense_personnel"]).size().reset_index(name="n")
+    totals = df.groupby("posteam").size().reset_index(name="n_total")
+    counts = counts.merge(totals, on="posteam")
+    counts["usage_pct"] = counts["n"] / counts["n_total"]
+
+    dominant = counts.loc[counts.groupby("posteam")["usage_pct"].idxmax()][
+        ["posteam", "offense_personnel", "usage_pct"]
+    ].rename(columns={"offense_personnel": "dominant_personnel", "usage_pct": "dominant_personnel_pct"})
+    return dominant
+
+
+def build_defense_personnel_allowed(season: int, week: int, participation_df: pd.DataFrame,
+                                     pbp_df: pd.DataFrame, min_plays: int = 15) -> pd.DataFrame:
+    """
+    Per (defteam, offense_personnel-they-faced), real EPA allowed - which
+    SPECIFIC personnel grouping a defense struggles against, not just
+    overall defense quality. Rows below min_plays are dropped entirely
+    (too thin a sample to trust) rather than returned as noisy NaN, same
+    pattern as build_coverage_playaction_crosswalk.
+    """
+    hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)]
+    merged = participation_df.merge(
+        hist_pbp[["game_id", "play_id", "defteam", "epa"]],
+        left_on=["nflverse_game_id", "play_id"], right_on=["game_id", "play_id"], how="inner",
+    )
+    df = merged.dropna(subset=["defteam", "offense_personnel", "epa"])
+    if df.empty:
+        return pd.DataFrame()
+
+    result = df.groupby(["defteam", "offense_personnel"]).agg(
+        epa_allowed=("epa", "mean"), n_plays=("epa", "count"),
+    ).reset_index()
+    result = result[result["n_plays"] >= min_plays]
+    if result.empty:
+        return result
+
+    result["epa_allowed_grade"] = result["epa_allowed"].apply(
+        lambda v: 100 - calc_percentile_grade(v, result["epa_allowed"]) if pd.notna(v) else np.nan
+    )
+    return result
+
+
+def calc_personnel_exploit_strength(team: str, offense_personnel_tendency_df: pd.DataFrame,
+                                     defteam: str, defense_personnel_allowed_df: pd.DataFrame) -> dict:
+    """
+    Looks up this offense's dominant personnel grouping, then the
+    opponent's real EPA-allowed grade specifically against THAT grouping -
+    a 0-1 exploit signal, same shape as calc_playaction_exploit_strength.
+    Degrades to NaN (not a guessed neutral value) if either side lacks
+    enough real data - the caller should treat NaN as "no signal here"
+    same as every other exploit function in this file.
+    """
+    if offense_personnel_tendency_df.empty or defense_personnel_allowed_df.empty:
+        return {"exploit_strength": np.nan, "dominant_personnel": None}
+
+    off_row = offense_personnel_tendency_df[offense_personnel_tendency_df["posteam"] == team]
+    if off_row.empty:
+        return {"exploit_strength": np.nan, "dominant_personnel": None}
+    dominant_personnel = off_row.iloc[0]["dominant_personnel"]
+
+    def_row = defense_personnel_allowed_df[
+        (defense_personnel_allowed_df["defteam"] == defteam)
+        & (defense_personnel_allowed_df["offense_personnel"] == dominant_personnel)
+    ]
+    if def_row.empty:
+        return {"exploit_strength": np.nan, "dominant_personnel": dominant_personnel}
+
+    grade = def_row.iloc[0]["epa_allowed_grade"]
+    if pd.isna(grade):
+        return {"exploit_strength": np.nan, "dominant_personnel": dominant_personnel}
+    return {"exploit_strength": round(1 - (grade / 100), 3), "dominant_personnel": dominant_personnel}
+
+
+# ---------------------------------------------------------------------------
 # 4. COORDINATOR TENDENCY MAPPING (manual lookup - free data can't supply this)
 # ---------------------------------------------------------------------------
 
@@ -331,6 +736,71 @@ def get_coordinator_tendency_profile(coach_name: str, tendency_df: pd.DataFrame,
         return pd.DataFrame()
     mask = tendency_df["team_season_key"].isin(teams_seasons)
     return tendency_df[mask]
+
+
+# ---------------------------------------------------------------------------
+# 4a2. SHADOW-CORNER CONTEXT (manual lookup - free data genuinely CANNOT
+#      supply this, same category as COORDINATOR_MAP above)
+#
+# HONESTY NOTE: true per-play defender assignment (which specific CB
+# covered which specific WR) is NOT in any free NFL data source -
+# nflreadpy/nflverse has no column identifying this. That's specifically
+# what PFF sells as a premium "coverage/matchup" product. This is
+# deliberately NOT an automatic algorithm pretending to detect real
+# matchups from stats - it's a manually-maintained list, same honest
+# pattern as COORDINATOR_MAP, for the small number of corners around the
+# league who are PUBLICLY KNOWN to consistently shadow the opponent's
+# WR1 (most defenses instead rotate by field side or play zone concepts,
+# where no fixed CB-vs-WR1 assignment exists at all - don't fill in a
+# team here unless that team's shadow-corner tendency is real, known
+# information, not a guess).
+#
+# DELIBERATELY NOT wired into quality_score/mu - even when a shadow
+# corner is known, the only free per-defender stat available
+# (def_interceptions from player_stats) is a weak, noisy proxy for
+# coverage quality (a corner can play great technique with zero picks,
+# or get lucky with several despite poor coverage) - wiring a thin signal
+# like that into scoring is exactly the mistake the readiness report just
+# caught with the coverage/box adjustment. Shown as CONTEXT ONLY.
+# ---------------------------------------------------------------------------
+
+SHADOW_CORNER_MAP = {
+    # "team_abbr": "gsis_id_of_the_corner_who_shadows_the_opponent's_true_WR1"
+    # Fill in ONLY for teams with a real, known shadow-coverage tendency.
+    # Leave every other team out entirely - an empty/missing entry means
+    # "no known fixed assignment", not "no advantage".
+}
+
+
+def get_shadow_corner_context(team: str, opponent: str, receiver_target_share_rank: int,
+                               player_stats_df: pd.DataFrame, season: int, week: int) -> dict:
+    """
+    CONTEXT ONLY - see honesty note above. If `opponent` has a known
+    shadow corner in SHADOW_CORNER_MAP AND this receiver is presumed to
+    be that opponent's primary target (receiver_target_share_rank == 1
+    on his own team, i.e. the team's real WR1 by target share - the
+    closest free-data proxy for "the corner's likely assignment"),
+    returns that corner's real season interception/fumble-recovery
+    counting stats as background context for a human to weigh manually -
+    NOT a coverage-quality grade, and NOT added to any exploit_strength
+    or quality_score calculation.
+    """
+    corner_gsis_id = SHADOW_CORNER_MAP.get(opponent)
+    if corner_gsis_id is None or receiver_target_share_rank != 1:
+        return {}
+
+    corner_stats = player_stats_df[
+        (player_stats_df["gsis_id"] == corner_gsis_id) & (player_stats_df["season"] == season)
+        & (player_stats_df["week"] < week)
+    ]
+    if corner_stats.empty:
+        return {"shadow_corner_gsis_id": corner_gsis_id, "shadow_corner_note": "Known shadow corner, no season stats yet."}
+
+    return {
+        "shadow_corner_gsis_id": corner_gsis_id,
+        "shadow_corner_interceptions_season": int(corner_stats["def_interceptions"].sum()) if "def_interceptions" in corner_stats.columns else None,
+        "shadow_corner_note": "Context only - real coverage-quality data isn't free. Weigh manually, not scored.",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -914,6 +1384,44 @@ def get_opponent_this_week(team: str, season: int, week: int, schedules_df: pd.D
     return g["away_team"] if g["home_team"] == team else g["home_team"]
 
 
+def get_matchup_label(team: str, season: int, week: int, schedules_df: pd.DataFrame) -> str:
+    """
+    Returns the "AWAY @ HOME" label for whichever game this team plays in
+    this week - used to group the slate by game (see build_week_games_list)
+    rather than only by prop_type/position. Same lookup shape as
+    get_opponent_this_week, so both teams in a game resolve to the
+    identical label regardless of which side's row is being tagged.
+    """
+    game = schedules_df[
+        (schedules_df["season"] == season) & (schedules_df["week"] == week)
+        & ((schedules_df["home_team"] == team) | (schedules_df["away_team"] == team))
+    ]
+    if game.empty:
+        return None
+    g = game.iloc[0]
+    return f"{g['away_team']} @ {g['home_team']}"
+
+
+def build_week_games_list(season: int, week: int, schedules_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per real game this week - away_team, home_team, matchup label,
+    and gameday (date) if present - used by the UI to render a game-by-
+    game picker (mirrors a scoreboard/"Gamecast" list) rather than only a
+    flat prop_type/position filter. Does NOT filter out preseason games
+    itself (schedules_df's game_type column, if present, can be used by
+    the caller to do that) - this function just lists whatever games
+    schedules_df has for that season/week.
+    """
+    games = schedules_df[
+        (schedules_df["season"] == season) & (schedules_df["week"] == week)
+    ].copy()
+    if games.empty:
+        return pd.DataFrame(columns=["away_team", "home_team", "matchup"])
+    games["matchup"] = games["away_team"] + " @ " + games["home_team"]
+    cols = [c for c in ["away_team", "home_team", "matchup", "gameday", "game_type"] if c in games.columns]
+    return games[cols].reset_index(drop=True)
+
+
 def get_full_coverage_breakdown(coverage_row: dict) -> dict:
     """
     Returns the FULL individual coverage-type breakdown (Cover 1 %, Cover 2 %,
@@ -1432,9 +1940,10 @@ def calc_box_adjusted_mu(base_mu: float, box_efficiency: dict, opp_stacked_pct: 
 PROP_METRIC_CROSSWALK = {
     "pass_yards": {
         "offense_grades": ["passing_epa_grade", "cpoe_grade", "success_rate_grade", "adot_grade",
-                            "explosive_20plus_rate_grade"],
+                            "explosive_20plus_rate_grade", "pa_rate_grade", "pa_epa_diff_grade",
+                            "pressure_rate_faced_grade", "proe_grade"],
         "defense_grades": ["opp_pass_epa_allowed_grade", "opp_pressure_rate_generated_grade",
-                            "opp_pass_explosive_allowed_rate_grade"],
+                            "opp_pass_explosive_allowed_rate_grade", "opp_pa_epa_allowed_grade"],
     },
     "rush_yards": {
         "offense_grades": ["rushing_epa_grade", "rush_yards_over_expected_per_att_grade", "efficiency_grade",
@@ -1446,7 +1955,7 @@ PROP_METRIC_CROSSWALK = {
                             "avg_separation_grade", "yac_above_expectation_grade",
                             "explosive_15plus_rate_grade"],
         "defense_grades": ["opp_pass_epa_allowed_grade", "opp_pressure_rate_generated_grade",
-                            "opp_pass_explosive_allowed_rate_grade"],
+                            "opp_pass_explosive_allowed_rate_grade", "opp_pa_epa_allowed_grade"],
     },
 }
 
@@ -1681,12 +2190,56 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     )
     def_metrics = build_defense_advanced_metrics(season, week, pbp_history_df, participation_df)
 
+    # Play-action tendency/vulnerability, QB pressure profile, and PROE -
+    # closes the previously-flagged gaps (FTN's is_play_action/is_motion
+    # sat unused, QB had no own-side pressure metric to pair against the
+    # defense's, PROE wasn't built). qb_pa_profile/qb_pressure_profile/
+    # proe_profile merge into qb_metrics by gsis_id/team so they ride along
+    # with get_player_grades() automatically; def_pa_profile merges into
+    # def_metrics by defteam the same way. coverage_pa_crosswalk is used
+    # directly per-matchup below (dominant-coverage-specific, not a static
+    # per-team column).
+    qb_pa_profile = build_qb_playaction_profile(season, week, pbp_history_df, ftn_df)
+    def_pa_profile = build_defense_playaction_allowed(season, week, pbp_history_df, ftn_df)
+    coverage_pa_crosswalk = build_coverage_playaction_crosswalk(season, week, participation_df, ftn_df, pbp_history_df)
+    qb_pressure_profile = build_qb_pressure_profile(season, week, participation_df, pbp_history_df)
+    proe_profile = build_proe_profile(season, week, pbp_history_df)
+    offense_personnel_tendency = build_offense_personnel_tendency(season, week, participation_df, pbp_history_df)
+    defense_personnel_allowed = build_defense_personnel_allowed(season, week, participation_df, pbp_history_df)
+
+    if not qb_pa_profile.empty and not qb_metrics.empty:
+        qb_metrics = qb_metrics.merge(
+            qb_pa_profile[["gsis_id", "pa_rate", "pa_epa_diff", "pa_rate_grade", "pa_epa_diff_grade"]],
+            on="gsis_id", how="left",
+        )
+    if not qb_pressure_profile.empty and not qb_metrics.empty:
+        qb_metrics = qb_metrics.merge(
+            qb_pressure_profile[["gsis_id", "pressure_rate_faced", "pressure_rate_faced_grade"]],
+            on="gsis_id", how="left",
+        )
+    if not def_pa_profile.empty and not def_metrics.empty:
+        def_metrics = def_metrics.merge(
+            def_pa_profile[["defteam", "pa_epa_allowed", "pa_vulnerability_gap", "pa_epa_allowed_grade"]],
+            on="defteam", how="left",
+        )
+
     this_week_games = schedules_df[
         (schedules_df["season"] == season) & (schedules_df["week"] == week)
     ]
     teams_this_week = pd.concat([
         this_week_games["home_team"], this_week_games["away_team"]
     ]).unique().tolist()
+
+    # Team -> "AWAY @ HOME" matchup label, precomputed once so every row
+    # below can tag itself with a simple dict lookup instead of a fresh
+    # schedules_df filter per player - lets the UI group/filter the slate
+    # game-by-game (see build_week_games_list) instead of only by
+    # prop_type/position.
+    week_games = build_week_games_list(season, week, schedules_df)
+    team_to_matchup = {}
+    for _, g in week_games.iterrows():
+        team_to_matchup[g["away_team"]] = g["matchup"]
+        team_to_matchup[g["home_team"]] = g["matchup"]
 
     # Eligible players come from ROSTERS (who's on the team this week),
     # NOT from this week's own NGS/player_stats rows - those don't exist
@@ -1721,6 +2274,23 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
         coverage_info = calc_coverage_quality_score(opp_coverage_row, coverage_profile)
         n_plays = opp_coverage_row.get("n_plays", 0) if opp_coverage_row else 0
 
+        # Play-action exploit: does THIS QB run PA often and perform well
+        # in it, AND is the opponent (specifically in whichever coverage
+        # they lean on most - falls back to their overall PA-allowed
+        # number if that coverage lacks a PA-specific sample) actually
+        # vulnerable to it. Averaged with the structural coverage-elevation
+        # signal above into one combined structural component, rather than
+        # replacing it - both are real, separate tendency signals.
+        qb_pa_row = qb_pa_profile[qb_pa_profile["gsis_id"] == gsis_id]
+        qb_pa_row = qb_pa_row.iloc[0].to_dict() if not qb_pa_row.empty else {}
+        def_pa_row = def_pa_profile[def_pa_profile["defteam"] == opponent]
+        def_pa_row = def_pa_row.iloc[0].to_dict() if not def_pa_row.empty else {}
+        playaction_info = calc_playaction_exploit_strength(
+            qb_pa_row, def_pa_row, coverage_pa_crosswalk, opponent, coverage_info.get("dominant_coverage")
+        )
+        structural_parts = [v for v in [coverage_info.get("exploit_strength"), playaction_info.get("exploit_strength")] if pd.notna(v)]
+        combined_structural_exploit = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
+
         # ACTUAL mu adjustment (not just a quality_score side signal) using
         # this QB's own real man/zone efficiency split from their play
         # history, weighted by this specific opponent's man/zone tendency.
@@ -1740,16 +2310,26 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
         own_grades = get_player_grades(gsis_id, qb_metrics)
         def_grades = get_defense_grades(opponent, def_metrics)
 
+        # PROE is team-level (posteam), not per-player, so it doesn't ride
+        # along with get_player_grades() the way gsis_id-keyed metrics do -
+        # looked up by team and merged in directly here.
+        if not proe_profile.empty:
+            team_proe = proe_profile[proe_profile["posteam"] == team]
+            if not team_proe.empty:
+                own_grades["proe_grade"] = team_proe.iloc[0].get("proe_grade")
+                own_grades["proe"] = team_proe.iloc[0].get("proe")
+
         # Grade-based crosswalk (own skill grades vs opponent's allowed
         # grades, tailored to pass_yards - see PROP_METRIC_CROSSWALK) and
         # real-role verification (recent vs season pass-attempt volume),
-        # blended with the structural coverage-exploit signal above -
-        # mirrors the MLB tool's pitch-crosswalk + lineup_verification blend.
+        # blended with the combined structural (coverage + play-action)
+        # exploit signal above - mirrors the MLB tool's pitch-crosswalk +
+        # lineup_verification blend.
         grade_exploit = calc_grade_matchup_strength({**own_grades, **def_grades}, "pass_yards")
         role_trend = build_role_trend(gsis_id, "attempts", ngs_pass_df, "player_gsis_id", season, week)
         role_score = calc_role_verification_score(role_trend)
         blended_exploit = calc_blended_matchup_strength(
-            coverage_info.get("exploit_strength"), grade_exploit, role_score
+            combined_structural_exploit, grade_exploit, role_score
         )
         quality_score = calc_quality_score(
             matchup_exploit_strength=blended_exploit,
@@ -1761,12 +2341,15 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
         rows.append({
             "gsis_id": gsis_id, "player_display_name": qb.get("full_name"),
             "team": team, "position": "QB", "prop_type": "pass_yards",
+            "matchup": team_to_matchup.get(team),
             "mu": adjusted_mu, "mu_before_coverage_adj": mu, "sigma": sigma, "opponent": opponent,
             "opp_man_pct": opp_coverage_row.get("man_pct") if opp_coverage_row else np.nan,
             "opp_zone_pct": opp_coverage_row.get("zone_pct") if opp_coverage_row else np.nan,
             "opp_dominant_coverage": coverage_info["dominant_coverage"],
             "opp_dominant_coverage_pct": coverage_info["dominant_coverage_pct"],
             "opp_num_elevated_coverages": coverage_info.get("num_elevated_coverages", 0),
+            "playaction_exploit_strength": playaction_info.get("exploit_strength"),
+            "playaction_used_coverage_specific_data": playaction_info.get("used_coverage_specific_playaction_data"),
             "quality_score": quality_score,
             "grade_matchup_strength": grade_exploit,
             "role_verification_score": role_score,
@@ -1834,6 +2417,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             rows.append({
                 "gsis_id": gsis_id, "player_display_name": rb.get("full_name"),
                 "team": rb.get("team"), "position": position, "prop_type": "rush_yards",
+                "matchup": team_to_matchup.get(rb_team),
                 "mu": adjusted_rush_mu, "mu_before_box_adj": mu, "sigma": sigma, "opponent": rb_opponent,
                 "opp_box_stack_pct": box_info.get("box_stack_pct"),
                 "opp_box_elevated": box_info.get("box_elevated"),
@@ -1871,6 +2455,18 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             coverage_info = calc_coverage_quality_score(opp_coverage_row, coverage_profile)
             n_plays = opp_coverage_row.get("n_plays", 0) if opp_coverage_row else 0
 
+            # Personnel-grouping exploit: does this team's dominant
+            # personnel package (11/12/21 etc.) match up against a real
+            # weakness in THIS specific opponent's defense against that
+            # exact grouping - same crosswalk pattern as play-action for
+            # pass_yards, applied to personnel here since it's the more
+            # directly relevant tendency signal for receiving props.
+            personnel_info = calc_personnel_exploit_strength(
+                team, offense_personnel_tendency, opponent, defense_personnel_allowed
+            )
+            structural_parts = [v for v in [coverage_info.get("exploit_strength"), personnel_info.get("exploit_strength")] if pd.notna(v)]
+            combined_structural_exploit = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
+
             # ACTUAL mu adjustment using this receiver's own real man/zone
             # efficiency split, weighted by this specific opponent's tendency.
             adjusted_mu = mu
@@ -1892,7 +2488,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             role_trend = build_role_trend(gsis_id, "target_share", player_stats_df, "gsis_id", season, week)
             role_score = calc_role_verification_score(role_trend)
             blended_exploit = calc_blended_matchup_strength(
-                coverage_info.get("exploit_strength"), grade_exploit, role_score
+                combined_structural_exploit, grade_exploit, role_score
             )
             quality_score = calc_quality_score(
                 matchup_exploit_strength=blended_exploit,
@@ -1904,12 +2500,15 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             rows.append({
                 "gsis_id": gsis_id, "player_display_name": wr.get("full_name"),
                 "team": team, "position": position, "prop_type": "rec_yards",
+                "matchup": team_to_matchup.get(team),
                 "mu": adjusted_mu, "mu_before_coverage_adj": mu, "sigma": sigma, "opponent": opponent,
                 "opp_man_pct": opp_coverage_row.get("man_pct") if opp_coverage_row else np.nan,
                 "opp_zone_pct": opp_coverage_row.get("zone_pct") if opp_coverage_row else np.nan,
                 "opp_dominant_coverage": coverage_info["dominant_coverage"],
                 "opp_dominant_coverage_pct": coverage_info["dominant_coverage_pct"],
                 "opp_num_elevated_coverages": coverage_info.get("num_elevated_coverages", 0),
+                "personnel_exploit_strength": personnel_info.get("exploit_strength"),
+                "dominant_personnel": personnel_info.get("dominant_personnel"),
                 **get_full_coverage_breakdown(opp_coverage_row),
                 "quality_score": quality_score,
                 "grade_matchup_strength": grade_exploit,
@@ -1954,6 +2553,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
         rows.append({
             "gsis_id": gsis_id, "player_display_name": pr.get("full_name"),
             "team": pr.get("team"), "position": pr.get("position"), "prop_type": "fantasy_points",
+            "matchup": team_to_matchup.get(pr.get("team")),
             "mu": mu_fantasy, "sigma": sigma, "quality_score": fantasy_quality_score,
         })
 
@@ -1986,6 +2586,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
         rows.append({
             "gsis_id": gsis_id, "player_display_name": kr.get("full_name"),
             "team": kr.get("team"), "position": "K", "prop_type": "kicker_fantasy",
+            "matchup": team_to_matchup.get(kr.get("team")),
             "mu": mu_kicker, "sigma": sigma,
         })
 
