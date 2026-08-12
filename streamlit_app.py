@@ -193,17 +193,36 @@ else:
 
     if btn_col2 is not None:
         with btn_col2:
-            if st.button("Run Full-Season Readiness Report", type="secondary"):
-                with st.spinner(f"Scoring every completed week of {season} against real results - this pulls the full season, may take a while..."):
-                    try:
-                        st.session_state.season_report = build_season_accuracy_report(season)
-                        st.session_state.backtest_mode = True
-                        st.session_state.show_season_report = True
-                        n_rows = len(st.session_state.season_report["raw"])
-                        st.success(f"Scored {n_rows} rows across the completed weeks of {season}.")
-                    except Exception as e:
-                        st.error(f"Season readiness report failed: {e}")
-                        st.session_state.season_report = None
+            st.caption(
+                "Runs a range of weeks, not necessarily the whole season - start small "
+                "(e.g. a 4-6 week range) to confirm it works within Streamlit Cloud's free-"
+                "tier memory limit before attempting the full season in one run."
+            )
+            rcol1, rcol2 = st.columns(2)
+            with rcol1:
+                report_start_week = st.number_input(
+                    "Report start week", min_value=2, max_value=18, value=2, step=1,
+                    help="Week 1 is skipped automatically - there's no prior-week history to project from yet.",
+                )
+            with rcol2:
+                report_end_week = st.number_input(
+                    "Report end week", min_value=2, max_value=18, value=6, step=1,
+                )
+            if st.button("Run Readiness Report for this week range", type="secondary"):
+                if report_end_week < report_start_week:
+                    st.error("End week must be >= start week.")
+                else:
+                    weeks_to_run = list(range(report_start_week, report_end_week + 1))
+                    with st.spinner(f"Scoring weeks {report_start_week}-{report_end_week} of {season} against real results..."):
+                        try:
+                            st.session_state.season_report = build_season_accuracy_report(season, weeks=weeks_to_run)
+                            st.session_state.backtest_mode = True
+                            st.session_state.show_season_report = True
+                            n_rows = len(st.session_state.season_report["raw"])
+                            st.success(f"Scored {n_rows} rows across weeks {report_start_week}-{report_end_week} of {season}.")
+                        except Exception as e:
+                            st.error(f"Season readiness report failed: {e}")
+                            st.session_state.season_report = None
 
 # -----------------------------------------------------------------------
 # DRAFT RANKINGS DISPLAY
@@ -460,6 +479,36 @@ elif st.session_state.show_season_report and st.session_state.season_report is n
 elif st.session_state.slate_df is not None and not st.session_state.slate_df.empty:
     df = st.session_state.slate_df.copy()
 
+    # -----------------------------------------------------------------------
+    # GAME-BY-GAME PICKER - lets you pick a single matchup (like a scoreboard)
+    # and see just that game's props, ranked by quality instead of only
+    # filtering by prop_type/position across the whole week's slate.
+    # -----------------------------------------------------------------------
+    if "selected_game" not in st.session_state:
+        st.session_state.selected_game = "All Games"
+
+    if "matchup" in df.columns:
+        available_games = sorted([g for g in df["matchup"].dropna().unique().tolist()])
+        if available_games:
+            st.subheader("Games this week")
+            st.caption("Pick a matchup to see just its props, ranked best-quality first - or leave 'All Games' selected to filter the whole week's slate like before.")
+
+            game_options = ["All Games"] + available_games
+            # Buttons in a row, mirroring a scoreboard-style pick - the
+            # currently-selected game is shown as the primary (highlighted) button.
+            n_cols = min(len(game_options), 4)
+            game_cols = st.columns(n_cols)
+            for i, g in enumerate(game_options):
+                with game_cols[i % n_cols]:
+                    is_selected = (st.session_state.selected_game == g)
+                    if st.button(g, key=f"game_btn_{g}", type=("primary" if is_selected else "secondary"), width='stretch'):
+                        st.session_state.selected_game = g
+                        st.rerun()
+
+    if st.session_state.selected_game != "All Games" and "matchup" in df.columns:
+        df = df[df["matchup"] == st.session_state.selected_game]
+        st.info(f"Showing {st.session_state.selected_game} only - sorted by quality_score (best matchups first).")
+
     st.subheader("Filters")
     fcol1, fcol2, fcol3 = st.columns(3)
     with fcol1:
@@ -585,12 +634,14 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         if min_edge_filter > 0:
             scored_df = scored_df[scored_df["edge"].fillna(0) >= min_edge_filter]
 
-        base_display_cols = ["player_display_name", "team", "position", "prop_type",
+        base_display_cols = ["player_display_name", "team", "matchup", "position", "prop_type",
                               "mu", "sigma", "data_confidence", "games_sampled_current",
                               "opponent", "opp_dominant_coverage",
                               "opp_dominant_coverage_pct", "opp_num_elevated_coverages",
                               "opp_man_pct", "opp_zone_pct",
                               "opp_box_stack_pct", "opp_box_elevated",
+                              "playaction_exploit_strength", "playaction_used_coverage_specific_data",
+                              "personnel_exploit_strength", "dominant_personnel",
                               "quality_score", "grade_matchup_strength",
                               "role_verification_score", "role_trend_ratio",
                               "line", "p_over", "edge"]
@@ -603,7 +654,17 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         grade_cols = sorted([c for c in scored_df.columns if c.endswith("_grade")])
         display_cols = base_display_cols + grade_cols + cov_breakdown_cols
         display_cols = [c for c in display_cols if c in scored_df.columns]
-        scan_sorted = scored_df[display_cols].sort_values("edge", ascending=False, na_position="last")
+        # Default sort is edge (once lines are entered) across the whole
+        # week's slate - but when a single game is selected, no line has
+        # necessarily been entered yet for THIS specific game's props, so
+        # sort by quality_score instead (best matchups first), matching
+        # what was actually asked for: pick a game, see its best-quality
+        # plays ranked by how the model grades them, not by an as-yet-
+        # unentered edge number.
+        if st.session_state.get("selected_game", "All Games") != "All Games" and "quality_score" in scored_df.columns:
+            scan_sorted = scored_df[display_cols].sort_values("quality_score", ascending=False, na_position="last")
+        else:
+            scan_sorted = scored_df[display_cols].sort_values("edge", ascending=False, na_position="last")
         # Color-coded: edge/p_over use the MLB tool's green scale. Every
         # coverage/box % column and every advanced metric grade (0-100
         # scale, already normalized so higher = always better/more
@@ -613,6 +674,7 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         # better", so the same gradient direction applies.
         gradient_cols = [c for c in (["edge", "p_over", "opp_man_pct", "opp_zone_pct",
                                        "opp_dominant_coverage_pct", "opp_box_stack_pct",
+                                       "playaction_exploit_strength", "personnel_exploit_strength",
                                        "quality_score", "grade_matchup_strength",
                                        "role_verification_score"]
                                       + grade_cols + cov_breakdown_cols)
@@ -623,13 +685,18 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
             st.caption(
                 "opp_cov_* columns show the opponent defense's FULL coverage breakdown "
                 "(e.g. Cover 1 19%, Cover 2 17.5%, etc.); opp_box_stack_pct is the run-game "
-                "equivalent (share of plays with 7+ in the box). *_grade columns are 0-100 "
-                "percentile grades against this season's league-wide distribution - "
-                "player grades (EPA, target share, separation, etc.) and opponent "
-                "defense grades (pass/run EPA allowed, pressure rate) are both included. "
-                "Defense 'allowed' grades are inverted so high = good defense, consistent "
-                "with every other grade. quality_score now blends THREE signals: the "
-                "structural coverage/box-tendency exploit shown above, grade_matchup_strength "
+                "equivalent (share of plays with 7+ in the box). playaction_exploit_strength "
+                "combines whether this QB runs play-action often AND performs well in it with "
+                "whether the opponent is specifically vulnerable to play-action in their "
+                "dominant coverage (falls back to their overall PA-allowed number if that "
+                "coverage lacks a PA-specific sample - see playaction_used_coverage_specific_data). "
+                "*_grade columns are 0-100 percentile grades against this season's league-wide "
+                "distribution - player grades (EPA, target share, separation, pressure faced, "
+                "PROE, etc.) and opponent defense grades (pass/run EPA allowed, pressure rate, "
+                "play-action allowed) are both included. Defense 'allowed'/'faced' grades are "
+                "inverted so high = good defense/QB, consistent with every other grade. "
+                "quality_score blends THREE signals: the structural coverage/box/play-action "
+                "tendency exploit shown above, grade_matchup_strength "
                 "(this player's own skill grades vs the opponent's allowed grades, tailored "
                 "per prop type), and role_verification_score (whether this player's recent "
                 "real usage backs up their season-long role - see role_trend_ratio). mu "
