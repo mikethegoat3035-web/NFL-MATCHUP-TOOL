@@ -1,6 +1,6 @@
-nflreadpy
-pandas
-numpy
-scipy
-streamlit
-matplotlib
+nflreadpy==0.1.5
+pandas==3.0.2
+numpy==2.4.4
+scipy==1.17.1
+streamlit==1.61.1
+matplotlib==3.11.1
