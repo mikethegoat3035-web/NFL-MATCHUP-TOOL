@@ -92,7 +92,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v16-personnel-reenabled-alone-2026-08-13"
+DEPLOY_VERSION = "v17-mu-recency-weighting-2026-08-13"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
