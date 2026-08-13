@@ -4,4 +4,3 @@ numpy==2.4.4
 scipy==1.17.1
 streamlit==1.61.1
 matplotlib==3.11.1
-altair==5.5.0
