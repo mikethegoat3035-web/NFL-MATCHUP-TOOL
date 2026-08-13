@@ -92,7 +92,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v22-interactive-coverage-chart-2026-08-13"
+DEPLOY_VERSION = "v23-altair-reverted-styled-table-2026-08-13"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -604,47 +604,54 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                     player_sample = explanation.get("player_coverage_sample", {})
 
                     if coverage_mix:
-                        import altair as alt
-                        chart_rows = []
+                        # BUGFIX: the Altair version of this chart broke in
+                        # production (a Python typing/schema compatibility
+                        # error deep inside altair's own import, unrelated
+                        # to anything in this file - it fails before our
+                        # code even runs). Reverted to a combination of
+                        # things ALREADY confirmed working in this exact
+                        # deployment all session: matplotlib (the original
+                        # pie chart worked fine) + a styled, sortable
+                        # dataframe (background_gradient has worked
+                        # reliably in every other table all session) -
+                        # zero new dependency risk, same "tied together"
+                        # goal achieved a different way.
+                        rows = []
                         for cov_type, usage_pct in coverage_mix.items():
                             sample = player_sample.get(cov_type)
-                            chart_rows.append({
+                            rows.append({
                                 "coverage_type": cov_type,
                                 "defense_usage_pct": round(usage_pct * 100, 1),
-                                "sample_status": "Reliable sample" if sample else "No reliable sample yet",
-                                "player_ypp": sample["ypp"] if sample else None,
+                                "player_ypp_here": sample["ypp"] if sample else None,
                                 "real_plays_sampled": sample["n_plays"] if sample else 0,
+                                "sample_status": "✅ Reliable" if sample else "⬜ No sample yet",
                             })
-                        chart_df = pd.DataFrame(chart_rows)
+                        detail_df = pd.DataFrame(rows).sort_values("defense_usage_pct", ascending=False)
 
-                        st.markdown(
-                            f"**{picked_row['opponent']}'s real coverage mix, tied directly to "
-                            f"{picked_row['player_display_name']}'s real efficiency in each one** "
-                            "— hover any bar for the full detail behind it."
-                        )
-                        chart = alt.Chart(chart_df).mark_bar().encode(
-                            x=alt.X("coverage_type:N", title="Coverage type", sort="-y"),
-                            y=alt.Y("defense_usage_pct:Q", title="Defense usage % (this season)"),
-                            color=alt.Color(
-                                "sample_status:N", title="Player sample",
-                                scale=alt.Scale(
-                                    domain=["Reliable sample", "No reliable sample yet"],
-                                    range=["#2ca02c", "#a0a0a0"],
-                                ),
-                            ),
-                            tooltip=[
-                                alt.Tooltip("coverage_type:N", title="Coverage"),
-                                alt.Tooltip("defense_usage_pct:Q", title="Defense usage %", format=".1f"),
-                                alt.Tooltip("player_ypp:Q", title="Player's real yards/play here", format=".1f"),
-                                alt.Tooltip("real_plays_sampled:Q", title="Real plays sampled"),
-                                alt.Tooltip("sample_status:N", title="Status"),
-                            ],
-                        ).properties(height=380)
-                        st.altair_chart(chart, use_container_width=True)
+                        dcol1, dcol2 = st.columns([1, 1])
+                        with dcol1:
+                            st.markdown(f"**{picked_row['opponent']}'s real coverage mix**")
+                            import matplotlib.pyplot as plt
+                            fig, ax = plt.subplots(figsize=(4, 4))
+                            ax.pie(coverage_mix.values(), labels=coverage_mix.keys(), autopct="%1.0f%%",
+                                   textprops={"fontsize": 8})
+                            ax.set_title(f"{picked_row['opponent']} coverage mix", fontsize=9)
+                            st.pyplot(fig)
+                        with dcol2:
+                            st.markdown(
+                                f"**Tied directly to {picked_row['player_display_name']}'s real "
+                                "efficiency in each one:**"
+                            )
+                            styled_detail = detail_df.style.background_gradient(
+                                subset=["defense_usage_pct"], cmap="Blues"
+                            ).background_gradient(
+                                subset=["player_ypp_here"], cmap="Greens"
+                            )
+                            st.dataframe(styled_detail, width='stretch', hide_index=True)
                         st.caption(
-                            "Green = reliable real sample (8+ plays) behind that coverage's yards/play number, "
-                            "used in the weighting. Grey = the defense runs it, but there's not enough real "
-                            "sample yet for this player against it - excluded from the weighting rather than guessed at."
+                            "✅ Reliable = 8+ real plays behind that coverage's yards/play number, used in "
+                            "the weighting. ⬜ No sample yet = the defense runs it, but there's not enough "
+                            "real sample yet for this player against it - excluded rather than guessed at."
                         )
                     else:
                         st.caption("No real coverage-mix data available for this defense yet.")
