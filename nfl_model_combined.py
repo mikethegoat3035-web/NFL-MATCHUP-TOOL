@@ -2031,7 +2031,7 @@ def calc_box_adjusted_mu(base_mu: float, box_efficiency: dict, opp_stacked_pct: 
 # to True only after re-testing shows each one is actually net-positive.
 # ---------------------------------------------------------------------------
 ENABLE_PLAYACTION_IN_QUALITY_SCORE = True  # RE-ENABLED for isolated testing - see note below
-ENABLE_PERSONNEL_IN_QUALITY_SCORE = False  # stays off - one change at a time; personnel is next, once PA is confirmed clean alone
+ENABLE_PERSONNEL_IN_QUALITY_SCORE = True  # RE-ENABLED - PA confirmed clean alone (weeks 4-18, quality tiers stable, no inversion), this round's ONE change
 # RE-ENABLE TEST (this round's ONE change, everything else held constant):
 # play-action was disabled after landing untested alongside 4 other changes
 # in one round, which caused a severe quality_score tier inversion never
