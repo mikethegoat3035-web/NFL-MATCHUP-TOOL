@@ -199,7 +199,36 @@ def build_coverage_profile(participation_df: pd.DataFrame, pbp_df: pd.DataFrame)
         .fillna(0)
     )
     man_zone_pct = man_zone.div(man_zone.sum(axis=1), axis=0).round(3)
-    man_zone_pct.columns = [f"{c}_pct" for c in man_zone_pct.columns]
+
+    # NORMALIZE column names to always be "man_pct"/"zone_pct" regardless of
+    # the real raw value strings, instead of relying on the raw value
+    # becoming the literal column name. REAL BUG FOUND (confirmed via a
+    # live diagnostic run against real 2025 week 8 data): defense_man_
+    # zone_type's actual values are "MAN_COVERAGE"/"ZONE_COVERAGE" (with
+    # underscore) plus a large share of empty string "" (non-charted/non-
+    # pass plays) - the raw dynamic pivot previously produced columns
+    # literally named "MAN_COVERAGE_pct"/"ZONE_COVERAGE_pct"/"_pct", which
+    # never matched what every downstream consumer (calc_coverage_adjusted_
+    # mu's own gate check, get_full_coverage_breakdown, the opp_man_pct/
+    # opp_zone_pct row columns) was looking up - "man_pct"/"zone_pct"
+    # exactly. Confirmed this meant opp_man_pct/opp_zone_pct were NULL for
+    # all 6,875 rows in every single backtest run all session, and the
+    # coverage mu-adjustment's own gate (`if pd.notna(man_pct) and
+    # pd.notna(zone_pct)`) never once passed - THIS was the actual root
+    # blocker, upstream of and independent from the bucket-matching bug
+    # already fixed in build_player_coverage_efficiency. Now matches on
+    # content (case-insensitive "man"/"zone" substring) instead of relying
+    # on the exact raw string becoming the column name.
+    renamed_cols = {}
+    for col in man_zone_pct.columns:
+        col_lower = str(col).lower()
+        if "man" in col_lower:
+            renamed_cols[col] = "man_pct"
+        elif "zone" in col_lower:
+            renamed_cols[col] = "zone_pct"
+        else:
+            renamed_cols[col] = f"{col}_pct"  # e.g. the "" (uncharted) bucket - kept for visibility, not relied on
+    man_zone_pct = man_zone_pct.rename(columns=renamed_cols)
 
     result = pivot.merge(man_zone_pct, on="defteam", how="left")
     return result
@@ -1344,8 +1373,15 @@ def build_player_coverage_efficiency(player_gsis_id: str, role: str, season: int
     def _bucket_count(plays_df, coverage_type):
         return len(plays_df[plays_df["defense_man_zone_type"].str.lower() == coverage_type])
 
-    man_n = _bucket_count(player_plays, "man")
-    zone_n = _bucket_count(player_plays, "zone")
+    # REAL VALUES CONFIRMED via live diagnostic (diagnose_participation_data(),
+    # run against real 2025 week 8 data): defense_man_zone_type's actual real
+    # values are "MAN_COVERAGE" / "ZONE_COVERAGE" (with underscore) - NOT
+    # "man"/"zone" or "Man"/"Zone", both of which were guessed and both wrong
+    # across two earlier fix attempts tonight (confirmed 0% fire rate either
+    # way). This is the first version matched against real, directly-observed
+    # data instead of an assumption.
+    man_n = _bucket_count(player_plays, "man_coverage")
+    zone_n = _bucket_count(player_plays, "zone_coverage")
 
     # top up with team-filtered prior-season plays if either bucket is short
     if (man_n < min_plays_per_bucket or zone_n < min_plays_per_bucket) \
@@ -1362,8 +1398,8 @@ def build_player_coverage_efficiency(player_gsis_id: str, role: str, season: int
         yards_col = "receiving_yards" if role == "receiver" else "passing_yards"
         return round(bucket[yards_col].mean(), 2), n
 
-    man_avg, man_n = _bucket_avg("man")
-    zone_avg, zone_n = _bucket_avg("zone")
+    man_avg, man_n = _bucket_avg("man_coverage")
+    zone_avg, zone_n = _bucket_avg("zone_coverage")
     yards_col = "receiving_yards" if role == "receiver" else "passing_yards"
     overall_avg = round(player_plays[yards_col].mean(), 2) if len(player_plays) > 0 else np.nan
 
