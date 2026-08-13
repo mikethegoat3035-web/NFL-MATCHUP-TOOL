@@ -1233,14 +1233,32 @@ def rescore_quality_mu_row_nfl(mu: float, line: float, sigma: float) -> dict:
 def calc_quality_score(matchup_exploit_strength: float, sample_size_games: int,
                         coverage_confidence: float) -> float:
     """
-    Placeholder quality_score formula, same 0-100 scale as MLB tool.
     matchup_exploit_strength: how much this specific offense/player profile
         beats this specific defense's tendency (e.g. high aDOT WR vs man-heavy defense)
-    sample_size_games: games backing the mu (fewer games early season = lower confidence)
-    coverage_confidence: how much of the play sample has charted coverage data
+    sample_size_games: REAL games backing THIS PLAYER'S OWN mu this season
+        (fewer games = lower confidence, regardless of how good the matchup
+        looks) - see BUGFIX note below.
+    coverage_confidence: how much of the OPPONENT's play sample has charted
+        coverage data (a separate, complementary concept from the player's
+        own sample size - this is about how much we trust the opponent's
+        tendency profile itself)
+
+    BUGFIX (real gap found via 2025 backtest): sample_size_games was always
+    being fed opponent coverage PLAY COUNT (n_plays/60) at every call site,
+    not the player's own games - a genuine mismatch between what this
+    parameter was named/documented to mean and what it actually received.
+    Confirmed via real correlation check: quality_score showed ~zero
+    relationship with pass_yards miss size (0.056) even though the worst
+    misses were concentrated in players with thin/unstable CURRENT-SEASON
+    samples - quality_score's "confidence" signal was answering "how much
+    do we know about the opponent's coverage" while never once asking "how
+    much do we know about THIS player's own current role/production."
+    Call sites fixed to pass games_sampled_current (the player's own real
+    sample size, already computed via get_data_confidence and already
+    reliable) instead of the opponent-derived play count.
     """
     base = matchup_exploit_strength * 70
-    sample_bonus = min(sample_size_games / 10, 1.0) * 20
+    sample_bonus = min(sample_size_games / 6, 1.0) * 20
     coverage_bonus = coverage_confidence * 10
     return round(min(base + sample_bonus + coverage_bonus, 100), 1)
 
@@ -2367,7 +2385,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
         )
         quality_score = calc_quality_score(
             matchup_exploit_strength=blended_exploit,
-            sample_size_games=min(n_plays / 60, 10),  # rough plays-to-games conversion
+            sample_size_games=confidence_info["games_sampled_current"],  # this QB's own real sample - see calc_quality_score bugfix note
             coverage_confidence=min(n_plays / 300, 1.0),
         )
         _record_quality_score(gsis_id, quality_score)
@@ -2445,7 +2463,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             )
             rush_quality_score = calc_quality_score(
                 matchup_exploit_strength=blended_exploit,
-                sample_size_games=min(n_box_plays / 60, 10),
+                sample_size_games=rb_confidence_info["games_sampled_current"],  # this RB's own real sample - see calc_quality_score bugfix note
                 coverage_confidence=min(n_box_plays / 300, 1.0),
             )
             _record_quality_score(gsis_id, rush_quality_score)
@@ -2531,7 +2549,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             )
             quality_score = calc_quality_score(
                 matchup_exploit_strength=blended_exploit,
-                sample_size_games=min(n_plays / 60, 10),
+                sample_size_games=rec_confidence_info["games_sampled_current"],  # this receiver's own real sample - see calc_quality_score bugfix note
                 coverage_confidence=min(n_plays / 300, 1.0),
             )
             _record_quality_score(gsis_id, quality_score)
