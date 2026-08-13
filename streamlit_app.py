@@ -92,7 +92,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v21-best-matchups-in-backtest-too-2026-08-13"
+DEPLOY_VERSION = "v22-interactive-coverage-chart-2026-08-13"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -572,6 +572,15 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                 )
 
                 st.markdown("**Why did the model pick one of these?**")
+                use_full_season_toggle = st.checkbox(
+                    "Use full season for this breakdown (more real sample volume)", value=True,
+                    key="bm_full_season",
+                    help="ON (default): uses every real play from the whole season for the "
+                         "coverage/efficiency breakdown below - this is a validation view, not "
+                         "the live betting mu itself, so more real volume gives a fuller picture "
+                         "with no leakage concern. OFF: shows only the same before-this-week "
+                         "data mu itself actually used.",
+                )
                 player_options = [
                     f"{r['player_display_name']} ({r['prop_type']}, quality={r['quality_score']:.0f})"
                     for _, r in bm_filtered.iterrows()
@@ -584,39 +593,61 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                         explanation = get_player_matchup_explanation(
                             picked_row["gsis_id"], picked_row["prop_type"], picked_row["team"],
                             picked_row["opponent"], int(season), int(week),
+                            use_full_season=use_full_season_toggle,
                         )
                     except Exception as e:
                         explanation = None
                         st.error(f"Couldn't pull the detailed breakdown: {e}")
 
                 if explanation is not None:
-                    ecol1, ecol2 = st.columns(2)
+                    coverage_mix = explanation.get("coverage_mix", {})
+                    player_sample = explanation.get("player_coverage_sample", {})
 
-                    with ecol1:
-                        st.markdown(f"**{picked_row['opponent']}'s real coverage mix**")
-                        coverage_mix = explanation.get("coverage_mix", {})
-                        if coverage_mix:
-                            import matplotlib.pyplot as plt
-                            fig, ax = plt.subplots(figsize=(4, 4))
-                            ax.pie(coverage_mix.values(), labels=coverage_mix.keys(), autopct="%1.0f%%",
-                                   textprops={"fontsize": 8})
-                            ax.set_title(f"{picked_row['opponent']} coverage mix (this season)", fontsize=9)
-                            st.pyplot(fig)
-                        else:
-                            st.caption("No real coverage-mix data available for this defense yet.")
+                    if coverage_mix:
+                        import altair as alt
+                        chart_rows = []
+                        for cov_type, usage_pct in coverage_mix.items():
+                            sample = player_sample.get(cov_type)
+                            chart_rows.append({
+                                "coverage_type": cov_type,
+                                "defense_usage_pct": round(usage_pct * 100, 1),
+                                "sample_status": "Reliable sample" if sample else "No reliable sample yet",
+                                "player_ypp": sample["ypp"] if sample else None,
+                                "real_plays_sampled": sample["n_plays"] if sample else 0,
+                            })
+                        chart_df = pd.DataFrame(chart_rows)
 
-                    with ecol2:
-                        st.markdown(f"**{picked_row['player_display_name']}'s real efficiency, by coverage faced**")
-                        player_sample = explanation.get("player_coverage_sample", {})
-                        if player_sample:
-                            sample_df = pd.DataFrame([
-                                {"coverage_type": k, "yards_per_play": v["ypp"], "real_plays": v["n_plays"]}
-                                for k, v in player_sample.items()
-                            ]).set_index("coverage_type")
-                            st.bar_chart(sample_df["yards_per_play"])
-                            st.caption("Bar shown only for coverage types with a reliable real sample (8+ plays this season).")
-                        else:
-                            st.caption("No coverage type has a reliable (8+ play) sample yet for this player.")
+                        st.markdown(
+                            f"**{picked_row['opponent']}'s real coverage mix, tied directly to "
+                            f"{picked_row['player_display_name']}'s real efficiency in each one** "
+                            "— hover any bar for the full detail behind it."
+                        )
+                        chart = alt.Chart(chart_df).mark_bar().encode(
+                            x=alt.X("coverage_type:N", title="Coverage type", sort="-y"),
+                            y=alt.Y("defense_usage_pct:Q", title="Defense usage % (this season)"),
+                            color=alt.Color(
+                                "sample_status:N", title="Player sample",
+                                scale=alt.Scale(
+                                    domain=["Reliable sample", "No reliable sample yet"],
+                                    range=["#2ca02c", "#a0a0a0"],
+                                ),
+                            ),
+                            tooltip=[
+                                alt.Tooltip("coverage_type:N", title="Coverage"),
+                                alt.Tooltip("defense_usage_pct:Q", title="Defense usage %", format=".1f"),
+                                alt.Tooltip("player_ypp:Q", title="Player's real yards/play here", format=".1f"),
+                                alt.Tooltip("real_plays_sampled:Q", title="Real plays sampled"),
+                                alt.Tooltip("sample_status:N", title="Status"),
+                            ],
+                        ).properties(height=380)
+                        st.altair_chart(chart, use_container_width=True)
+                        st.caption(
+                            "Green = reliable real sample (8+ plays) behind that coverage's yards/play number, "
+                            "used in the weighting. Grey = the defense runs it, but there's not enough real "
+                            "sample yet for this player against it - excluded from the weighting rather than guessed at."
+                        )
+                    else:
+                        st.caption("No real coverage-mix data available for this defense yet.")
 
                     no_sample = explanation.get("coverage_types_no_sample", [])
                     if no_sample:
