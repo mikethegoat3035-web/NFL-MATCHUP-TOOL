@@ -11,6 +11,7 @@ import numpy as np
 from nfl_model_combined import (
     scan_full_slate_nfl, rescore_quality_mu_row_nfl, backtest_week, build_season_accuracy_report,
     diagnose_participation_data, get_player_matchup_explanation, diagnose_injuries_data,
+    diagnose_alignment_data,
 )
 from draft_rankings import (
     build_yahoo_style_rankings, detect_risers, build_league_settings,
@@ -92,7 +93,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v24-injuries-diagnostic-2026-08-13"
+DEPLOY_VERSION = "v25-alignment-diagnostic-2026-08-13"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -169,6 +170,42 @@ with st.expander("🔍 Debug: Inspect real injury-report data (for the planned i
                 st.json(inj_diag.get("sample_rows"))
             with st.expander("Full raw diagnostic output"):
                 st.json(inj_diag)
+
+with st.expander("🔍 Debug: Check for real receiver alignment data (wide/slot/backfield/inline)"):
+    st.caption(
+        "There's a confirmed 'route' column (route TYPE - slant/go/screen/etc.), which is NOT "
+        "the same thing as pre-snap ALIGNMENT (wide/slot/backfield/inline). This checks every "
+        "real column in both data sources for anything alignment-related before building "
+        "anything on a guess."
+    )
+    acol1, acol2 = st.columns(2)
+    with acol1:
+        align_season = st.number_input("Diagnostic season", min_value=2020, max_value=2030, value=2025, step=1, key="align_season")
+    with acol2:
+        align_week = st.number_input("Diagnostic week", min_value=1, max_value=18, value=8, step=1, key="align_week")
+    if st.button("Run alignment diagnostic", key="run_align_diag_btn"):
+        with st.spinner("Checking real data for alignment fields..."):
+            try:
+                align_diag = diagnose_alignment_data(int(align_season), int(align_week))
+                st.session_state.align_diag_result = align_diag
+            except Exception as e:
+                st.error(f"Diagnostic failed: {e}")
+    if "align_diag_result" in st.session_state:
+        align_diag = st.session_state.align_diag_result
+        st.write("**Alignment-sounding columns found in participation data:**", align_diag.get("participation_alignment_like_columns"))
+        st.write("**Alignment-sounding columns found in FTN charting data:**", align_diag.get("ftn_alignment_like_columns"))
+        if "route_value_counts" in align_diag:
+            st.write("**Real values in `route` (route TYPE, not alignment):**")
+            st.json(align_diag["route_value_counts"])
+        if "n_offense_backfield_value_counts" in align_diag:
+            st.write("**Real values in `n_offense_backfield` (a COUNT, not per-player alignment):**")
+            st.json(align_diag["n_offense_backfield_value_counts"])
+        for key in align_diag:
+            if key.startswith("participation_value_counts__") or key.startswith("ftn_value_counts__"):
+                st.write(f"**Real values in `{key.split('__', 1)[1]}`:**")
+                st.json(align_diag[key])
+        with st.expander("Full raw diagnostic output (every real column name from both sources)"):
+            st.json(align_diag)
 
 mode = st.radio(
     "Mode",
