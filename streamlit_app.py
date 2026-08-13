@@ -10,6 +10,7 @@ import pandas as pd
 import numpy as np
 from nfl_model_combined import (
     scan_full_slate_nfl, rescore_quality_mu_row_nfl, backtest_week, build_season_accuracy_report,
+    diagnose_participation_data,
 )
 from draft_rankings import (
     build_yahoo_style_rankings, detect_risers, build_league_settings,
@@ -91,12 +92,46 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v11-coverage-casing-bugfix-2026-08-13"
+DEPLOY_VERSION = "v12-coverage-data-diagnostic-2026-08-13"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
 # Season / week selection
 # -----------------------------------------------------------------------
+
+with st.expander("🔍 Debug: Inspect real participation data (coverage adjustment diagnostic)"):
+    st.caption(
+        "The coverage mu-adjustment has stayed at a 0% fire rate through two separate "
+        "fixes with no change either time - this shows the REAL raw data instead of "
+        "guessing a third time. Pick a season/week and run it."
+    )
+    dcol1, dcol2 = st.columns(2)
+    with dcol1:
+        diag_season = st.number_input("Diagnostic season", min_value=2020, max_value=2030, value=2025, step=1, key="diag_season")
+    with dcol2:
+        diag_week = st.number_input("Diagnostic week", min_value=1, max_value=18, value=8, step=1, key="diag_week")
+    if st.button("Run diagnostic", key="run_diag_btn"):
+        with st.spinner("Pulling real participation data and checking..."):
+            try:
+                diag = diagnose_participation_data(int(diag_season), int(diag_week))
+                st.session_state.diag_result = diag
+            except Exception as e:
+                st.error(f"Diagnostic failed: {e}")
+    if "diag_result" in st.session_state:
+        diag = st.session_state.diag_result
+        st.write("**Does `defense_man_zone_type` exist as a column at all?**", diag.get("has_defense_man_zone_type"))
+        if diag.get("has_defense_man_zone_type"):
+            st.write("**Real values found (including how much is missing/NaN):**")
+            st.json(diag.get("defense_man_zone_type_value_counts"))
+        st.write("**Sample player used:**", diag.get("sample_gsis_id_used"))
+        st.write("**Total merged rows for that player:**", diag.get("sample_player_total_merged_rows"))
+        st.write("**Of those, how many have a non-null defense_man_zone_type:**", diag.get("sample_player_non_null_man_zone_rows"))
+        if "sample_player_man_zone_values_seen" in diag:
+            st.write("**Real values seen for that specific player's rows:**")
+            st.json(diag["sample_player_man_zone_values_seen"])
+        with st.expander("Full raw diagnostic output"):
+            st.json(diag)
+
 mode = st.radio(
     "Mode",
     ["Scan (adjustable lines)", "Backtest (compare mu vs actual results)", "Draft Rankings"],
