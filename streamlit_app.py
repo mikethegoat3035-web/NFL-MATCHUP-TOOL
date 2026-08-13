@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 from nfl_model_combined import (
     scan_full_slate_nfl, rescore_quality_mu_row_nfl, backtest_week, build_season_accuracy_report,
-    diagnose_participation_data, get_player_matchup_explanation,
+    diagnose_participation_data, get_player_matchup_explanation, diagnose_injuries_data,
 )
 from draft_rankings import (
     build_yahoo_style_rankings, detect_risers, build_league_settings,
@@ -92,7 +92,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v23-altair-reverted-styled-table-2026-08-13"
+DEPLOY_VERSION = "v24-injuries-diagnostic-2026-08-13"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -131,6 +131,44 @@ with st.expander("🔍 Debug: Inspect real participation data (coverage adjustme
             st.json(diag["sample_player_man_zone_values_seen"])
         with st.expander("Full raw diagnostic output"):
             st.json(diag)
+
+with st.expander("🔍 Debug: Inspect real injury-report data (for the planned injury/active-status check)"):
+    st.caption(
+        "Real columns for nflreadpy's injury data have never been checked against live data - "
+        "this shows exactly what's actually there before anything gets built to read specific "
+        "column names from it, same approach that found the real coverage-type bug earlier."
+    )
+    icol1, icol2 = st.columns(2)
+    with icol1:
+        inj_season = st.number_input("Diagnostic season", min_value=2020, max_value=2030, value=2025, step=1, key="inj_season")
+    with icol2:
+        inj_week = st.number_input("Diagnostic week", min_value=1, max_value=18, value=8, step=1, key="inj_week")
+    if st.button("Run injuries diagnostic", key="run_inj_diag_btn"):
+        with st.spinner("Pulling real injury-report data and checking..."):
+            try:
+                inj_diag = diagnose_injuries_data(int(inj_season), int(inj_week))
+                st.session_state.inj_diag_result = inj_diag
+            except Exception as e:
+                st.error(f"Diagnostic failed: {e}")
+    if "inj_diag_result" in st.session_state:
+        inj_diag = st.session_state.inj_diag_result
+        if "error" in inj_diag:
+            st.error(inj_diag["error"])
+        else:
+            st.write("**Real columns pull_injuries() returns:**", inj_diag.get("columns"))
+            st.write("**Total rows pulled:**", inj_diag.get("n_rows_total"))
+            st.write("**Columns whose name looks like an injury status field:**", inj_diag.get("status_like_columns_found"))
+            st.write("**Columns whose name looks like a player-ID field:**", inj_diag.get("id_like_columns_found"))
+            for key in inj_diag:
+                if key.startswith("value_counts__"):
+                    st.write(f"**Real values in `{key.replace('value_counts__', '')}`:**")
+                    st.json(inj_diag[key])
+            st.write("**Real seasons present:**", inj_diag.get("real_seasons_present"))
+            st.write("**Real weeks present:**", inj_diag.get("real_weeks_present"))
+            with st.expander("Raw sample rows (unfiltered)"):
+                st.json(inj_diag.get("sample_rows"))
+            with st.expander("Full raw diagnostic output"):
+                st.json(inj_diag)
 
 mode = st.radio(
     "Mode",
