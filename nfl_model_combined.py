@@ -468,16 +468,30 @@ def build_coverage_playaction_crosswalk(season: int, week: int, participation_df
 
 def calc_playaction_exploit_strength(qb_pa_row: dict, def_pa_row: dict,
                                       coverage_pa_crosswalk_df: pd.DataFrame,
-                                      defteam: str, dominant_coverage: str) -> dict:
+                                      defteam: str, coverage_row: dict) -> dict:
     """
     Combines the offense side (does this QB run PA often AND perform well
-    in it) with the defense side (is this specific defense - ideally in
-    its SPECIFIC dominant coverage, falling back to its overall PA-allowed
-    number if that coverage doesn't have a trustworthy PA-specific sample
-    yet - vulnerable to play-action) into one 0-1 exploit signal. This is
-    the real interaction requested: coverage tendency x play-action
-    tendency x play-action-specific vulnerability, not any of those three
-    in isolation.
+    in it) with the defense side (is this defense - across the REAL FULL
+    MIX of coverages it actually plays, weighted by real usage% - allowing
+    real problems specifically on play-action) into one 0-1 exploit signal.
+
+    FIX (real gap found by the user reading the raw export directly):
+    previously only checked PA-vulnerability for the single "dominant"
+    coverage type - but real defenses split their coverage mix, often
+    close to evenly across 3-4+ types (confirmed via live data: the
+    "dominant" coverage averages only ~31% of a defense's real snaps, not
+    a majority). calc_coverage_quality_score's STRUCTURAL exploit signal
+    was already fixed to combine every elevated coverage type, not just
+    one - this brings the PA-specific crosswalk in line with that same
+    fix, instead of being the one place still using only the top type.
+
+    Now takes the full coverage_row (every real coverage-type percentage
+    for this defense) and computes a usage-weighted average of PA-
+    vulnerability across every coverage type with BOTH a real usage% AND
+    a trustworthy PA-specific sample in coverage_pa_crosswalk_df - a
+    coverage type the defense rarely plays contributes little to the
+    blend even if its PA-allowed grade happens to be extreme, same
+    principle as the structural signal.
     """
     offense_vals = [
         qb_pa_row.get("pa_rate_grade") if qb_pa_row else None,
@@ -486,19 +500,33 @@ def calc_playaction_exploit_strength(qb_pa_row: dict, def_pa_row: dict,
     offense_vals = [v for v in offense_vals if pd.notna(v)]
     offense_component = (sum(offense_vals) / len(offense_vals) / 100) if offense_vals else np.nan
 
-    # Prefer the coverage-specific number; fall back to the defense's
-    # overall PA-allowed grade if that specific coverage lacks a sample.
-    coverage_specific_grade = np.nan
-    if not coverage_pa_crosswalk_df.empty and dominant_coverage is not None:
-        match = coverage_pa_crosswalk_df[
-            (coverage_pa_crosswalk_df["defteam"] == defteam)
-            & (coverage_pa_crosswalk_df["defense_coverage_type"] == dominant_coverage)
-        ]
-        if not match.empty:
-            coverage_specific_grade = match.iloc[0].get("pa_epa_allowed_in_coverage_grade")
+    # Usage-weighted blend across EVERY coverage type this defense plays
+    # with a trustworthy PA-specific sample - not just the single dominant one.
+    coverage_type_cols = {
+        k: v for k, v in (coverage_row or {}).items()
+        if k.endswith("_pct") and k not in ("man_pct", "zone_pct") and pd.notna(v)
+    }
+    weighted_grade_sum, weight_total, any_coverage_specific = 0.0, 0.0, False
+    if coverage_type_cols and not coverage_pa_crosswalk_df.empty:
+        crosswalk_for_def = coverage_pa_crosswalk_df[coverage_pa_crosswalk_df["defteam"] == defteam]
+        for cov_type_pct_key, usage_pct in coverage_type_cols.items():
+            # BUGFIX caught in testing (same bug class as the mu-shrinkage
+            # fix's own testing catch earlier): coverage_row's keys end in
+            # "_pct" (e.g. "COVER_2_pct") but the crosswalk's real
+            # defense_coverage_type values (raw participation_df values)
+            # don't have that suffix (e.g. "COVER_2") - strip it before
+            # matching, or this lookup silently never matches anything.
+            cov_type = cov_type_pct_key[:-len("_pct")]
+            match = crosswalk_for_def[crosswalk_for_def["defense_coverage_type"] == cov_type]
+            if not match.empty:
+                grade = match.iloc[0].get("pa_epa_allowed_in_coverage_grade")
+                if pd.notna(grade):
+                    weighted_grade_sum += grade * usage_pct
+                    weight_total += usage_pct
+                    any_coverage_specific = True
 
-    if pd.notna(coverage_specific_grade):
-        defense_grade = coverage_specific_grade
+    if any_coverage_specific and weight_total > 0:
+        defense_grade = weighted_grade_sum / weight_total
         used_coverage_specific = True
     else:
         defense_grade = def_pa_row.get("pa_epa_allowed_grade") if def_pa_row else np.nan
@@ -649,11 +677,19 @@ def build_motion_tendency_profile(season: int, week: int, ftn_df: pd.DataFrame,
 def build_offense_personnel_tendency(season: int, week: int, participation_df: pd.DataFrame,
                                       pbp_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Per-team DOMINANT offense personnel grouping (e.g. '11 Personnel',
-    whatever the real charted label is) and how often they actually use
-    it - the offense-tendency half of the crosswalk. Same join pattern
-    used throughout this file for participation data: nflverse_game_id +
-    play_id -> pbp's game_id + play_id for posteam.
+    Per-team FULL personnel usage distribution (every grouping actually
+    used, with its real usage%) - the offense-tendency half of the
+    crosswalk. Same join pattern used throughout this file for
+    participation data: nflverse_game_id + play_id -> pbp's game_id +
+    play_id for posteam.
+
+    FIX (same real gap the user found for coverage, applied here too):
+    previously collapsed to only the single DOMINANT personnel grouping
+    per team, discarding the rest of a team's real personnel mix - same
+    issue the coverage structural signal was already fixed for. Now
+    returns every (posteam, offense_personnel, usage_pct) row, so
+    calc_personnel_exploit_strength can weight across the full real mix
+    instead of just the top grouping.
     """
     hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)]
     merged = participation_df.merge(
@@ -668,11 +704,7 @@ def build_offense_personnel_tendency(season: int, week: int, participation_df: p
     totals = df.groupby("posteam").size().reset_index(name="n_total")
     counts = counts.merge(totals, on="posteam")
     counts["usage_pct"] = counts["n"] / counts["n_total"]
-
-    dominant = counts.loc[counts.groupby("posteam")["usage_pct"].idxmax()][
-        ["posteam", "offense_personnel", "usage_pct"]
-    ].rename(columns={"offense_personnel": "dominant_personnel", "usage_pct": "dominant_personnel_pct"})
-    return dominant
+    return counts[["posteam", "offense_personnel", "usage_pct"]]
 
 
 def build_defense_personnel_allowed(season: int, week: int, participation_df: pd.DataFrame,
@@ -710,8 +742,19 @@ def calc_personnel_exploit_strength(team: str, offense_personnel_tendency_df: pd
                                      defteam: str, defense_personnel_allowed_df: pd.DataFrame) -> dict:
     """
     Looks up this offense's dominant personnel grouping, then the
-    opponent's real EPA-allowed grade specifically against THAT grouping -
-    a 0-1 exploit signal, same shape as calc_playaction_exploit_strength.
+    opponent's real EPA-allowed grade across the FULL real personnel mix
+    this offense uses (weighted by actual usage%), not just its single
+    most-common grouping - a 0-1 exploit signal, same shape as
+    calc_playaction_exploit_strength.
+
+    FIX (same real gap the user found for coverage): previously only
+    checked the defense's vulnerability to the offense's single dominant
+    personnel grouping, discarding the rest of a real, often-substantial
+    mix. Now computes a usage-weighted average across every grouping this
+    offense actually uses with a trustworthy defense-side sample - a
+    rarely-used grouping contributes little to the blend even if its
+    allowed-grade happens to be extreme, same principle as the coverage fix.
+
     Degrades to NaN (not a guessed neutral value) if either side lacks
     enough real data - the caller should treat NaN as "no signal here"
     same as every other exploit function in this file.
@@ -719,22 +762,26 @@ def calc_personnel_exploit_strength(team: str, offense_personnel_tendency_df: pd
     if offense_personnel_tendency_df.empty or defense_personnel_allowed_df.empty:
         return {"exploit_strength": np.nan, "dominant_personnel": None}
 
-    off_row = offense_personnel_tendency_df[offense_personnel_tendency_df["posteam"] == team]
-    if off_row.empty:
+    off_rows = offense_personnel_tendency_df[offense_personnel_tendency_df["posteam"] == team]
+    if off_rows.empty:
         return {"exploit_strength": np.nan, "dominant_personnel": None}
-    dominant_personnel = off_row.iloc[0]["dominant_personnel"]
+    dominant_personnel = off_rows.loc[off_rows["usage_pct"].idxmax(), "offense_personnel"]
 
-    def_row = defense_personnel_allowed_df[
-        (defense_personnel_allowed_df["defteam"] == defteam)
-        & (defense_personnel_allowed_df["offense_personnel"] == dominant_personnel)
-    ]
-    if def_row.empty:
+    def_rows_for_team = defense_personnel_allowed_df[defense_personnel_allowed_df["defteam"] == defteam]
+    weighted_grade_sum, weight_total = 0.0, 0.0
+    for _, off_row in off_rows.iterrows():
+        match = def_rows_for_team[def_rows_for_team["offense_personnel"] == off_row["offense_personnel"]]
+        if not match.empty:
+            grade = match.iloc[0]["epa_allowed_grade"]
+            if pd.notna(grade):
+                weighted_grade_sum += grade * off_row["usage_pct"]
+                weight_total += off_row["usage_pct"]
+
+    if weight_total == 0:
         return {"exploit_strength": np.nan, "dominant_personnel": dominant_personnel}
 
-    grade = def_row.iloc[0]["epa_allowed_grade"]
-    if pd.isna(grade):
-        return {"exploit_strength": np.nan, "dominant_personnel": dominant_personnel}
-    return {"exploit_strength": round(1 - (grade / 100), 3), "dominant_personnel": dominant_personnel}
+    blended_grade = weighted_grade_sum / weight_total
+    return {"exploit_strength": round(1 - (blended_grade / 100), 3), "dominant_personnel": dominant_personnel}
 
 
 # ---------------------------------------------------------------------------
@@ -1449,6 +1496,204 @@ def calc_coverage_adjusted_mu(base_mu: float, coverage_efficiency: dict,
     return round(base_mu * multiplier, 2)
 
 
+# ---------------------------------------------------------------------------
+# 5b. FULL-COVERAGE-TYPE PLAYER SPLIT (real efficiency by EVERY charted
+#     coverage type, not just the coarser man/zone binary above - that
+#     mechanism is currently disabled, proven coinflip-accuracy at 2
+#     buckets. This is a NEW, separate signal built to test whether more
+#     granularity actually helps, rather than silently modifying the
+#     disabled mechanism - keeps results cleanly attributable either way.
+# ---------------------------------------------------------------------------
+
+def build_player_full_coverage_efficiency(player_gsis_id: str, role: str,
+                                           participation_df: pd.DataFrame, pbp_df: pd.DataFrame,
+                                           min_plays_per_type: int = 8) -> dict:
+    """
+    Real per-player efficiency (yards/play) split across EVERY charted
+    coverage type (Cover 0/1/2/3/4/6/9, 2-Man, Combo, etc.), not just
+    man/zone. Caller is expected to pass the FULL SEASON of real plays
+    before the target week (not a short recent window) - per real-world
+    volume, a full season gives enough plays for a player's more common
+    coverages even split this fine, though rarer types (Cover 9, Combo,
+    Blown) will often still fall below min_plays_per_type even over 17
+    games. Those are dropped entirely rather than trusted on a thin
+    sample - see calc_full_coverage_adjusted_mu for how the fallback
+    then correctly relies on whichever 2-3 real coverages ARE reliable.
+
+    Returns {coverage_type: {"ypp": float, "n_plays": int}, ...} for
+    types clearing min_plays_per_type, plus "overall_ypp"/"overall_plays"
+    keys holding this player's real overall average across every play
+    regardless of coverage type (the baseline the multiplier compares
+    against).
+    """
+    merged = participation_df.merge(
+        pbp_df[["game_id", "play_id", "defteam", "posteam",
+                "receiver_player_id", "receiving_yards",
+                "passer_player_id", "passing_yards"]],
+        left_on=["nflverse_game_id", "play_id"], right_on=["game_id", "play_id"], how="left",
+    )
+    player_col = "receiver_player_id" if role == "receiver" else "passer_player_id"
+    yards_col = "receiving_yards" if role == "receiver" else "passing_yards"
+    player_plays = merged[
+        (merged[player_col] == player_gsis_id) & merged["defense_coverage_type"].notna()
+    ]
+    if player_plays.empty:
+        return {"overall_ypp": np.nan, "overall_plays": 0}
+
+    result = {}
+    for cov_type, group in player_plays.groupby("defense_coverage_type"):
+        n = len(group)
+        if n >= min_plays_per_type:
+            result[cov_type] = {"ypp": round(group[yards_col].mean(), 2), "n_plays": n}
+
+    result["overall_ypp"] = round(player_plays[yards_col].mean(), 2)
+    result["overall_plays"] = len(player_plays)
+    return result
+
+
+def calc_full_coverage_adjusted_mu(base_mu: float, player_coverage_eff: dict,
+                                    opp_coverage_row: dict, max_adjustment: float = 0.2) -> dict:
+    """
+    Generalizes calc_coverage_adjusted_mu's exact multiplier logic (real
+    per-player split x this week's opponent tendency, capped adjustment)
+    from 2 buckets (man/zone) to EVERY coverage type both sides have
+    reliable real data for - the fallback the user specifically asked
+    for: a defense that plays 3 real coverages this season where the
+    player has adequate sample against 2 of them but not the 3rd
+    correctly RENORMALIZES the weighting across just those 2 reliable
+    types, rather than forcing in an unreliable split or refusing to
+    adjust mu at all.
+
+    Returns a dict (not just a float) so the caller can see HOW MUCH of
+    the opponent's real coverage mix was actually covered by a reliable
+    player-side sample (coverage_weight_used, 0-1) - a defense that
+    spreads evenly across many types the player barely sees correctly
+    results in little to no adjustment, not a forced guess.
+    """
+    overall_ypp = player_coverage_eff.get("overall_ypp")
+    if pd.isna(overall_ypp) or not overall_ypp:
+        return {"adjusted_mu": base_mu, "coverage_weight_used": 0.0}
+
+    coverage_type_cols = {
+        k: v for k, v in (opp_coverage_row or {}).items()
+        if k.endswith("_pct") and k not in ("man_pct", "zone_pct") and pd.notna(v)
+    }
+    weighted_ypp_sum, weight_total = 0.0, 0.0
+    for cov_type_pct_key, usage_pct in coverage_type_cols.items():
+        # BUGFIX caught in testing: opp_coverage_row's keys end in "_pct"
+        # (e.g. "COVER_3_pct") but player_coverage_eff's keys don't (e.g.
+        # "COVER_3") - strip the suffix before matching, or this lookup
+        # silently returns None every time and coverage_weight_used stays
+        # 0.0 no matter how much real overlap actually exists.
+        cov_type = cov_type_pct_key[:-len("_pct")]
+        player_split = player_coverage_eff.get(cov_type)
+        if player_split is not None:
+            weighted_ypp_sum += player_split["ypp"] * usage_pct
+            weight_total += usage_pct
+
+    if weight_total == 0:
+        return {"adjusted_mu": base_mu, "coverage_weight_used": 0.0}
+
+    expected_ypp_this_matchup = weighted_ypp_sum / weight_total
+    multiplier = expected_ypp_this_matchup / overall_ypp
+    multiplier = max(1 - max_adjustment, min(1 + max_adjustment, multiplier))
+
+    return {"adjusted_mu": round(base_mu * multiplier, 2), "coverage_weight_used": round(weight_total, 3)}
+
+
+def build_matchup_explanation(coverage_row: dict, player_coverage_eff: dict,
+                               personnel_row: dict = None, personnel_eff: dict = None,
+                               min_meaningful_usage: float = 0.05) -> dict:
+    """
+    DISPLAY-ONLY summary of "why" behind a matchup - built for the Best
+    Matchups explainer tab, computed regardless of whether the full-
+    coverage mu-adjustment itself is enabled, since seeing this reasoning
+    doesn't require trusting the adjustment yet. Answers exactly what the
+    user asked to see: which coverages/personnel groupings the defense
+    actually leans on, and which of those the player has (or doesn't
+    have) a real, reliable sample against.
+
+    Returns:
+      coverage_mix: {coverage_type: usage_pct} for every real coverage
+        type the defense plays (min_meaningful_usage floor - a coverage
+        run <5% of the time isn't worth listing as part of "their tendency")
+      player_coverage_sample: {coverage_type: {"ypp","n_plays"}} - only
+        the coverage types the player has a RELIABLE sample against
+        (already filtered by build_player_full_coverage_efficiency's
+        min_plays_per_type)
+      coverage_types_no_sample: which of the defense's real meaningful
+        coverage types the player does NOT have reliable data for -
+        exactly the "defense runs 3/4/6, player only has sample vs 3/4"
+        case the user described
+      personnel_mix / player_personnel_note: same idea for personnel,
+        when provided (rec_yards only)
+    """
+    coverage_mix = {
+        k[:-len("_pct")]: round(v, 3) for k, v in (coverage_row or {}).items()
+        if k.endswith("_pct") and k not in ("man_pct", "zone_pct") and pd.notna(v) and v >= min_meaningful_usage
+    }
+    player_coverage_sample = {
+        k: v for k, v in (player_coverage_eff or {}).items()
+        if k not in ("overall_ypp", "overall_plays")
+    }
+    coverage_types_no_sample = [
+        cov for cov in coverage_mix if cov not in player_coverage_sample
+    ]
+
+    result = {
+        "coverage_mix": coverage_mix,
+        "player_coverage_sample": player_coverage_sample,
+        "coverage_types_no_sample": coverage_types_no_sample,
+        "player_overall_ypp": (player_coverage_eff or {}).get("overall_ypp"),
+    }
+
+    if personnel_row is not None:
+        result["personnel_mix"] = {
+            row["offense_personnel"]: round(row["usage_pct"], 3)
+            for _, row in personnel_row.iterrows()
+        } if hasattr(personnel_row, "iterrows") else {}
+        result["personnel_efficiency_note"] = personnel_eff
+
+    return result
+
+
+def get_player_matchup_explanation(gsis_id: str, prop_type: str, team: str, opponent: str,
+                                    season: int, week: int) -> dict:
+    """
+    ON-DEMAND, single-player version of build_matchup_explanation - built
+    to be called interactively when a user clicks a specific player in
+    the Best Matchups UI, NOT baked into every row of build_weekly_slate.
+    Deliberately kept separate: embedding this into every scanned row
+    would add real per-player compute cost, and build_weekly_slate also
+    gets called 15x inside the season readiness report's week loop -
+    baking this in there would multiply that cost 15x, risking the same
+    Streamlit Cloud resource-limit issue already hit once this session.
+    Cheap to call per-click instead, since the underlying data pulls
+    (_cache_pull-decorated) are already cached from whatever scan just ran.
+    """
+    participation_df = pull_participation([season])
+    pbp_df = pull_pbp([season])
+    pbp_history_df = pbp_df[pbp_df["week"] < week]
+    coverage_profile = build_blended_coverage_profile(season, week)
+
+    opp_coverage_row = None
+    if not coverage_profile.empty:
+        match = coverage_profile[coverage_profile["defteam"] == opponent]
+        if not match.empty:
+            opp_coverage_row = match.iloc[0].to_dict()
+
+    role = "passer" if prop_type == "pass_yards" else "receiver"
+    player_coverage_eff = build_player_full_coverage_efficiency(gsis_id, role, participation_df, pbp_history_df)
+
+    personnel_row = None
+    if prop_type == "rec_yards":
+        offense_personnel_tendency = build_offense_personnel_tendency(season, week, participation_df, pbp_history_df)
+        if not offense_personnel_tendency.empty:
+            personnel_row = offense_personnel_tendency[offense_personnel_tendency["posteam"] == team]
+
+    return build_matchup_explanation(opp_coverage_row, player_coverage_eff, personnel_row)
+
+
 def get_opponent_this_week(team: str, season: int, week: int, schedules_df: pd.DataFrame) -> str:
     """
     Looks up who a team plays this week, using schedules_df's home_team/away_team.
@@ -2068,6 +2313,17 @@ ENABLE_BOX_MU_ADJUSTMENT = False
 # shown via mu_before_coverage_adj for comparison.
 ENABLE_COVERAGE_MU_ADJUSTMENT = False
 
+# NEW, SEPARATE mechanism - full-coverage-type player split (Cover 0-9
+# individually, not just the coarser man/zone binary above). Built per
+# user request after confirming the disabled man/zone version's problem
+# wasn't necessarily "situational splits don't work" so much as "2 buckets
+# might just be too coarse" - this tests that directly, using the FULL
+# season of real plays (not a short window) and a fallback that only
+# relies on whichever specific coverages both the player and defense have
+# a reliable real sample for (renormalized, not forced). Kept OFF by
+# default pending its own live test - untested, not yet proven either way.
+ENABLE_FULL_COVERAGE_MU_ADJUSTMENT = False
+
 
 PROP_METRIC_CROSSWALK = {
     "pass_yards": {
@@ -2421,7 +2677,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
         def_pa_row = def_pa_profile[def_pa_profile["defteam"] == opponent]
         def_pa_row = def_pa_row.iloc[0].to_dict() if not def_pa_row.empty else {}
         playaction_info = calc_playaction_exploit_strength(
-            qb_pa_row, def_pa_row, coverage_pa_crosswalk, opponent, coverage_info.get("dominant_coverage")
+            qb_pa_row, def_pa_row, coverage_pa_crosswalk, opponent, opp_coverage_row
         )
         # GATED per ENABLE_PLAYACTION_IN_QUALITY_SCORE - still computed and
         # still attached to the row below for visibility, just excluded
@@ -2447,6 +2703,18 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
                     prior_pbp_df=prior_pbp_df,
                 )
                 adjusted_mu = calc_coverage_adjusted_mu(mu, coverage_eff, man_pct, zone_pct)
+
+        # NEW, SEPARATE full-coverage-type version - GATED per
+        # ENABLE_FULL_COVERAGE_MU_ADJUSTMENT, off by default pending its
+        # own live test. See rec_yards block for the full rationale.
+        full_coverage_weight_used = 0.0
+        if ENABLE_FULL_COVERAGE_MU_ADJUSTMENT and pd.notna(mu) and opp_coverage_row:
+            player_full_coverage_eff = build_player_full_coverage_efficiency(
+                gsis_id, "passer", participation_df, pbp_history_df,
+            )
+            full_cov_result = calc_full_coverage_adjusted_mu(adjusted_mu, player_full_coverage_eff, opp_coverage_row)
+            adjusted_mu = full_cov_result["adjusted_mu"]
+            full_coverage_weight_used = full_cov_result["coverage_weight_used"]
 
         confidence_info = get_data_confidence(gsis_id, player_stats_df, season, week, current_team=team)
         own_grades = get_player_grades(gsis_id, qb_metrics)
@@ -2492,6 +2760,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             "opp_num_elevated_coverages": coverage_info.get("num_elevated_coverages", 0),
             "playaction_exploit_strength": playaction_info.get("exploit_strength"),
             "playaction_used_coverage_specific_data": playaction_info.get("used_coverage_specific_playaction_data"),
+            "full_coverage_weight_used": full_coverage_weight_used,
             "quality_score": quality_score,
             "grade_matchup_strength": grade_exploit,
             "role_verification_score": role_score,
@@ -2628,6 +2897,20 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
                 )
                 adjusted_mu = calc_coverage_adjusted_mu(mu, coverage_eff, man_pct, zone_pct)
 
+            # NEW, SEPARATE full-coverage-type version - GATED per
+            # ENABLE_FULL_COVERAGE_MU_ADJUSTMENT, off by default pending
+            # its own live test. Applied on top of adjusted_mu (which is
+            # just `mu` unchanged while the man/zone version stays off) so
+            # this can be tested in isolation regardless of that flag's state.
+            full_coverage_weight_used = 0.0
+            if ENABLE_FULL_COVERAGE_MU_ADJUSTMENT and opp_coverage_row:
+                player_full_coverage_eff = build_player_full_coverage_efficiency(
+                    gsis_id, "receiver", participation_df, pbp_history_df,
+                )
+                full_cov_result = calc_full_coverage_adjusted_mu(adjusted_mu, player_full_coverage_eff, opp_coverage_row)
+                adjusted_mu = full_cov_result["adjusted_mu"]
+                full_coverage_weight_used = full_cov_result["coverage_weight_used"]
+
             rec_confidence_info = get_data_confidence(gsis_id, player_stats_df, season, week, current_team=team)
             own_grades = get_player_grades(gsis_id, rec_metrics)
             def_grades = get_defense_grades(opponent, def_metrics)
@@ -2657,6 +2940,7 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
                 "opp_num_elevated_coverages": coverage_info.get("num_elevated_coverages", 0),
                 "personnel_exploit_strength": personnel_info.get("exploit_strength"),
                 "dominant_personnel": personnel_info.get("dominant_personnel"),
+                "full_coverage_weight_used": full_coverage_weight_used,
                 **get_full_coverage_breakdown(opp_coverage_row),
                 "quality_score": quality_score,
                 "grade_matchup_strength": grade_exploit,
