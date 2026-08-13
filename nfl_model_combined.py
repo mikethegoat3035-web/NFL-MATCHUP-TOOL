@@ -3125,6 +3125,70 @@ def backtest_week(season: int, week: int) -> pd.DataFrame:
 #    accuracy uneven across prop types/positions.
 # ---------------------------------------------------------------------------
 
+def diagnose_participation_data(season: int, week: int, sample_gsis_id: str = None) -> dict:
+    """
+    DIAGNOSTIC ONLY - not used anywhere in scoring. Built after the
+    coverage adjustment stayed stuck at a 0% fire rate through TWO
+    separate fixes (raising then reverting min_plays_per_bucket, then a
+    case-insensitive matching fix) with no change either time - two blind
+    guesses in a row without seeing the real data is enough; this surfaces
+    the real thing directly instead of guessing a third time. This build
+    environment has no network access to nflreadpy, so this can only
+    actually run wherever the real data is reachable (the deployed app).
+
+    Returns real, raw facts about participation_df for this season/week:
+      - whether "defense_man_zone_type" exists as a column at all
+      - its real value_counts (including NaN share) - the actual strings
+        real data contains, whatever they turn out to be
+      - the same for "defense_coverage_type" for comparison (this ONE
+        drives the confirmed-working man_pct/zone_pct calculation, so
+        comparing the two columns' real behavior side by side is useful)
+      - whether the join to pbp_df actually produces ANY matched rows at
+        all for a sample player (rules out/in a join-key problem
+        completely separate from the coverage-type values themselves)
+    """
+    participation_df = pull_participation([season])
+    pbp_df = pull_pbp([season])
+    result = {"season": season, "week": week}
+
+    result["participation_columns"] = list(participation_df.columns)
+    result["has_defense_man_zone_type"] = "defense_man_zone_type" in participation_df.columns
+    result["has_defense_coverage_type"] = "defense_coverage_type" in participation_df.columns
+
+    if result["has_defense_man_zone_type"]:
+        vc = participation_df["defense_man_zone_type"].value_counts(dropna=False)
+        result["defense_man_zone_type_value_counts"] = vc.to_dict()
+    if result["has_defense_coverage_type"]:
+        vc2 = participation_df["defense_coverage_type"].value_counts(dropna=False)
+        result["defense_coverage_type_value_counts"] = vc2.head(10).to_dict()
+
+    # Join sanity check: does merging participation to pbp on
+    # (nflverse_game_id, play_id) -> (game_id, play_id) actually produce
+    # any rows with a non-null defense_man_zone_type for a sample player?
+    if sample_gsis_id is None:
+        # pick whichever player has the most receiving plays this season as a reasonable sample
+        hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)]
+        if "receiver_player_id" in hist_pbp.columns and hist_pbp["receiver_player_id"].notna().any():
+            sample_gsis_id = hist_pbp["receiver_player_id"].value_counts().idxmax()
+    result["sample_gsis_id_used"] = sample_gsis_id
+
+    if sample_gsis_id is not None and result["has_defense_man_zone_type"]:
+        hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)]
+        merged = participation_df.merge(
+            hist_pbp[["game_id", "play_id", "receiver_player_id"]],
+            left_on=["nflverse_game_id", "play_id"], right_on=["game_id", "play_id"], how="left",
+        )
+        sample_rows = merged[merged["receiver_player_id"] == sample_gsis_id]
+        result["sample_player_total_merged_rows"] = len(sample_rows)
+        result["sample_player_non_null_man_zone_rows"] = int(sample_rows["defense_man_zone_type"].notna().sum())
+        if not sample_rows.empty:
+            result["sample_player_man_zone_values_seen"] = (
+                sample_rows["defense_man_zone_type"].value_counts(dropna=False).to_dict()
+            )
+
+    return result
+
+
 def get_completed_weeks_with_data(season: int, through_week: int = 18) -> list:
     """
     Returns the list of weeks in `season` that actually have real
