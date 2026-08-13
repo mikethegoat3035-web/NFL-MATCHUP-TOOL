@@ -92,7 +92,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v20-best-matchups-integrated-2026-08-13"
+DEPLOY_VERSION = "v21-best-matchups-in-backtest-too-2026-08-13"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -535,16 +535,21 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
     # -------------------------------------------------------------------
     # BEST QUALITY MATCHUPS - built directly into the scan itself now
     # (was a separate mode, folded in per feedback: no reason to force a
-    # mode switch just to see the curated best-quality view). Only shown
-    # for a real Scan (not Backtest, which is comparing against known
-    # past results, not picking matchups). Filters by a MINIMUM
-    # quality_score (not just top-N) so "keep options limited but
+    # mode switch just to see the curated best-quality view). Shown for
+    # BOTH Scan and Backtest (a backtest row has the same gsis_id/prop_type/
+    # team/opponent/week columns needed for the same real breakdown - a
+    # played week is actually a great way to sanity-check this feature
+    # works, no different underlying data than a live scan). Filters by a
+    # MINIMUM quality_score (not just top-N) so "keep options limited but
     # quality high" is a real floor, not just a count.
     # -------------------------------------------------------------------
-    if not st.session_state.backtest_mode:
+    if True:
         bm_df = df[df["prop_type"].isin(["pass_yards", "rec_yards"])].dropna(subset=["quality_score"])
         if not bm_df.empty:
             st.subheader("🏆 Best Quality Matchups")
+            if st.session_state.backtest_mode:
+                st.caption("Backtest data - real per-coverage breakdown for an already-played week, "
+                           "same underlying function as a live Scan.")
             bmf1, bmf2 = st.columns(2)
             with bmf1:
                 bm_min_quality = st.slider("Minimum quality_score", 0, 100, 75, 5, key="bm_min_quality")
