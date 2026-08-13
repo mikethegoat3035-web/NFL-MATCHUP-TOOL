@@ -2042,6 +2042,22 @@ ENABLE_PERSONNEL_IN_QUALITY_SCORE = False
 # re-diagnosed; still computed and shown via mu_before_box_adj for
 # comparison.
 ENABLE_BOX_MU_ADJUSTMENT = False
+# GATED per real 2025 data (once the mechanism was finally debugged to
+# actually fire - two real bugs found and fixed: build_player_coverage_
+# efficiency was matching the wrong coverage-type strings, and upstream of
+# that, build_coverage_profile was producing man_pct/zone_pct as
+# permanently-null columns due to the same underlying value mismatch, so
+# the adjustment's own gate check never once passed all session): once
+# correctly firing (82.2% of eligible rows), direction accuracy came back
+# at 48.7% - a coinflip, essentially identical to box's 47%. Two
+# INDEPENDENT situational-split mechanisms (coverage type, box count) both
+# landing at coinflip accuracy on real, CORRECTLY FUNCTIONING code is
+# converging evidence about the underlying idea itself (a player's
+# situational split x opponent's situational tendency, turned into an
+# actual mu multiplier), not a remaining bug in either implementation.
+# Disabled from moving mu for the same reason as box; still computed and
+# shown via mu_before_coverage_adj for comparison.
+ENABLE_COVERAGE_MU_ADJUSTMENT = False
 
 
 PROP_METRIC_CROSSWALK = {
@@ -2408,8 +2424,11 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
         # ACTUAL mu adjustment (not just a quality_score side signal) using
         # this QB's own real man/zone efficiency split from their play
         # history, weighted by this specific opponent's man/zone tendency.
+        # GATED per ENABLE_COVERAGE_MU_ADJUSTMENT (see flag note above) -
+        # still computed below when the gate check passes, so mu_before_
+        # coverage_adj stays available for comparison, just not applied.
         adjusted_mu = mu
-        if pd.notna(mu) and opp_coverage_row:
+        if ENABLE_COVERAGE_MU_ADJUSTMENT and pd.notna(mu) and opp_coverage_row:
             man_pct = opp_coverage_row.get("man_pct")
             zone_pct = opp_coverage_row.get("zone_pct")
             if pd.notna(man_pct) and pd.notna(zone_pct):
@@ -2588,10 +2607,11 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
 
             # ACTUAL mu adjustment using this receiver's own real man/zone
             # efficiency split, weighted by this specific opponent's tendency.
+            # GATED per ENABLE_COVERAGE_MU_ADJUSTMENT (see flag note above).
             adjusted_mu = mu
             man_pct = opp_coverage_row.get("man_pct") if opp_coverage_row else None
             zone_pct = opp_coverage_row.get("zone_pct") if opp_coverage_row else None
-            if pd.notna(man_pct) and pd.notna(zone_pct):
+            if ENABLE_COVERAGE_MU_ADJUSTMENT and pd.notna(man_pct) and pd.notna(zone_pct):
                 coverage_eff = build_player_coverage_efficiency(
                     gsis_id, "receiver", season, participation_df, pbp_history_df,
                     current_team=team, prior_participation_df=prior_participation_df,
