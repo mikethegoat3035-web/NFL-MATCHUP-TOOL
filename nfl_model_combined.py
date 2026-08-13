@@ -1658,7 +1658,7 @@ def build_matchup_explanation(coverage_row: dict, player_coverage_eff: dict,
 
 
 def get_player_matchup_explanation(gsis_id: str, prop_type: str, team: str, opponent: str,
-                                    season: int, week: int) -> dict:
+                                    season: int, week: int, use_full_season: bool = True) -> dict:
     """
     ON-DEMAND, single-player version of build_matchup_explanation - built
     to be called interactively when a user clicks a specific player in
@@ -1670,11 +1670,23 @@ def get_player_matchup_explanation(gsis_id: str, prop_type: str, team: str, oppo
     Streamlit Cloud resource-limit issue already hit once this session.
     Cheap to call per-click instead, since the underlying data pulls
     (_cache_pull-decorated) are already cached from whatever scan just ran.
+
+    use_full_season (per explicit request, default True): this function is
+    a VALIDATION/understanding tool, not the live mu-generating pathway -
+    the actual mu/quality_score computation elsewhere in this file
+    correctly stays restricted to weeks BEFORE the target week (no
+    leakage). This explainer is different in kind: its whole purpose is
+    "does this real relationship make sense," so maximizing real sample
+    volume (the full season) gives a fuller, more honest picture than
+    artificially restricting to a partial season, with no leakage concern
+    since nothing here feeds back into a live projection. Set False to
+    see the exact same before-this-week-only data mu would have used.
     """
     participation_df = pull_participation([season])
     pbp_df = pull_pbp([season])
-    pbp_history_df = pbp_df[pbp_df["week"] < week]
-    coverage_profile = build_blended_coverage_profile(season, week)
+    effective_week = 19 if use_full_season else week  # week 19 = "no real week is >= this", captures the whole season
+    pbp_history_df = pbp_df[pbp_df["week"] < effective_week]
+    coverage_profile = build_blended_coverage_profile(season, effective_week)
 
     opp_coverage_row = None
     if not coverage_profile.empty:
@@ -1687,7 +1699,7 @@ def get_player_matchup_explanation(gsis_id: str, prop_type: str, team: str, oppo
 
     personnel_row = None
     if prop_type == "rec_yards":
-        offense_personnel_tendency = build_offense_personnel_tendency(season, week, participation_df, pbp_history_df)
+        offense_personnel_tendency = build_offense_personnel_tendency(season, effective_week, participation_df, pbp_history_df)
         if not offense_personnel_tendency.empty:
             personnel_row = offense_personnel_tendency[offense_personnel_tendency["posteam"] == team]
 
