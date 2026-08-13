@@ -2674,7 +2674,7 @@ def get_data_confidence(player_gsis_id: str, player_stats_df: pd.DataFrame, seas
 def calc_prop_mu(player_gsis_id: str, prop_column: str, player_stats_df: pd.DataFrame,
                   season: int, current_week: int, current_team: str = None,
                   lookback_games: int = 6, min_games: int = 2,
-                  league_fallback_mu: float = None) -> float:
+                  league_fallback_mu: float = None, full_confidence_games: int = None) -> float:
     """
     Computes mu as the average of a player's own recent real games for a
     given stat column, using player_stats history from weeks BEFORE
@@ -2695,6 +2695,25 @@ def calc_prop_mu(player_gsis_id: str, prop_column: str, player_stats_df: pd.Data
     If current_team isn't provided (backward-compatible), falls back to
     the old team-agnostic behavior.
 
+    SHRINKAGE FIX (real structural bug found via the 2025 backtest): this
+    was previously a HARD CUTOVER - the instant a player had >=min_games
+    (2) real games, their own average was used at FULL weight, with
+    IDENTICAL treatment for a player on 2-3 games and one on 15+. This
+    directly explains a confirmed real pattern in the pass_yards backtest
+    failure: every worst-miss QB had thin games_sampled (3-5, almost
+    always a backup/uncertain-role situation), each trusted as fully
+    reliable as an established starter - one unusually good or bad game
+    inside a 2-3 game sample could swing mu hugely with zero dampening.
+    Now blends the player's own average with league_fallback_mu using the
+    SAME Bayesian shrinkage shape already used elsewhere in this file
+    (blend_volume_estimate, blend_scheme_baseline): weight shifts smoothly
+    toward the player's own data as real games accumulate, reaching full
+    confidence only at full_confidence_games (8, roughly half a season)
+    instead of an instant all-or-nothing cutover at 2. Below min_games,
+    behavior is unchanged (pure fallback, or NaN if none exists). If no
+    league_fallback_mu is available to shrink toward, also unchanged
+    (falls back to the player's own average outright, same as before).
+
     Returns NaN if there's no usable history and no league_fallback_mu is
     provided - flagged low-confidence in the UI rather than guessed.
     """
@@ -2704,28 +2723,43 @@ def calc_prop_mu(player_gsis_id: str, prop_column: str, player_stats_df: pd.Data
         & (player_stats_df["week"] < current_week)
     ].sort_values("week", ascending=False).head(lookback_games)
 
-    if len(current_season_history) >= min_games:
-        return round(current_season_history[prop_column].mean(), 2)
+    combined = current_season_history
+    if len(combined) < min_games:
+        # Not enough current-season games (Week 1-2, or right after a trade) -
+        # bridge with the end of the prior season, but ONLY if it was with the
+        # SAME team (when current_team is known) - a traded player's old-team
+        # games are excluded rather than silently blended in.
+        prior_season_query = (
+            (player_stats_df["gsis_id"] == player_gsis_id)
+            & (player_stats_df["season"] == season - 1)
+        )
+        if current_team is not None:
+            prior_season_query &= (player_stats_df["team"] == current_team)
+        prior_season_history = player_stats_df[prior_season_query].sort_values(
+            "week", ascending=False
+        ).head(lookback_games)
+        combined = pd.concat([current_season_history, prior_season_history])
 
-    # Not enough current-season games (Week 1-2, or right after a trade) -
-    # bridge with the end of the prior season, but ONLY if it was with the
-    # SAME team (when current_team is known) - a traded player's old-team
-    # games are excluded rather than silently blended in.
-    prior_season_query = (
-        (player_stats_df["gsis_id"] == player_gsis_id)
-        & (player_stats_df["season"] == season - 1)
-    )
-    if current_team is not None:
-        prior_season_query &= (player_stats_df["team"] == current_team)
-    prior_season_history = player_stats_df[prior_season_query].sort_values(
-        "week", ascending=False
-    ).head(lookback_games)
+    if len(combined) < min_games:
+        return league_fallback_mu if league_fallback_mu is not None else np.nan
 
-    combined = pd.concat([current_season_history, prior_season_history])
-    if len(combined) >= min_games:
-        return round(combined[prop_column].mean(), 2)
+    own_avg = combined[prop_column].mean()
+    games_n = len(combined)
 
-    return league_fallback_mu if league_fallback_mu is not None else np.nan
+    if league_fallback_mu is None or pd.isna(league_fallback_mu):
+        return round(own_avg, 2)
+
+    # BUGFIX caught in testing: full_confidence_games must not exceed
+    # lookback_games, or full confidence becomes mathematically
+    # unreachable - games_n can never exceed lookback_games (the sample
+    # is capped there), so a full_confidence_games default higher than
+    # that would dampen even a rock-solid veteran's mu, not just thin
+    # samples. Defaults to lookback_games itself unless explicitly
+    # overridden with something smaller.
+    effective_full_confidence = full_confidence_games if full_confidence_games is not None else lookback_games
+    weight_own = min(games_n / effective_full_confidence, 1.0)
+    shrunk_mu = (weight_own * own_avg) + ((1 - weight_own) * league_fallback_mu)
+    return round(shrunk_mu, 2)
 
 
 def build_league_fallback_mus(player_stats_df: pd.DataFrame, season: int,
@@ -2766,7 +2800,7 @@ def build_league_fallback_mus(player_stats_df: pd.DataFrame, season: int,
 def calc_player_sigma(player_gsis_id: str, prop_column: str, player_stats_df: pd.DataFrame,
                        season: int, current_week: int, current_team: str = None,
                        lookback_games: int = 8, min_games: int = 3,
-                       league_fallback_sigma: float = None) -> float:
+                       league_fallback_sigma: float = None, full_confidence_games: int = None) -> float:
     """
     Computes a player's own game-to-game standard deviation for a given prop
     column using their real weekly history from player_stats, up to
@@ -2776,6 +2810,13 @@ def calc_player_sigma(player_gsis_id: str, prop_column: str, player_stats_df: pd
     now filtered to the SAME team when current_team is provided, so a
     traded player's sigma isn't computed off stale old-team variance mixed
     with new-team games.
+
+    SHRINKAGE FIX: same hard-cutover bug as calc_prop_mu, same fix - see
+    that function's docstring for the full real-data justification. A
+    thin-sample player's own std dev (itself noisy and unstable on only
+    3-4 games) now blends toward league_fallback_sigma instead of being
+    trusted outright the instant min_games is cleared, reaching full
+    confidence only at full_confidence_games real games.
 
     Returns league_fallback_sigma if there's no usable history in either
     season - otherwise NaN, and the row should be flagged as low-confidence
@@ -2787,24 +2828,35 @@ def calc_player_sigma(player_gsis_id: str, prop_column: str, player_stats_df: pd
         & (player_stats_df["week"] < current_week)
     ].sort_values("week", ascending=False).head(lookback_games)
 
-    if len(current_season_history) >= min_games:
-        return round(current_season_history[prop_column].std(ddof=1), 3)
+    combined = current_season_history
+    if len(combined) < min_games:
+        prior_season_query = (
+            (player_stats_df["gsis_id"] == player_gsis_id)
+            & (player_stats_df["season"] == season - 1)
+        )
+        if current_team is not None:
+            prior_season_query &= (player_stats_df["team"] == current_team)
+        prior_season_history = player_stats_df[prior_season_query].sort_values(
+            "week", ascending=False
+        ).head(lookback_games)
+        combined = pd.concat([current_season_history, prior_season_history])
 
-    prior_season_query = (
-        (player_stats_df["gsis_id"] == player_gsis_id)
-        & (player_stats_df["season"] == season - 1)
-    )
-    if current_team is not None:
-        prior_season_query &= (player_stats_df["team"] == current_team)
-    prior_season_history = player_stats_df[prior_season_query].sort_values(
-        "week", ascending=False
-    ).head(lookback_games)
+    if len(combined) < min_games:
+        return league_fallback_sigma if league_fallback_sigma is not None else np.nan
 
-    combined = pd.concat([current_season_history, prior_season_history])
-    if len(combined) >= min_games:
-        return round(combined[prop_column].std(ddof=1), 3)
+    own_sigma = combined[prop_column].std(ddof=1)
+    games_n = len(combined)
 
-    return league_fallback_sigma if league_fallback_sigma is not None else np.nan
+    if league_fallback_sigma is None or pd.isna(league_fallback_sigma) or pd.isna(own_sigma):
+        if pd.notna(own_sigma):
+            return round(own_sigma, 3)
+        return league_fallback_sigma if league_fallback_sigma is not None else np.nan
+
+    # Same lookback_games/full_confidence_games ceiling fix as calc_prop_mu.
+    effective_full_confidence = full_confidence_games if full_confidence_games is not None else lookback_games
+    weight_own = min(games_n / effective_full_confidence, 1.0)
+    shrunk_sigma = (weight_own * own_sigma) + ((1 - weight_own) * league_fallback_sigma)
+    return round(shrunk_sigma, 3)
 
 
 def build_league_fallback_sigmas(player_stats_df: pd.DataFrame, season: int,
