@@ -2030,8 +2030,17 @@ def calc_box_adjusted_mu(base_mu: float, box_efficiency: dict, opp_stacked_pct: 
 # can be tested in isolation instead of as one tangled change. Flip back
 # to True only after re-testing shows each one is actually net-positive.
 # ---------------------------------------------------------------------------
-ENABLE_PLAYACTION_IN_QUALITY_SCORE = False
-ENABLE_PERSONNEL_IN_QUALITY_SCORE = False
+ENABLE_PLAYACTION_IN_QUALITY_SCORE = True  # RE-ENABLED for isolated testing - see note below
+ENABLE_PERSONNEL_IN_QUALITY_SCORE = False  # stays off - one change at a time; personnel is next, once PA is confirmed clean alone
+# RE-ENABLE TEST (this round's ONE change, everything else held constant):
+# play-action was disabled after landing untested alongside 4 other changes
+# in one round, which caused a severe quality_score tier inversion never
+# individually attributed to PA specifically vs personnel vs the other
+# changes. Since then: the reweighting fix, mu/sigma shrinkage fix, quality_
+# score sample-size fix, and the coverage-adjustment casing/root-cause
+# fixes have all been tested and landed cleanly with PA still off. Testing
+# PA alone now, with personnel and both mu-adjustments still off, so any
+# change in results this round can be attributed to PA specifically.
 # GATED per real 2025 data: the box-count mu adjustment was found to be
 # net-harmful, not just weak - direction accuracy of 47% overall, and it
 # got WORSE (down to 42.5%) as the adjustment size grew, the opposite of
