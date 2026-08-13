@@ -1952,6 +1952,16 @@ def calc_box_adjusted_mu(base_mu: float, box_efficiency: dict, opp_stacked_pct: 
 # ---------------------------------------------------------------------------
 ENABLE_PLAYACTION_IN_QUALITY_SCORE = False
 ENABLE_PERSONNEL_IN_QUALITY_SCORE = False
+# GATED per real 2025 data: the box-count mu adjustment was found to be
+# net-harmful, not just weak - direction accuracy of 47% overall, and it
+# got WORSE (down to 42.5%) as the adjustment size grew, the opposite of
+# what a real signal should do. It also turned out to be the SOLE driver
+# of adjustment_direction_accuracy across the whole report (833 of 833
+# non-trivial adjustments were box, zero were coverage - see note on
+# min_plays_per_bucket below). Disabled from actually moving mu until
+# re-diagnosed; still computed and shown via mu_before_box_adj for
+# comparison.
+ENABLE_BOX_MU_ADJUSTMENT = False
 
 
 PROP_METRIC_CROSSWALK = {
@@ -2412,9 +2422,11 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             # ACTUAL mu adjustment using this RB's own real light-vs-stacked
             # box yards-per-carry split, weighted by this week's opponent's
             # stacked-box rate - run-game equivalent of the QB/WR coverage
-            # adjustment above.
+            # adjustment above. GATED per ENABLE_BOX_MU_ADJUSTMENT (see flag
+            # note above) - still computed below so mu_before_box_adj stays
+            # available for comparison, just not applied to mu itself.
             adjusted_rush_mu = mu
-            if opp_box_row and pd.notna(box_info.get("box_stack_pct")):
+            if ENABLE_BOX_MU_ADJUSTMENT and opp_box_row and pd.notna(box_info.get("box_stack_pct")):
                 box_eff = build_player_rush_box_efficiency(
                     gsis_id, season, ftn_df, pbp_history_df,
                     current_team=rb_team, prior_ftn_df=prior_ftn_df, prior_pbp_df=prior_pbp_df,
