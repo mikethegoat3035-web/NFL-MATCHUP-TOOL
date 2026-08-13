@@ -86,6 +86,14 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# DEPLOY VERSION MARKER - bump this string on every file delivered, so a
+# glance at the app tells you in 5 seconds whether a new deploy actually
+# took effect, instead of waiting through a full readiness-report run to
+# find out indirectly. If this doesn't match what was just sent, the
+# deploy didn't land - no need to test anything further until it does.
+DEPLOY_VERSION = "v6-playaction-personnel-gated-2026-08-13"
+st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
+
 # -----------------------------------------------------------------------
 # Season / week selection
 # -----------------------------------------------------------------------
