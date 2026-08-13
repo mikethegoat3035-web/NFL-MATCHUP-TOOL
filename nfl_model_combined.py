@@ -3658,6 +3658,50 @@ def diagnose_injuries_data(season: int, week: int = 8) -> dict:
     return result
 
 
+def diagnose_alignment_data(season: int, week: int = 8) -> dict:
+    """
+    DIAGNOSTIC ONLY - not used anywhere in scoring, same discipline as
+    diagnose_participation_data()/diagnose_injuries_data(): check the real
+    data before building anything on an assumption. Confirmed real
+    participation_df has a "route" column (route TYPE run - slant/go/
+    screen/etc.), which is NOT the same thing as pre-snap ALIGNMENT
+    (wide/slot/backfield/inline) - related concepts, genuinely different
+    data. This checks EVERY real column in both participation_df and
+    ftn_df (not just the ones already confirmed for other purposes) for
+    anything alignment-related by name, plus shows real values for the
+    columns already known to be alignment-adjacent (route,
+    n_offense_backfield) so there's no guessing either way.
+    """
+    result = {"season": season, "week": week}
+
+    participation_df = pull_participation([season])
+    ftn_df = pull_ftn_charting([season])
+
+    result["participation_columns"] = list(participation_df.columns)
+    result["ftn_columns"] = list(ftn_df.columns)
+
+    alignment_keywords = ["align", "slot", "wide", "inline", "backfield", "position", "split", "formation"]
+    result["participation_alignment_like_columns"] = [
+        c for c in participation_df.columns if any(k in c.lower() for k in alignment_keywords)
+    ]
+    result["ftn_alignment_like_columns"] = [
+        c for c in ftn_df.columns if any(k in c.lower() for k in alignment_keywords)
+    ]
+
+    if "route" in participation_df.columns:
+        result["route_value_counts"] = participation_df["route"].value_counts(dropna=False).head(20).to_dict()
+    if "n_offense_backfield" in ftn_df.columns:
+        result["n_offense_backfield_value_counts"] = ftn_df["n_offense_backfield"].value_counts(dropna=False).to_dict()
+
+    # dump real values for anything the keyword search found, whatever it turns out to be
+    for col in result["participation_alignment_like_columns"]:
+        result[f"participation_value_counts__{col}"] = participation_df[col].value_counts(dropna=False).head(15).to_dict()
+    for col in result["ftn_alignment_like_columns"]:
+        result[f"ftn_value_counts__{col}"] = ftn_df[col].value_counts(dropna=False).head(15).to_dict()
+
+    return result
+
+
 def get_completed_weeks_with_data(season: int, through_week: int = 18) -> list:
     """
     Returns the list of weeks in `season` that actually have real
