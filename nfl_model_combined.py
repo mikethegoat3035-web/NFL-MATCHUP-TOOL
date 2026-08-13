@@ -1265,7 +1265,7 @@ def calc_quality_score(matchup_exploit_strength: float, sample_size_games: int,
 
 def build_player_coverage_efficiency(player_gsis_id: str, role: str, season: int,
                                       participation_df: pd.DataFrame, pbp_df: pd.DataFrame,
-                                      min_plays_per_bucket: int = 14, current_team: str = None,
+                                      min_plays_per_bucket: int = 8, current_team: str = None,
                                       prior_participation_df: pd.DataFrame = None,
                                       prior_pbp_df: pd.DataFrame = None) -> dict:
     """
@@ -1287,6 +1287,19 @@ def build_player_coverage_efficiency(player_gsis_id: str, role: str, season: int
     gets NOTHING from the prior-season fallback here, since none of his
     2025 plays have posteam=="NE" - his old-team plays are excluded, same
     as intended, not a gap in this fix.
+
+    REVIVED (min_plays_per_bucket back to 8, was raised to 14): confirmed
+    via a real 2025 backtest's full raw export that at 14, this fired on
+    0 of 2,521 eligible rows all season - requiring 14+ real plays against
+    BOTH man AND zone specifically for one player is too strict a bar to
+    ever clear, even with the cross-season top-up above. The 14 threshold
+    was raised speculatively to fix adjustment_direction_accuracy (stuck
+    at 47%) - but a later isolated test proved that number was being
+    driven ENTIRELY by the box-count adjustment (833 of 833 non-trivial
+    adjustments were box, zero were coverage), so tightening THIS
+    function's threshold was never actually addressing the real cause.
+    Reverting to 8 to test this mechanism on its own, now that it's
+    correctly isolated from the actual problem.
 
     role: "receiver" or "passer". Joins participation_df (which carries
     defense_man_zone_type per play) to pbp_df on (game_id, play_id) - same
