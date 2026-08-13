@@ -132,6 +132,24 @@ def pull_participation(years: list[int]) -> pd.DataFrame:
 
 
 @_cache_pull
+def pull_injuries(years: list[int]) -> pd.DataFrame:
+    """
+    Weekly injury report data - UNVERIFIED real column names/values, this
+    build environment has no network access to confirm nflreadpy's real
+    load_injuries() schema against live data. Real injury/active-status
+    (the one piece flagged all session as the most plausible explanation
+    for the still-unfixed pass_yards outlier pattern - backup/uncertain-
+    role QBs, in-game injuries) can't be built responsibly on a guess
+    given tonight's repeated lesson about exactly this failure mode
+    (the coverage-type casing bug, twice). Use
+    diagnose_injuries_data() FIRST against real data before building
+    anything that actually reads specific columns from this.
+    """
+    df = nfl.load_injuries(seasons=years)
+    return df.to_pandas()
+
+
+@_cache_pull
 def pull_schedules(years: list[int]) -> pd.DataFrame:
     df = nfl.load_schedules(seasons=years)
     return df.to_pandas()
@@ -3586,6 +3604,56 @@ def diagnose_participation_data(season: int, week: int, sample_gsis_id: str = No
             result["sample_player_man_zone_values_seen"] = (
                 sample_rows["defense_man_zone_type"].value_counts(dropna=False).to_dict()
             )
+
+    return result
+
+
+def diagnose_injuries_data(season: int, week: int = 8) -> dict:
+    """
+    DIAGNOSTIC ONLY - not used anywhere in scoring, mirrors
+    diagnose_participation_data()'s proven approach exactly: surface the
+    REAL data first, before building anything that reads specific column
+    names from it. pull_injuries()'s real schema is completely unverified
+    in this build environment (no network access) - guessing at column
+    names here would repeat the exact coverage-type-casing mistake made
+    (twice) earlier this session, this time on a data source we've never
+    even looked at once.
+
+    Since the real column names aren't known at all (unlike the
+    participation diagnostic, where the column NAME was already known and
+    only its VALUES were in question), this dumps broadly rather than
+    guessing specific column names:
+      - every real column name pull_injuries() actually returns
+      - a few raw sample rows, unfiltered - the fastest way to see the
+        real shape at a glance
+      - real value_counts for any column whose name plausibly looks like
+        an injury status field (checked by name pattern, not assumed)
+      - whether a gsis_id-compatible player-id column exists at all, and
+        what it's actually called
+    """
+    result = {"season": season, "week": week}
+    try:
+        injuries_df = pull_injuries([season])
+    except Exception as e:
+        result["error"] = f"pull_injuries() itself failed: {e}"
+        return result
+
+    result["columns"] = list(injuries_df.columns)
+    result["n_rows_total"] = len(injuries_df)
+    result["sample_rows"] = injuries_df.head(5).to_dict(orient="records")
+
+    status_like_cols = [c for c in injuries_df.columns if "status" in c.lower()]
+    result["status_like_columns_found"] = status_like_cols
+    for col in status_like_cols:
+        result[f"value_counts__{col}"] = injuries_df[col].value_counts(dropna=False).head(15).to_dict()
+
+    id_like_cols = [c for c in injuries_df.columns if "gsis" in c.lower() or "player_id" in c.lower() or c.lower() == "id"]
+    result["id_like_columns_found"] = id_like_cols
+
+    if "season" in injuries_df.columns:
+        result["real_seasons_present"] = sorted(injuries_df["season"].dropna().unique().tolist())
+    if "week" in injuries_df.columns:
+        result["real_weeks_present"] = sorted(injuries_df["week"].dropna().unique().tolist())
 
     return result
 
