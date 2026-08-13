@@ -1298,8 +1298,21 @@ def build_player_coverage_efficiency(player_gsis_id: str, role: str, season: int
     driven ENTIRELY by the box-count adjustment (833 of 833 non-trivial
     adjustments were box, zero were coverage), so tightening THIS
     function's threshold was never actually addressing the real cause.
-    Reverting to 8 to test this mechanism on its own, now that it's
-    correctly isolated from the actual problem.
+
+    REAL ROOT CAUSE FOUND (the actual reason for the 0% fire rate, not the
+    threshold at all): the man/zone bucket matching below used to compare
+    against hardcoded TITLE-CASE strings ("Man"/"Zone"), while the
+    CONFIRMED-WORKING build_coverage_profile() function (whose real output
+    - opp_man_pct/opp_zone_pct - has shown correct real percentages in
+    every backtest export all session) pivots dynamically on whatever raw
+    values actually exist, with no hardcoded casing assumption at all -
+    strong indirect evidence the real column's values don't match "Man"/
+    "Zone" exactly. This means the 0% fire rate was NEVER actually about
+    sample size - even the ORIGINAL threshold of 8 (before any of tonight's
+    tuning) would have produced 0% for this same reason. Fixed to match
+    case-insensitively (.str.lower() == "man"/"zone") so it can't silently
+    fail on a casing assumption again, whatever the real casing turns out
+    to be.
 
     role: "receiver" or "passer". Joins participation_df (which carries
     defense_man_zone_type per play) to pbp_df on (game_id, play_id) - same
@@ -1329,10 +1342,10 @@ def build_player_coverage_efficiency(player_gsis_id: str, role: str, season: int
     player_plays = _get_player_plays(participation_df, pbp_df)
 
     def _bucket_count(plays_df, coverage_type):
-        return len(plays_df[plays_df["defense_man_zone_type"] == coverage_type])
+        return len(plays_df[plays_df["defense_man_zone_type"].str.lower() == coverage_type])
 
-    man_n = _bucket_count(player_plays, "Man")
-    zone_n = _bucket_count(player_plays, "Zone")
+    man_n = _bucket_count(player_plays, "man")
+    zone_n = _bucket_count(player_plays, "zone")
 
     # top up with team-filtered prior-season plays if either bucket is short
     if (man_n < min_plays_per_bucket or zone_n < min_plays_per_bucket) \
@@ -1342,15 +1355,15 @@ def build_player_coverage_efficiency(player_gsis_id: str, role: str, season: int
         player_plays = pd.concat([player_plays, prior_plays])
 
     def _bucket_avg(coverage_type):
-        bucket = player_plays[player_plays["defense_man_zone_type"] == coverage_type]
+        bucket = player_plays[player_plays["defense_man_zone_type"].str.lower() == coverage_type]
         n = len(bucket)
         if n < min_plays_per_bucket:
             return np.nan, n
         yards_col = "receiving_yards" if role == "receiver" else "passing_yards"
         return round(bucket[yards_col].mean(), 2), n
 
-    man_avg, man_n = _bucket_avg("Man")
-    zone_avg, zone_n = _bucket_avg("Zone")
+    man_avg, man_n = _bucket_avg("man")
+    zone_avg, zone_n = _bucket_avg("zone")
     yards_col = "receiving_yards" if role == "receiver" else "passing_yards"
     overall_avg = round(player_plays[yards_col].mean(), 2) if len(player_plays) > 0 else np.nan
 
