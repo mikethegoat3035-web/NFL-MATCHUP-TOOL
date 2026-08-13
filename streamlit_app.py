@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 from nfl_model_combined import (
     scan_full_slate_nfl, rescore_quality_mu_row_nfl, backtest_week, build_season_accuracy_report,
-    diagnose_participation_data,
+    diagnose_participation_data, get_player_matchup_explanation,
 )
 from draft_rankings import (
     build_yahoo_style_rankings, detect_risers, build_league_settings,
@@ -92,7 +92,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v17-mu-recency-weighting-2026-08-13"
+DEPLOY_VERSION = "v20-best-matchups-integrated-2026-08-13"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -531,6 +531,117 @@ elif st.session_state.show_season_report and st.session_state.season_report is n
 # -----------------------------------------------------------------------
 elif st.session_state.slate_df is not None and not st.session_state.slate_df.empty:
     df = st.session_state.slate_df.copy()
+
+    # -------------------------------------------------------------------
+    # BEST QUALITY MATCHUPS - built directly into the scan itself now
+    # (was a separate mode, folded in per feedback: no reason to force a
+    # mode switch just to see the curated best-quality view). Only shown
+    # for a real Scan (not Backtest, which is comparing against known
+    # past results, not picking matchups). Filters by a MINIMUM
+    # quality_score (not just top-N) so "keep options limited but
+    # quality high" is a real floor, not just a count.
+    # -------------------------------------------------------------------
+    if not st.session_state.backtest_mode:
+        bm_df = df[df["prop_type"].isin(["pass_yards", "rec_yards"])].dropna(subset=["quality_score"])
+        if not bm_df.empty:
+            st.subheader("🏆 Best Quality Matchups")
+            bmf1, bmf2 = st.columns(2)
+            with bmf1:
+                bm_min_quality = st.slider("Minimum quality_score", 0, 100, 75, 5, key="bm_min_quality")
+            with bmf2:
+                bm_prop_filter = st.selectbox("Prop type", ["Both", "pass_yards", "rec_yards"], key="bm_prop_filter")
+
+            bm_filtered = bm_df[bm_df["quality_score"] >= bm_min_quality]
+            if bm_prop_filter != "Both":
+                bm_filtered = bm_filtered[bm_filtered["prop_type"] == bm_prop_filter]
+            bm_filtered = bm_filtered.sort_values("quality_score", ascending=False)
+
+            if bm_filtered.empty:
+                st.caption(f"No rows clear quality_score >= {bm_min_quality} - lower the floor to see more.")
+            else:
+                summary_cols = [c for c in ["player_display_name", "team", "matchup", "position", "prop_type",
+                                             "mu", "quality_score", "opponent"] if c in bm_filtered.columns]
+                st.dataframe(
+                    bm_filtered[summary_cols].style.background_gradient(subset=["quality_score"], cmap="Greens"),
+                    width='stretch', hide_index=True,
+                )
+
+                st.markdown("**Why did the model pick one of these?**")
+                player_options = [
+                    f"{r['player_display_name']} ({r['prop_type']}, quality={r['quality_score']:.0f})"
+                    for _, r in bm_filtered.iterrows()
+                ]
+                picked = st.selectbox("Pick one to see the breakdown", player_options, key="bm_picked_player")
+                picked_row = bm_filtered.iloc[player_options.index(picked)]
+
+                with st.spinner("Pulling this player's real per-coverage sample..."):
+                    try:
+                        explanation = get_player_matchup_explanation(
+                            picked_row["gsis_id"], picked_row["prop_type"], picked_row["team"],
+                            picked_row["opponent"], int(season), int(week),
+                        )
+                    except Exception as e:
+                        explanation = None
+                        st.error(f"Couldn't pull the detailed breakdown: {e}")
+
+                if explanation is not None:
+                    ecol1, ecol2 = st.columns(2)
+
+                    with ecol1:
+                        st.markdown(f"**{picked_row['opponent']}'s real coverage mix**")
+                        coverage_mix = explanation.get("coverage_mix", {})
+                        if coverage_mix:
+                            import matplotlib.pyplot as plt
+                            fig, ax = plt.subplots(figsize=(4, 4))
+                            ax.pie(coverage_mix.values(), labels=coverage_mix.keys(), autopct="%1.0f%%",
+                                   textprops={"fontsize": 8})
+                            ax.set_title(f"{picked_row['opponent']} coverage mix (this season)", fontsize=9)
+                            st.pyplot(fig)
+                        else:
+                            st.caption("No real coverage-mix data available for this defense yet.")
+
+                    with ecol2:
+                        st.markdown(f"**{picked_row['player_display_name']}'s real efficiency, by coverage faced**")
+                        player_sample = explanation.get("player_coverage_sample", {})
+                        if player_sample:
+                            sample_df = pd.DataFrame([
+                                {"coverage_type": k, "yards_per_play": v["ypp"], "real_plays": v["n_plays"]}
+                                for k, v in player_sample.items()
+                            ]).set_index("coverage_type")
+                            st.bar_chart(sample_df["yards_per_play"])
+                            st.caption("Bar shown only for coverage types with a reliable real sample (8+ plays this season).")
+                        else:
+                            st.caption("No coverage type has a reliable (8+ play) sample yet for this player.")
+
+                    no_sample = explanation.get("coverage_types_no_sample", [])
+                    if no_sample:
+                        st.warning(
+                            f"**{picked_row['opponent']} also runs real snaps of {', '.join(no_sample)}, but "
+                            f"{picked_row['player_display_name']} doesn't have a reliable sample against "
+                            f"{'that' if len(no_sample) == 1 else 'those'} yet — excluded from the weighting "
+                            "rather than guessed at."
+                        )
+                    else:
+                        st.success(f"{picked_row['player_display_name']} has a reliable real sample against every "
+                                   f"coverage {picked_row['opponent']} meaningfully uses.")
+
+                    st.caption(
+                        f"Overall real yards/play across every coverage this season: "
+                        f"{explanation.get('player_overall_ypp', 'n/a')} — "
+                        "the baseline the coverage-specific numbers above are compared against."
+                    )
+
+                    grade_cols_to_show = [c for c in picked_row.index if c.endswith("_grade") and pd.notna(picked_row[c])]
+                    if grade_cols_to_show:
+                        st.markdown("**Underlying skill grades (0-100 percentile vs the league this season)**")
+                        grade_table = pd.DataFrame({
+                            "metric": grade_cols_to_show,
+                            "grade": [picked_row[c] for c in grade_cols_to_show],
+                        }).sort_values("grade", ascending=False)
+                        st.dataframe(grade_table, width='stretch', hide_index=True)
+
+            st.markdown("---")
+            st.caption("Full scan results (every prop, every position) below.")
 
     # -----------------------------------------------------------------------
     # GAME-BY-GAME PICKER - lets you pick a single matchup (like a scoreboard)
