@@ -235,11 +235,15 @@ def _compute_field_tiers(rows_by_key):
         r["_tiers"] = tiers
 
 
-def _load_coverage_keyed_data(file_paths: dict, key_column: str):
-    """Generic loader for both QB-vs-coverage (key_column='Name') and
-    def-allowed-to-QB (key_column='Name', team rows) files. Captures
-    EVERY column from the CSV, not a curated subset, and computes real
-    statistical tiers per stat within each coverage's own distribution."""
+def _load_coverage_keyed_data(file_paths: dict, key_column: str, volume_column: str = "ATT"):
+    """Generic loader for QB-vs-coverage, def-allowed-to-QB, receiver-vs-
+    coverage, and def-allowed-by-alignment files. Captures EVERY column
+    from the CSV, not a curated subset, and computes real statistical
+    tiers per stat within each coverage's own distribution.
+
+    volume_column: which column represents sample size for thin-sample
+    flagging - 'ATT' for QB/passing files, 'TGT' for receiver files
+    (they don't have an ATT column at all)."""
     data = {}
     for coverage_field, path in file_paths.items():
         header, rows = _read_fp_csv(path)
@@ -249,7 +253,7 @@ def _load_coverage_keyed_data(file_paths: dict, key_column: str):
             key = d.get(key_column)
             if not key:
                 continue
-            att = int(_to_float(d.get("ATT", 0)) or 0)
+            att = int(_to_float(d.get(volume_column, 0)) or 0)
             threshold = THIN_SAMPLE_ATT_THRESHOLD.get(coverage_field, 15)
             d["_thin_sample"] = (att < threshold) or (coverage_field in ALWAYS_THIN_COVERAGES)
             d["_att"] = att
@@ -270,6 +274,139 @@ def load_def_allowed_to_qb(file_paths: dict):
     """What each DEFENSE allows to QBs specifically in that coverage.
     Same full-column + tiering treatment, keyed by team name."""
     return _load_coverage_keyed_data(file_paths, key_column="Name")
+
+
+# ---------------------------------------------------------------------------
+# Receiver (WR/TE) by alignment vs coverage
+# ---------------------------------------------------------------------------
+
+# Alignment RTE% column names as they appear in the receiver CSVs - used to
+# confirm a player's real alignment fit before leaning on an alignment-
+# specific file for them (e.g. don't trust "Wide vs Cover 6" numbers for a
+# player who's actually 80% Slot).
+ALIGNMENT_RTE_COLUMNS = {
+    "wide": "WIDE RTE %", "slot": "SLOT RTE %",
+    "inline": "INLINE RTE %", "backfield": "BACK RTE %",
+}
+
+
+def load_receiver_vs_coverage(file_paths: dict):
+    """Receiver's (WR/TE) own season performance vs each coverage, for a
+    SPECIFIC alignment (e.g. all Wide-alignment vs Cover 6). file_paths:
+    dict of {coverage_field: csv_path}, one alignment's worth of 7 files.
+    Same full-column capture + tiering as the QB loader - reuses the
+    identical generic engine, since these files also key on 'Name'.
+    Uses TGT (not ATT - these files don't have that column) as the
+    volume basis for thin-sample flagging."""
+    return _load_coverage_keyed_data(file_paths, key_column="Name", volume_column="TGT")
+
+
+def load_def_allowed_by_alignment(file_paths: dict):
+    """What each DEFENSE allows to a specific alignment (Wide/Slot/Inline/
+    Backfield) in that coverage. Same shape as load_def_allowed_to_qb,
+    just for receivers-by-alignment instead of QBs. Team-keyed, TGT-based."""
+    return _load_coverage_keyed_data(file_paths, key_column="Name", volume_column="TGT")
+
+
+def check_alignment_fit(receiver_row, alignment):
+    """Given a receiver's row (from ANY of their coverage files - RTE%
+    columns are the same regardless of which coverage split you pulled)
+    and the alignment you're about to use for a matchup, returns the
+    player's real RTE% in that alignment so you can judge whether the
+    alignment-specific file is actually representative of how they're
+    used. Returns None if the column wasn't populated (blank = not
+    their primary alignment in that export)."""
+    col = ALIGNMENT_RTE_COLUMNS.get(alignment.lower())
+    if col is None or receiver_row is None:
+        return None
+    return _to_float(receiver_row.get(col))
+
+
+def build_receiver_matchup_report(receiver_name, alignment, opponent_team_profile: TeamCoverageProfile,
+                                   receiver_coverage_data: dict, receiver_team_name=None,
+                                   def_allowed_data: dict = None, max_outliers=3):
+    """Same shape as build_qb_matchup_report, for a receiver at a specific
+    alignment. Includes an alignment-fit check so a report never silently
+    misrepresents a player who isn't actually primarily in that alignment."""
+    if receiver_team_name and _same_team(receiver_team_name, opponent_team_profile.team_name):
+        return [{"error": f"{receiver_name} plays for {opponent_team_profile.team_name} - "
+                           f"cannot build a matchup report against his own team."}]
+
+    report = []
+    outliers = opponent_team_profile.outliers[:max_outliers]
+    if not outliers:
+        return [{"note": f"{opponent_team_profile.team_name} has no statistically real "
+                          f"outlier coverage this season - no specific coverage edge to flag."}]
+
+    for coverage_field, z in outliers:
+        cov_label = coverage_field.replace(" %", "")
+        entry = {
+            "coverage": cov_label,
+            "alignment": alignment,
+            "opponent_usage_pct": opponent_team_profile.rates[coverage_field],
+            "opponent_z_score": round(z, 2),
+        }
+
+        rec_row = receiver_coverage_data.get(coverage_field, {}).get(receiver_name)
+        if rec_row is None:
+            entry["receiver_data"] = None
+            entry["confidence"] = "no_data"
+        else:
+            entry["receiver_data"] = rec_row
+            entry["confidence"] = "thin_sample" if rec_row["_thin_sample"] else "solid"
+            fit = check_alignment_fit(rec_row, alignment)
+            entry["alignment_fit_pct"] = fit
+            entry["alignment_fit_warning"] = (fit is not None and fit < 60)
+
+        if def_allowed_data is not None:
+            def_row = def_allowed_data.get(coverage_field, {}).get(opponent_team_profile.team_name)
+            entry["defense_allows"] = def_row
+            entry["defense_confidence"] = ("thin_sample" if def_row and def_row["_thin_sample"]
+                                            else "solid" if def_row else "no_data")
+
+        report.append(entry)
+    return report
+
+
+def print_receiver_matchup_report(receiver_name, alignment, opponent_team_profile,
+                                   receiver_coverage_data, receiver_team_name=None,
+                                   def_allowed_data=None,
+                                   highlight_stats=("CR %", "YPRR", "TD", "CTGT %", "RATE", "FP/G")):
+    report = build_receiver_matchup_report(receiver_name, alignment, opponent_team_profile,
+                                            receiver_coverage_data, receiver_team_name=receiver_team_name,
+                                            def_allowed_data=def_allowed_data)
+    if report and "error" in report[0]:
+        print(f"\n  [BLOCKED] {report[0]['error']}")
+        return report
+    if report and "note" in report[0]:
+        print(f"\n  {report[0]['note']}")
+        return report
+
+    print(f"\n=== {receiver_name} ({alignment}) vs {opponent_team_profile.team_name} — Coverage Matchup ===")
+    for entry in report:
+        print(f"\n  {opponent_team_profile.team_name} runs {entry['coverage']} at "
+              f"{entry['opponent_usage_pct']:.1f}% (z={entry['opponent_z_score']:+.2f} vs league)")
+
+        rd = entry.get("receiver_data")
+        if rd is None:
+            print(f"    -> {receiver_name}: no recorded targets vs this coverage.")
+        else:
+            flag = f"  [THIN - {rd['_att']} tgt]" if entry["confidence"] == "thin_sample" else ""
+            fit_warn = ""
+            if entry.get("alignment_fit_warning"):
+                fit_warn = f"  [CAUTION: only {entry['alignment_fit_pct']:.0f}% of routes are {alignment} - this file may not represent his usual usage]"
+            stat_str = ", ".join(f"{s}={rd.get(s)} ({rd['_tiers'].get(s,'-')})"
+                                  for s in highlight_stats if s in rd)
+            print(f"    -> {receiver_name} (own history, {rd['_att']} TGT){flag}{fit_warn}: {stat_str}")
+
+        dd = entry.get("defense_allows")
+        if dd is not None:
+            flag = f"  [THIN - {dd['_att']} tgt]" if entry.get("defense_confidence") == "thin_sample" else ""
+            stat_str = ", ".join(f"{s}={dd.get(s)} ({dd['_tiers'].get(s,'-')})"
+                                  for s in highlight_stats if s in dd)
+            print(f"    -> {opponent_team_profile.team_name} allows to {alignment} ({dd['_att']} TGT){flag}: {stat_str}")
+
+    return report
 
 
 # ---------------------------------------------------------------------------
