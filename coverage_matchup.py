@@ -410,6 +410,140 @@ def print_receiver_matchup_report(receiver_name, alignment, opponent_team_profil
 
 
 # ---------------------------------------------------------------------------
+# FULL DATASET LOADER - loads all 70 files in one call
+# ---------------------------------------------------------------------------
+
+ALIGNMENTS = ("wide", "slot", "inline", "backfield")
+COVERAGE_SUFFIXES = {
+    "COVER 0 %": "cover0", "COVER 1 %": "cover1", "COVER 2 %": "cover2",
+    "COVER 2 MAN %": "cover2man", "COVER 3 %": "cover3",
+    "COVER 4 %": "cover4", "COVER 6 %": "cover6",
+}
+
+
+@dataclass
+class CoverageDataBundle:
+    """Everything needed to build a matchup report for any player type,
+    loaded once and reused. Missing files are skipped silently (not every
+    coverage/alignment combo may exist yet) - check .missing for a list of
+    what didn't load, so gaps are visible rather than silently assumed
+    complete."""
+    off_coverage: dict          # team_name -> TeamCoverageProfile (coverages this team's offense SEES)
+    def_coverage: dict          # team_name -> TeamCoverageProfile (coverages this team's defense RUNS)
+    qb_vs_coverage: dict        # coverage_field -> {qb_name: row}
+    def_allowed_to_qb: dict     # coverage_field -> {team_name: row}
+    receiver_by_alignment: dict # alignment -> coverage_field -> {player_name: row}
+    def_allowed_by_alignment: dict  # alignment -> coverage_field -> {team_name: row}
+    missing: list = field(default_factory=list)
+
+
+def load_full_dataset(data_dir=".", off_coverage_file="OFF_COVG_.csv", def_coverage_file="DEF_COVG__.csv"):
+    """Loads the complete 70-file coverage dataset in one call, using the
+    established naming convention from this session:
+      QB: VS_COVER_<N>.csv / def_allowed_cover<N>.csv
+      Receiver by alignment: <alignment>_vs_cover<N>.csv
+      Def-allowed by alignment: def_<alignment>_cover<N>.csv
+    Missing files are skipped (not every combo may be collected yet) and
+    logged in the returned bundle's .missing list instead of raising -
+    partial datasets are expected and handled gracefully throughout this
+    module (thin-sample / no-data paths already exist on every report)."""
+    import os
+    missing = []
+
+    def _try_path(path):
+        return path if os.path.exists(os.path.join(data_dir, path)) else None
+
+    off_profiles, _ = load_team_coverage_matrix(os.path.join(data_dir, off_coverage_file))
+    def_profiles, _ = load_team_coverage_matrix(os.path.join(data_dir, def_coverage_file))
+
+    qb_files = {}
+    qb_filename_map = {
+        "COVER 0 %": "VS_COVER_0.csv", "COVER 1 %": "VS_COVER_1.csv",
+        "COVER 2 %": "VS_COVER_2.csv", "COVER 2 MAN %": "VS_COVER_2MAN.csv",
+        "COVER 3 %": "VS_COVER_3.csv", "COVER 4 %": "VS_COVER_4.csv",
+        "COVER 6 %": "VS_COVER_6.csv",
+    }
+    for cov, fname in qb_filename_map.items():
+        if _try_path(fname):
+            qb_files[cov] = os.path.join(data_dir, fname)
+        else:
+            missing.append(f"QB vs {cov}")
+    qb_data = load_qb_vs_coverage(qb_files) if qb_files else {}
+
+    def_qb_files = {}
+    for cov, suffix in COVERAGE_SUFFIXES.items():
+        found = _try_path(f"def_allowed_{suffix}.csv")
+        if found:
+            def_qb_files[cov] = os.path.join(data_dir, found)
+        else:
+            missing.append(f"Def-allowed-to-QB {cov}")
+    def_qb_data = load_def_allowed_to_qb(def_qb_files) if def_qb_files else {}
+
+    receiver_by_alignment = {}
+    def_allowed_by_alignment = {}
+    for alignment in ALIGNMENTS:
+        align_key = "bf" if alignment == "backfield" else alignment
+        rec_files = {}
+        def_files = {}
+        for cov, suffix in COVERAGE_SUFFIXES.items():
+            rec_found = _try_path(f"{alignment}_vs_{suffix}.csv")
+            def_found = _try_path(f"def_{alignment}_{suffix}.csv")
+            if rec_found:
+                rec_files[cov] = os.path.join(data_dir, rec_found)
+            else:
+                missing.append(f"{alignment} receiver vs {cov}")
+            if def_found:
+                def_files[cov] = os.path.join(data_dir, def_found)
+            else:
+                missing.append(f"Def-allowed-{alignment} {cov}")
+        receiver_by_alignment[alignment] = load_receiver_vs_coverage(rec_files) if rec_files else {}
+        def_allowed_by_alignment[alignment] = load_def_allowed_by_alignment(def_files) if def_files else {}
+
+    return CoverageDataBundle(
+        off_coverage=off_profiles, def_coverage=def_profiles,
+        qb_vs_coverage=qb_data, def_allowed_to_qb=def_qb_data,
+        receiver_by_alignment=receiver_by_alignment,
+        def_allowed_by_alignment=def_allowed_by_alignment,
+        missing=missing,
+    )
+
+
+def get_matchup(bundle: CoverageDataBundle, player_name, position, opponent_team,
+                 player_team=None, alignment=None):
+    """Single entry point for a matchup report, any position. Position:
+    'QB' uses the QB pipeline. 'WR'/'TE'/'RB' uses the receiver-by-
+    alignment pipeline and REQUIRES alignment ('wide'/'slot'/'inline'/
+    'backfield') since that data is alignment-specific.
+
+    opponent_team: full team name, matched against bundle.def_coverage
+    (the defense's own tendencies - what YOU'RE facing when playing them).
+    """
+    opp_profile = bundle.def_coverage.get(opponent_team)
+    if opp_profile is None:
+        return [{"error": f"'{opponent_team}' not found in loaded team coverage data. "
+                           f"Check spelling matches the full team name (e.g. 'Seattle Seahawks')."}]
+
+    if position.upper() == "QB":
+        return build_qb_matchup_report(player_name, opp_profile, bundle.qb_vs_coverage,
+                                        qb_team_name=player_team, def_allowed_data=bundle.def_allowed_to_qb)
+
+    if alignment is None:
+        return [{"error": f"alignment is required for position '{position}' "
+                           f"(one of: wide, slot, inline, backfield)."}]
+    alignment = alignment.lower()
+    if alignment not in bundle.receiver_by_alignment:
+        return [{"error": f"Unknown alignment '{alignment}'. Must be one of: {ALIGNMENTS}"}]
+
+    return build_receiver_matchup_report(
+        player_name, alignment, opp_profile,
+        bundle.receiver_by_alignment[alignment],
+        receiver_team_name=player_team,
+        def_allowed_data=bundle.def_allowed_by_alignment[alignment],
+    )
+
+
+
+# ---------------------------------------------------------------------------
 # Matchup report
 # ---------------------------------------------------------------------------
 
