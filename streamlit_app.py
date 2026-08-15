@@ -1325,20 +1325,25 @@ elif mode == "Coverage Matchup (premium data)":
                             + _stat_rows_html(def_row, def_row.get("_tiers", {}))
                         )
 
-                    card_html = f"""
-                    <div class="cov-card">
-                        <div class="cov-card-header">{entry['coverage']}
-                            <span class="cov-z-badge">z={z:+.2f}</span>
-                            {rank_badge}
-                        </div>
-                        <div class="cov-card-usage">{opp} runs this coverage at {entry['opponent_usage_pct']:.1f}% of snaps</div>
-                        {fit_html}
-                        <div class="cov-grid">
-                            <div class="cov-col">{own_col_html}</div>
-                            <div class="cov-col">{def_col_html}</div>
-                        </div>
-                    </div>
-                    """
+                    # Built as ONE continuous line (no embedded newlines/indentation) -
+                    # a multi-line indented f-string here previously broke rendering:
+                    # when fit_html was empty, it left a whitespace-only line, which
+                    # Markdown reads as "the HTML block just ended" - everything after
+                    # that point then got swept up by Markdown's indented-code-block
+                    # rule and printed as literal text instead of rendering as HTML.
+                    card_html = (
+                        '<div class="cov-card">'
+                        f'<div class="cov-card-header">{entry["coverage"]}'
+                        f'<span class="cov-z-badge">z={z:+.2f}</span>{rank_badge}</div>'
+                        f'<div class="cov-card-usage">{opp} runs this coverage at '
+                        f'{entry["opponent_usage_pct"]:.1f}% of snaps</div>'
+                        f'{fit_html}'
+                        '<div class="cov-grid">'
+                        f'<div class="cov-col">{own_col_html}</div>'
+                        f'<div class="cov-col">{def_col_html}</div>'
+                        '</div>'
+                        '</div>'
+                    )
                     st.markdown(card_html, unsafe_allow_html=True)
 
 elif mode not in ("Draft Rankings", "Coverage Matchup (premium data)"):
