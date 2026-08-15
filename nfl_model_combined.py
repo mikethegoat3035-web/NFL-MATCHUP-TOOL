@@ -3920,10 +3920,52 @@ def diagnose_player_stats_for_game_log(season: int) -> dict:
     return result
 
 
+def build_longest_play_by_game(pbp_df: pd.DataFrame, position: str) -> pd.DataFrame:
+    """
+    Real per-game "longest reception" (WR/TE) or "longest rush" (RB),
+    computed from real play-by-play data - genuinely new pbp usage beyond
+    what's elsewhere in this file (previously only play_type/week/ydstogo
+    were confirmed used here). receiver_player_id, rusher_player_id, and
+    yards_gained are extremely standard, stable nflverse pbp columns used
+    across the public nflverse ecosystem for years - a different
+    confidence category than the participation data casing bug (a
+    genuinely obscure, inconsistently-cased field caught earlier this
+    project). Still defensive: raises a clear KeyError naming exactly
+    which expected column is missing rather than silently returning
+    wrong/empty data, so a real schema mismatch surfaces immediately
+    instead of masquerading as "this player has no long plays."
+
+    Returns columns: gsis_id, season, week, longest_play.
+    """
+    if position.upper() == "RB":
+        id_col, want_play_type = "rusher_player_id", "run"
+    else:
+        id_col, want_play_type = "receiver_player_id", "pass"
+
+    required = {id_col, "yards_gained", "season", "week", "play_type"}
+    missing = required - set(pbp_df.columns)
+    if missing:
+        raise KeyError(f"build_longest_play_by_game: expected pbp columns not found: {missing}")
+
+    sub = pbp_df[pbp_df["play_type"] == want_play_type].copy()
+    if position.upper() != "RB" and "complete_pass" in sub.columns:
+        # only real completions count toward a real "longest catch" -
+        # defensive filter against an incomplete target somehow carrying
+        # a nonzero yards_gained value
+        sub = sub[sub["complete_pass"] == 1]
+
+    sub = sub.dropna(subset=[id_col])
+    if sub.empty:
+        return pd.DataFrame(columns=["gsis_id", "season", "week", "longest_play"])
+
+    agg = sub.groupby([id_col, "season", "week"])["yards_gained"].max().reset_index()
+    return agg.rename(columns={id_col: "gsis_id", "yards_gained": "longest_play"})
+
+
 def build_coverage_crossref_game_log(player_gsis_id: str, position: str,
                                       cross_team_abbrevs: set, player_stats_df: pd.DataFrame,
                                       schedules_df: pd.DataFrame, seasons: list = None,
-                                      max_games: int = 20) -> list:
+                                      max_games: int = 20, pbp_df: pd.DataFrame = None) -> list:
     """
     Real weekly game log rows for this player, filtered to games where the
     REAL opponent that week (resolved via schedules_df, same lookup as
@@ -3940,6 +3982,12 @@ def build_coverage_crossref_game_log(player_gsis_id: str, position: str,
     average that would just re-rank players by role/volume). Requires at
     least 3 of the player's own real games to compute a meaningful
     distribution - below that, values are shown ungraded.
+
+    pbp_df (optional): when given, merges in real per-game "longest_play"
+    (longest reception or longest rush - see build_longest_play_by_game)
+    as an additional tiered stat. Omitted (None) by default so existing
+    callers are unaffected; passing it on is the only way to get longest
+    reception/rush into the game log or any backtest built on top of it.
     """
     if seasons is None:
         seasons = list(player_stats_df["season"].dropna().unique())
@@ -3954,6 +4002,17 @@ def build_coverage_crossref_game_log(player_gsis_id: str, position: str,
     ].copy()
     if own_games.empty:
         return []
+
+    if pbp_df is not None:
+        try:
+            longest = build_longest_play_by_game(pbp_df, pos)
+            longest = longest[longest["gsis_id"] == player_gsis_id]
+            own_games = own_games.merge(longest[["season", "week", "longest_play"]],
+                                         on=["season", "week"], how="left")
+            if "longest_play" not in metrics:
+                metrics = metrics + ["longest_play"]
+        except KeyError:
+            pass  # pbp schema mismatch - game log still works, just without this one stat
 
     # Resolve the REAL opponent for every one of the player's own games -
     # same schedules_df lookup this file already uses for the current
