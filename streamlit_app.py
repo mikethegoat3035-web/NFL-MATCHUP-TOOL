@@ -76,6 +76,103 @@ st.markdown(f"""
     [data-testid="stCaptionContainer"] p {{
         color: {COWBOYS_NAVY} !important;
     }}
+    /* Coverage Matchup - StatRankings CoverageIQ-style cards */
+    .cov-card {{
+        background: {COWBOYS_WHITE};
+        border: 1px solid #ddd;
+        border-radius: 10px;
+        padding: 16px 22px;
+        margin-bottom: 18px;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+    }}
+    .cov-card-header {{
+        font-size: 19px;
+        font-weight: 700;
+        color: {COWBOYS_NAVY};
+        margin-bottom: 2px;
+    }}
+    .cov-card-usage {{
+        font-size: 13px;
+        color: #5a6b7a;
+        margin-bottom: 6px;
+    }}
+    .cov-z-badge {{
+        display: inline-block;
+        padding: 1px 9px;
+        border-radius: 10px;
+        font-size: 12px;
+        font-weight: 700;
+        color: {COWBOYS_WHITE};
+        background: {COWBOYS_NAVY};
+        margin-left: 6px;
+    }}
+    .cov-fit-warning {{
+        font-size: 12px;
+        color: #b02a37;
+        font-weight: 600;
+        margin-bottom: 8px;
+    }}
+    .cov-grid {{
+        display: flex;
+        gap: 28px;
+        margin-top: 10px;
+    }}
+    .cov-col {{
+        flex: 1;
+        min-width: 0;
+    }}
+    .cov-col-title {{
+        font-weight: 700;
+        color: {COWBOYS_NAVY};
+        font-size: 14px;
+        margin-bottom: 6px;
+        padding-bottom: 4px;
+        border-bottom: 2px solid {COWBOYS_NAVY};
+    }}
+    .cov-thin-flag {{
+        font-size: 11px;
+        font-weight: 700;
+        color: {COWBOYS_WHITE};
+        background: #b02a37;
+        padding: 1px 6px;
+        border-radius: 8px;
+        margin-left: 6px;
+    }}
+    .cov-no-data {{
+        font-size: 13px;
+        color: #8a8a8a;
+        font-style: italic;
+    }}
+    .stat-row {{
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 5px 0;
+        border-bottom: 1px solid #f0f0f0;
+        font-size: 13px;
+    }}
+    .stat-label {{
+        color: #444;
+        font-weight: 600;
+    }}
+    .stat-value {{
+        display: flex;
+        align-items: center;
+        gap: 6px;
+    }}
+    .tier-badge {{
+        padding: 2px 9px;
+        border-radius: 12px;
+        font-size: 11px;
+        font-weight: 700;
+        color: {COWBOYS_WHITE};
+        white-space: nowrap;
+    }}
+    .tier-elite {{ background: #1b7a3d; }}
+    .tier-above-avg {{ background: #66bb6a; }}
+    .tier-average {{ background: #8a8a8a; }}
+    .tier-below-avg {{ background: #ef8c1e; }}
+    .tier-poor {{ background: #c0392b; }}
     [data-testid="stMetricValue"] {{
         color: {COWBOYS_NAVY};
     }}
@@ -1099,42 +1196,70 @@ elif mode == "Coverage Matchup (premium data)":
                     else ("CR %", "YPRR", "TD", "CTGT %", "RATE", "FP/G")
                 )
 
+                TIER_CLASS = {
+                    "Elite": "tier-elite", "Above Avg": "tier-above-avg",
+                    "Average": "tier-average", "Below Avg": "tier-below-avg",
+                    "Poor": "tier-poor",
+                }
+
+                def _stat_rows_html(row, tiers_source, stats):
+                    parts = []
+                    for s in stats:
+                        if s not in row:
+                            continue
+                        tier = tiers_source.get(s, "-")
+                        cls = TIER_CLASS.get(tier, "tier-average")
+                        parts.append(
+                            f'<div class="stat-row"><span class="stat-label">{s}</span>'
+                            f'<span class="stat-value">{row.get(s)}'
+                            f'<span class="tier-badge {cls}">{tier}</span></span></div>'
+                        )
+                    return "".join(parts)
+
                 for entry in report:
                     z = entry["opponent_z_score"]
-                    st.markdown(
-                        f"**{entry['coverage']}** — {opp} runs this at "
-                        f"**{entry['opponent_usage_pct']:.1f}%** (z={z:+.2f} vs league average)"
-                    )
+                    fit_html = ""
                     if entry.get("alignment_fit_warning"):
-                        st.caption(
-                            f"⚠️ Only {entry['alignment_fit_pct']:.0f}% of {p_name}'s routes are "
-                            f"{align} - this alignment split may not represent his usual usage."
+                        fit_html = (
+                            f'<div class="cov-fit-warning">⚠️ Only {entry["alignment_fit_pct"]:.0f}% '
+                            f'of {p_name}\'s routes are {align} - this alignment split may not '
+                            f'represent his usual usage.</div>'
                         )
 
-                    rcol1, rcol2 = st.columns(2)
-                    with rcol1:
-                        own_row = entry.get(own_key)
-                        if own_row is None:
-                            st.caption(f"{p_name}: no recorded {own_vol_label.lower()}s vs this coverage.")
-                        else:
-                            thin = " ⚠️ THIN SAMPLE" if entry["confidence"] == "thin_sample" else ""
-                            st.markdown(f"**{p_name}** ({own_row['_att']} {own_vol_label}){thin}")
-                            for s in highlight_stats:
-                                if s in own_row:
-                                    tier = own_row["_tiers"].get(s, "-")
-                                    st.write(f"{s}: {own_row.get(s)}  _{tier}_")
-                    with rcol2:
-                        def_row = entry.get("defense_allows")
-                        if def_row is None:
-                            st.caption(f"{opp}: no defense-allowed data vs this coverage.")
-                        else:
-                            thin = " ⚠️ THIN SAMPLE" if entry.get("defense_confidence") == "thin_sample" else ""
-                            st.markdown(f"**{opp} allows** ({def_row['_att']} {own_vol_label}){thin}")
-                            for s in highlight_stats:
-                                if s in def_row:
-                                    tier = def_row["_tiers"].get(s, "-")
-                                    st.write(f"{s}: {def_row.get(s)}  _{tier}_")
-                    st.divider()
+                    own_row = entry.get(own_key)
+                    if own_row is None:
+                        own_col_html = f'<div class="cov-no-data">{p_name}: no recorded {own_vol_label.lower()}s vs this coverage.</div>'
+                    else:
+                        thin = '<span class="cov-thin-flag">THIN SAMPLE</span>' if entry["confidence"] == "thin_sample" else ""
+                        own_col_html = (
+                            f'<div class="cov-col-title">{p_name} — {own_row["_att"]} {own_vol_label}{thin}</div>'
+                            + _stat_rows_html(own_row, own_row.get("_tiers", {}), highlight_stats)
+                        )
+
+                    def_row = entry.get("defense_allows")
+                    if def_row is None:
+                        def_col_html = f'<div class="cov-no-data">{opp}: no defense-allowed data vs this coverage.</div>'
+                    else:
+                        thin = '<span class="cov-thin-flag">THIN SAMPLE</span>' if entry.get("defense_confidence") == "thin_sample" else ""
+                        def_col_html = (
+                            f'<div class="cov-col-title">{opp} allows — {def_row["_att"]} {own_vol_label}{thin}</div>'
+                            + _stat_rows_html(def_row, def_row.get("_tiers", {}), highlight_stats)
+                        )
+
+                    card_html = f"""
+                    <div class="cov-card">
+                        <div class="cov-card-header">{entry['coverage']}
+                            <span class="cov-z-badge">z={z:+.2f}</span>
+                        </div>
+                        <div class="cov-card-usage">{opp} runs this coverage at {entry['opponent_usage_pct']:.1f}% of snaps (league-average outlier)</div>
+                        {fit_html}
+                        <div class="cov-grid">
+                            <div class="cov-col">{own_col_html}</div>
+                            <div class="cov-col">{def_col_html}</div>
+                        </div>
+                    </div>
+                    """
+                    st.markdown(card_html, unsafe_allow_html=True)
 
 elif mode not in ("Draft Rankings", "Coverage Matchup (premium data)"):
     st.info("Click the button above to load this week's props.")
