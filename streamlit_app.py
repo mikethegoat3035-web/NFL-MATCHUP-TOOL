@@ -11,7 +11,8 @@ import numpy as np
 from nfl_model_combined import (
     scan_full_slate_nfl, rescore_quality_mu_row_nfl, backtest_week, build_season_accuracy_report,
     diagnose_participation_data, get_player_matchup_explanation, diagnose_injuries_data,
-    diagnose_alignment_data,
+    diagnose_alignment_data, pull_player_stats, pull_schedules,
+    build_coverage_crossref_game_log, diagnose_player_stats_for_game_log,
 )
 from draft_rankings import (
     build_yahoo_style_rankings, detect_risers, build_league_settings,
@@ -1178,6 +1179,65 @@ elif mode == "Coverage Matchup (premium data)":
                      "just because they weren't a statistical outlier.",
             )
 
+        def _top_n_coverage_fields(bundle, opp_profile, top_n):
+            """Shared ranking logic: for each of the 7 coverage fields, where
+            does this team rank (1=highest) among all 32 teams' usage rate?
+            Returns (field, z_score, rank) for every field where rank<=top_n."""
+            all_profiles = list(bundle.def_coverage.values())
+            included = []
+            for field in COVERAGE_FIELDS:
+                ranked = sorted(all_profiles, key=lambda p: p.rates.get(field, 0.0), reverse=True)
+                rank = next((i + 1 for i, p in enumerate(ranked) if p.team_name == opp_profile.team_name), None)
+                if rank is not None and rank <= top_n:
+                    included.append((field, opp_profile.z_scores.get(field, 0.0), rank))
+            return included
+
+        def _find_cross_reference_teams(bundle, included_fields, exclude_team, top_n, min_match=2):
+            """Which OTHER teams also rank in the top N for at least
+            min_match of this opponent's own top-N coverage fields - i.e.
+            real games against teams with a similarly heavy lean on the
+            same coverage shell(s), used as the best available proxy for
+            'games where this player likely saw similar coverage looks'
+            since no source tracks real per-play coverage calls."""
+            field_names = [f for f, _, _ in included_fields]
+            if not field_names:
+                return []
+            all_profiles = list(bundle.def_coverage.values())
+            matches = []
+            for field in field_names:
+                ranked = sorted(all_profiles, key=lambda p: p.rates.get(field, 0.0), reverse=True)
+                top_teams = {p.team_name for p in ranked[:top_n]}
+                matches.append(top_teams)
+            match_counts = {}
+            for team_set in matches:
+                for t in team_set:
+                    if t == exclude_team:
+                        continue
+                    match_counts[t] = match_counts.get(t, 0) + 1
+            threshold = min(min_match, len(field_names))
+            return sorted([t for t, c in match_counts.items() if c >= threshold])
+
+        def _quality_score(tiers: dict) -> float:
+            """0-100 composite: average of every tiered stat's weight. Same
+            weighting for coverage cards and game-log cards so the two are
+            visually/numerically comparable."""
+            weights = {"Elite": 100, "Above Avg": 75, "Average": 50, "Below Avg": 25, "Poor": 0}
+            vals = [weights[t] for t in tiers.values() if t in weights]
+            return round(sum(vals) / len(vals), 1) if vals else None
+
+        def _score_badge_class(score):
+            if score is None:
+                return "tier-average"
+            if score >= 80:
+                return "tier-elite"
+            if score >= 60:
+                return "tier-above-avg"
+            if score >= 40:
+                return "tier-average"
+            if score >= 20:
+                return "tier-below-avg"
+            return "tier-poor"
+
         def _build_full_coverage_report(bundle, player_name, position, opponent_team,
                                           player_team=None, alignment=None, top_n=10):
             """Same shape as get_matchup()'s output, but includes every coverage
@@ -1186,29 +1246,23 @@ elif mode == "Coverage Matchup (premium data)":
             Shows ALL tiered stat columns per row instead of a curated subset."""
             opp_profile = bundle.def_coverage.get(opponent_team)
             if opp_profile is None:
-                return [{"error": f"'{opponent_team}' not found in loaded team coverage data."}]
+                return [{"error": f"'{opponent_team}' not found in loaded team coverage data."}], [], None
             if player_team and _same_team(player_team, opp_profile.team_name):
                 return [{"error": f"{player_name} plays for {opp_profile.team_name} - "
-                                   f"cannot build a matchup report against his own team."}]
+                                   f"cannot build a matchup report against his own team."}], [], opp_profile
 
-            all_profiles = list(bundle.def_coverage.values())
-            included = []
-            for field in COVERAGE_FIELDS:
-                ranked = sorted(all_profiles, key=lambda p: p.rates.get(field, 0.0), reverse=True)
-                rank = next((i + 1 for i, p in enumerate(ranked) if p.team_name == opp_profile.team_name), None)
-                if rank is not None and rank <= top_n:
-                    included.append((field, opp_profile.z_scores.get(field, 0.0), rank))
+            included = _top_n_coverage_fields(bundle, opp_profile, top_n)
 
             if not included:
                 return [{"note": f"{opp_profile.team_name} has no coverage ranking in the top "
-                                  f"{top_n} of all 32 teams - no coverage edge to flag at this threshold."}]
+                                  f"{top_n} of all 32 teams - no coverage edge to flag at this threshold."}], [], opp_profile
 
             if position.upper() == "QB":
                 own_data, def_data = bundle.qb_vs_coverage, bundle.def_allowed_to_qb
             else:
                 if alignment is None or alignment.lower() not in bundle.receiver_by_alignment:
                     return [{"error": f"alignment is required for position '{position}' "
-                                       f"(one of: wide, slot, inline, backfield)."}]
+                                       f"(one of: wide, slot, inline, backfield)."}], [], opp_profile
                 alignment = alignment.lower()
                 own_data = bundle.receiver_by_alignment[alignment]
                 def_data = bundle.def_allowed_by_alignment[alignment]
@@ -1229,6 +1283,7 @@ elif mode == "Coverage Matchup (premium data)":
                 else:
                     entry[own_key] = own_row
                     entry["confidence"] = "thin_sample" if own_row.get("_thin_sample") else "solid"
+                    entry["quality_score"] = _quality_score(own_row.get("_tiers", {}))
                     if position.upper() != "QB":
                         fit = check_alignment_fit(own_row, alignment)
                         entry["alignment_fit_pct"] = fit
@@ -1239,19 +1294,77 @@ elif mode == "Coverage Matchup (premium data)":
                 entry["defense_confidence"] = ("thin_sample" if def_row and def_row.get("_thin_sample")
                                                 else "solid" if def_row else "no_data")
                 report.append(entry)
-            return report
+            return report, included, opp_profile
+
+        gl_col1, gl_col2 = st.columns(2)
+        with gl_col1:
+            game_log_season = st.number_input(
+                "Game log season (real weekly logs, free nflreadpy data)",
+                min_value=2020, max_value=2030, value=2025, step=1,
+            )
+        with gl_col2:
+            min_match_coverages = st.number_input(
+                "Cross-reference: min matching top-N coverages with another team",
+                min_value=1, max_value=7, value=2, step=1,
+                help="A past opponent counts as a real cross-reference game if THEY "
+                     "also ranked in the top-N of all 32 teams for at least this many "
+                     "of the SAME coverage types this week's opponent leans on.",
+            )
 
         if st.button("Get matchup report", type="primary"):
             if not player_name.strip():
                 st.warning("Enter a player name first.")
             else:
-                report = _build_full_coverage_report(
+                report, included, opp_profile = _build_full_coverage_report(
                     bundle, player_name.strip(), position, opponent_team,
                     player_team=player_team.strip() or None, alignment=alignment,
                     top_n=int(top_n_rank),
                 )
                 st.session_state["_coverage_report"] = report
                 st.session_state["_coverage_report_ctx"] = (player_name.strip(), position, opponent_team, alignment)
+
+                st.session_state["_crossref_game_log"] = None
+                if opp_profile is not None and included:
+                    cross_teams_full = _find_cross_reference_teams(
+                        bundle, included, opp_profile.team_name,
+                        top_n=int(top_n_rank), min_match=int(min_match_coverages),
+                    )
+                    full_to_abbrevs = {}
+                    for abbr, full in TEAM_ABBREV_TO_FULL.items():
+                        full_to_abbrevs.setdefault(full, set()).add(abbr)
+                    cross_team_abbrevs = set()
+                    for full_name in cross_teams_full:
+                        cross_team_abbrevs |= full_to_abbrevs.get(full_name, set())
+
+                    try:
+                        pstats = pull_player_stats([int(game_log_season)])
+                        sched = pull_schedules([int(game_log_season)])
+                        matches = pstats[pstats["position"].astype(str).str.upper() == position.upper()]
+                        name_col = "player_display_name" if "player_display_name" in pstats.columns else (
+                            "player_name" if "player_name" in pstats.columns else None)
+                        target_gsis = None
+                        if name_col:
+                            hit = matches[matches[name_col].astype(str).str.lower() == player_name.strip().lower()]
+                            if not hit.empty:
+                                target_gsis = hit.iloc[0]["gsis_id"]
+                        if target_gsis is None or not cross_team_abbrevs:
+                            st.session_state["_crossref_game_log"] = {
+                                "error": (
+                                    f"Couldn't match '{player_name}' to a real nflreadpy player record "
+                                    f"for {game_log_season}" if target_gsis is None else
+                                    "No cross-reference teams found at this top-N / min-match threshold."
+                                )
+                            }
+                        else:
+                            log = build_coverage_crossref_game_log(
+                                target_gsis, position, cross_team_abbrevs, pstats, sched,
+                                seasons=[int(game_log_season)],
+                            )
+                            st.session_state["_crossref_game_log"] = {
+                                "log": log, "cross_teams": sorted(cross_team_abbrevs),
+                            }
+                    except Exception as e:
+                        st.session_state["_crossref_game_log"] = {"error": f"Game log lookup failed: {e}"}
 
         report = st.session_state.get("_coverage_report")
         if report:
@@ -1297,6 +1410,11 @@ elif mode == "Coverage Matchup (premium data)":
                     z = entry["opponent_z_score"]
                     rank = entry.get("opponent_rank")
                     rank_badge = f'<span class="cov-z-badge">rank {rank} of 32</span>' if rank else ""
+                    qs = entry.get("quality_score")
+                    qs_badge = (
+                        f'<span class="tier-badge {_score_badge_class(qs)}">Quality {qs:.0f}</span>'
+                        if qs is not None else ""
+                    )
                     fit_html = ""
                     if entry.get("alignment_fit_warning"):
                         fit_html = (
@@ -1334,7 +1452,7 @@ elif mode == "Coverage Matchup (premium data)":
                     card_html = (
                         '<div class="cov-card">'
                         f'<div class="cov-card-header">{entry["coverage"]}'
-                        f'<span class="cov-z-badge">z={z:+.2f}</span>{rank_badge}</div>'
+                        f'<span class="cov-z-badge">z={z:+.2f}</span>{rank_badge}{qs_badge}</div>'
                         f'<div class="cov-card-usage">{opp} runs this coverage at '
                         f'{entry["opponent_usage_pct"]:.1f}% of snaps</div>'
                         f'{fit_html}'
@@ -1345,6 +1463,56 @@ elif mode == "Coverage Matchup (premium data)":
                         '</div>'
                     )
                     st.markdown(card_html, unsafe_allow_html=True)
+
+                st.divider()
+                st.markdown("### Real Weekly Game Log — Cross-Referenced Opponents")
+                st.caption(
+                    "This is an APPROXIMATION, not verified per-play coverage tracking - no free "
+                    "or paid source tracks real per-play coverage calls. These are real weekly "
+                    "game logs (nflreadpy) against teams that were ALSO top-N users of the same "
+                    "coverage shell(s) as this week's opponent, used as the best available proxy "
+                    "for 'games where this player likely saw a similar coverage look.'"
+                )
+                crossref = st.session_state.get("_crossref_game_log")
+                if crossref is None:
+                    st.info("No game log loaded - click 'Get matchup report' above to build it.")
+                elif crossref.get("error"):
+                    st.warning(crossref["error"])
+                else:
+                    log = crossref.get("log", [])
+                    st.caption(f"Cross-reference teams at this threshold: {', '.join(crossref.get('cross_teams', [])) or 'none'}")
+                    if not log:
+                        st.info("No real games found against a cross-reference team at this threshold/season.")
+                    for g in log:
+                        tiers = g.get("tiers", {})
+                        stats = g.get("stats", {})
+                        gqs = _quality_score(tiers)
+                        gqs_badge = (
+                            f'<span class="tier-badge {_score_badge_class(gqs)}">Quality {gqs:.0f}</span>'
+                            if gqs is not None else ""
+                        )
+                        rows_html = "".join(
+                            f'<div class="stat-row"><span class="stat-label">{s}</span>'
+                            f'<span class="stat-value">{stats.get(s)}'
+                            f'<span class="tier-badge {TIER_CLASS.get(tiers.get(s), "tier-average")}">{tiers.get(s, "-")}</span>'
+                            f'</span></div>'
+                            for s in stats
+                        )
+                        note_html = (
+                            f'<div class="cov-fit-warning">{g["sample_size_note"]}</div>'
+                            if g.get("sample_size_note") else ""
+                        )
+                        game_card_html = (
+                            '<div class="cov-card">'
+                            f'<div class="cov-card-header">{g["season"]} Week {g["week"]} '
+                            f'— {g["team"]} vs {g["opponent"]}{gqs_badge}</div>'
+                            f'{note_html}'
+                            f'<div class="cov-col">{rows_html}</div>'
+                            '</div>'
+                        )
+                        st.markdown(game_card_html, unsafe_allow_html=True)
+
+
 
 elif mode not in ("Draft Rankings", "Coverage Matchup (premium data)"):
     st.info("Click the button above to load this week's props.")
