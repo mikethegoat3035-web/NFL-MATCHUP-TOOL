@@ -20,7 +20,7 @@ from draft_rankings import (
 )
 from coverage_matchup import (
     load_full_dataset, get_matchup, TEAM_ABBREV_TO_FULL, COVERAGE_FIELDS,
-    _same_team, check_alignment_fit,
+    _same_team, check_alignment_fit, ALIGNMENT_RTE_COLUMNS, ALIGNMENTS,
 )
 
 st.set_page_config(page_title="Dallas Cowboys Matchup Tool", layout="wide", page_icon="⭐")
@@ -119,6 +119,19 @@ st.markdown(f"""
         gap: 28px;
         margin-top: 10px;
     }}
+    .cov-align-block {{
+        background: #fafafa;
+        border: 1px solid #eee;
+        border-radius: 8px;
+        padding: 10px 14px;
+        margin-top: 10px;
+    }}
+    .cov-align-header {{
+        font-weight: 700;
+        color: {COWBOYS_NAVY};
+        font-size: 13px;
+        margin-bottom: 4px;
+    }}
     .cov-col {{
         flex: 1;
         min-width: 0;
@@ -175,6 +188,25 @@ st.markdown(f"""
     .tier-average {{ background: #8a8a8a; }}
     .tier-below-avg {{ background: #ef8c1e; }}
     .tier-poor {{ background: #c0392b; }}
+    .cov-more {{
+        margin-top: 6px;
+    }}
+    .cov-more summary {{
+        cursor: pointer;
+        font-size: 11px;
+        font-weight: 600;
+        color: #5a6b7a;
+        list-style: none;
+    }}
+    .cov-more summary::-webkit-details-marker {{
+        display: none;
+    }}
+    .cov-more summary::before {{
+        content: "▸ ";
+    }}
+    .cov-more[open] summary::before {{
+        content: "▾ ";
+    }}
     [data-testid="stMetricValue"] {{
         color: {COWBOYS_NAVY};
     }}
@@ -1165,8 +1197,20 @@ elif mode == "Coverage Matchup (premium data)":
         with mcol2:
             position = st.selectbox("Position", ["QB", "WR", "TE", "RB"])
             alignment = None
+            use_auto_weight = False
             if position != "QB":
-                alignment = st.selectbox("Alignment", ["wide", "slot", "inline", "backfield"])
+                align_mode = st.radio(
+                    "Alignment weighting", ["Auto-weight by real usage (recommended)", "Manual - pick one alignment"],
+                    help="Every receiver row already carries this player's real season-long "
+                         "route% split across Wide/Slot/Inline/Backfield (WIDE RTE %, SLOT RTE %, "
+                         "etc.). Auto-weight blends the quality score across every alignment they "
+                         "actually play, weighted by that real split - a receiver who's 70% Slot "
+                         "won't get graded off his thin 10%-of-routes Wide numbers.",
+                )
+                if align_mode.startswith("Auto"):
+                    use_auto_weight = True
+                else:
+                    alignment = st.selectbox("Alignment", ["wide", "slot", "inline", "backfield"])
         with mcol3:
             opponent_team = st.selectbox("Opponent (defense)", team_names_sorted)
             top_n_rank = st.number_input(
@@ -1178,6 +1222,7 @@ elif mode == "Coverage Matchup (premium data)":
                      "coverage type - broader, so real heavy-usage tendencies aren't skipped "
                      "just because they weren't a statistical outlier.",
             )
+
 
         def _top_n_coverage_fields(bundle, opp_profile, top_n):
             """Shared ranking logic: for each of the 7 coverage fields, where
@@ -1217,13 +1262,79 @@ elif mode == "Coverage Matchup (premium data)":
             threshold = min(min_match, len(field_names))
             return sorted([t for t, c in match_counts.items() if c >= threshold])
 
+        TIER_WEIGHTS = {"Elite": 100, "Above Avg": 75, "Average": 50, "Below Avg": 25, "Poor": 0}
+
         def _quality_score(tiers: dict) -> float:
             """0-100 composite: average of every tiered stat's weight. Same
             weighting for coverage cards and game-log cards so the two are
             visually/numerically comparable."""
-            weights = {"Elite": 100, "Above Avg": 75, "Average": 50, "Below Avg": 25, "Poor": 0}
-            vals = [weights[t] for t in tiers.values() if t in weights]
+            vals = [TIER_WEIGHTS[t] for t in tiers.values() if t in TIER_WEIGHTS]
             return round(sum(vals) / len(vals), 1) if vals else None
+
+        # Prop-decision stats only - the ones that actually separate "best
+        # prop." TD and longest catch are NOT included: TD isn't a confirmed
+        # column anywhere, and longest catch needs per-play pbp data not yet
+        # wired (see diagnose_player_stats_for_game_log). Real crucial-stat
+        # set here, not a guess: TGT=opportunity, REC=realized volume,
+        # YDS=production.
+        PROP_STAT_MAP = {"targets": "TGT", "receptions": "REC", "rec_yards": "YDS"}
+        GAME_LOG_PROP_MAP = {"targets": "targets", "receptions": "receptions", "rec_yards": "receiving_yards"}
+        PROP_LABELS = {"targets": "Targets", "receptions": "Receptions", "rec_yards": "Receiving Yards"}
+
+        def _actual_best_prop(tiers: dict):
+            """Same argmax-with-ties logic as _predict_best_prop, applied to a
+            REAL game's actual tiers (already computed by
+            build_coverage_crossref_game_log against the player's own season
+            distribution)."""
+            valid = {prop: TIER_WEIGHTS[tiers[col]] for prop, col in GAME_LOG_PROP_MAP.items()
+                     if col in tiers and tiers[col] in TIER_WEIGHTS}
+            if not valid:
+                return None, []
+            best = max(valid, key=valid.get)
+            ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
+            return best, ties
+
+        def _predict_best_prop(bundle, player_name, position, opponent_team_full,
+                                 alignment=None, weights=None, top_n=10):
+            """For each candidate prop, blends its tier-weight across every
+            included top-N coverage (and across alignments if weights is
+            given - same real-usage blending as the quality score). Returns
+            {prop: score or None} plus the argmax and any close ties (within
+            10 points - shown as genuine toss-ups, not a false single pick)."""
+            opp_profile = bundle.def_coverage.get(opponent_team_full)
+            if opp_profile is None:
+                return None
+            included = _top_n_coverage_fields(bundle, opp_profile, top_n)
+            if not included:
+                return None
+
+            scores = {}
+            for prop, stat_col in PROP_STAT_MAP.items():
+                weighted_vals = []
+                for field, z, rank in included:
+                    if weights:  # auto-weight across real alignments
+                        for align, w in weights.items():
+                            row = bundle.receiver_by_alignment.get(align, {}).get(field, {}).get(player_name)
+                            if row is not None:
+                                tier = row.get("_tiers", {}).get(stat_col)
+                                if tier in TIER_WEIGHTS:
+                                    weighted_vals.append((w, TIER_WEIGHTS[tier]))
+                    else:
+                        source = bundle.qb_vs_coverage if position.upper() == "QB" else bundle.receiver_by_alignment.get(alignment, {})
+                        row = source.get(field, {}).get(player_name)
+                        if row is not None:
+                            tier = row.get("_tiers", {}).get(stat_col)
+                            if tier in TIER_WEIGHTS:
+                                weighted_vals.append((1.0, TIER_WEIGHTS[tier]))
+                total_w = sum(w for w, _ in weighted_vals)
+                scores[prop] = round(sum(w * s for w, s in weighted_vals) / total_w, 1) if total_w else None
+
+            valid = {p: s for p, s in scores.items() if s is not None}
+            if not valid:
+                return {"scores": scores, "best": None, "ties": []}
+            best = max(valid, key=valid.get)
+            ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
+            return {"scores": scores, "best": best, "ties": ties}
 
         def _score_badge_class(score):
             if score is None:
@@ -1238,12 +1349,47 @@ elif mode == "Coverage Matchup (premium data)":
                 return "tier-below-avg"
             return "tier-poor"
 
+        def _get_real_alignment_weights(bundle, player_name):
+            """Real season-long alignment split for this player, read straight
+            off any row we can find for them (WIDE/SLOT/INLINE/BACK RTE % -
+            already present on every receiver row regardless of which
+            alignment file it came from, confirmed earlier this session).
+            Returns {alignment: weight 0-1}, normalized to sum to 1, only for
+            alignments with real usage (>0). None if the player isn't found
+            in ANY alignment file at all."""
+            raw = {}
+            for align in ALIGNMENTS:
+                for cov_data in bundle.receiver_by_alignment.get(align, {}).values():
+                    row = cov_data.get(player_name)
+                    if row is not None:
+                        for a in ALIGNMENTS:
+                            pct = check_alignment_fit(row, a)
+                            if pct is not None:
+                                raw[a] = pct
+                        break
+                if raw:
+                    break
+            if not raw:
+                return None
+            total = sum(raw.values())
+            if not total:
+                return None
+            return {a: v / total for a, v in raw.items() if v > 0}
+
         def _build_full_coverage_report(bundle, player_name, position, opponent_team,
-                                          player_team=None, alignment=None, top_n=10):
+                                          player_team=None, alignment=None, top_n=10,
+                                          use_auto_weight=False):
             """Same shape as get_matchup()'s output, but includes every coverage
             where the opponent ranks in the top N of all 32 teams by usage rate
             for that specific coverage - not just statistical z-score outliers.
-            Shows ALL tiered stat columns per row instead of a curated subset."""
+            Shows ALL tiered stat columns per row instead of a curated subset.
+
+            use_auto_weight=True (WR/TE/RB only): instead of one manually-
+            picked alignment, blends the quality score + stat rows across
+            EVERY alignment the player really plays, weighted by their real
+            RTE % split (see _get_real_alignment_weights). Alignments with no
+            data for a given coverage are dropped and the remaining weights
+            re-normalized, rather than silently zero-filling."""
             opp_profile = bundle.def_coverage.get(opponent_team)
             if opp_profile is None:
                 return [{"error": f"'{opponent_team}' not found in loaded team coverage data."}], [], None
@@ -1259,6 +1405,13 @@ elif mode == "Coverage Matchup (premium data)":
 
             if position.upper() == "QB":
                 own_data, def_data = bundle.qb_vs_coverage, bundle.def_allowed_to_qb
+                weights = None
+            elif use_auto_weight:
+                weights = _get_real_alignment_weights(bundle, player_name)
+                if weights is None:
+                    return [{"error": f"'{player_name}' not found in any alignment file - "
+                                       f"can't compute a real alignment split."}], [], opp_profile
+                own_data = def_data = None  # per-alignment lookups happen in the loop below
             else:
                 if alignment is None or alignment.lower() not in bundle.receiver_by_alignment:
                     return [{"error": f"alignment is required for position '{position}' "
@@ -1266,6 +1419,7 @@ elif mode == "Coverage Matchup (premium data)":
                 alignment = alignment.lower()
                 own_data = bundle.receiver_by_alignment[alignment]
                 def_data = bundle.def_allowed_by_alignment[alignment]
+                weights = None
 
             report = []
             for field, z, rank in included:
@@ -1275,24 +1429,51 @@ elif mode == "Coverage Matchup (premium data)":
                     "opponent_z_score": round(z, 2),
                     "opponent_rank": rank,
                 }
-                own_row = own_data.get(field, {}).get(player_name)
-                own_key = "qb_data" if position.upper() == "QB" else "receiver_data"
-                if own_row is None:
-                    entry[own_key] = None
-                    entry["confidence"] = "no_data"
-                else:
-                    entry[own_key] = own_row
-                    entry["confidence"] = "thin_sample" if own_row.get("_thin_sample") else "solid"
-                    entry["quality_score"] = _quality_score(own_row.get("_tiers", {}))
-                    if position.upper() != "QB":
-                        fit = check_alignment_fit(own_row, alignment)
-                        entry["alignment_fit_pct"] = fit
-                        entry["alignment_fit_warning"] = (fit is not None and fit < 60)
 
-                def_row = def_data.get(field, {}).get(opp_profile.team_name)
-                entry["defense_allows"] = def_row
-                entry["defense_confidence"] = ("thin_sample" if def_row and def_row.get("_thin_sample")
-                                                else "solid" if def_row else "no_data")
+                if use_auto_weight and position.upper() != "QB":
+                    entry["auto_weighted"] = True
+                    breakdown = []
+                    weighted_scores = []
+                    for align in ALIGNMENTS:
+                        w = weights.get(align, 0.0)
+                        if w <= 0:
+                            continue
+                        a_own = bundle.receiver_by_alignment.get(align, {}).get(field, {}).get(player_name)
+                        a_def = bundle.def_allowed_by_alignment.get(align, {}).get(field, {}).get(opp_profile.team_name)
+                        a_qs = _quality_score(a_own.get("_tiers", {})) if a_own is not None else None
+                        if a_qs is not None:
+                            weighted_scores.append((w, a_qs))
+                        breakdown.append({
+                            "alignment": align, "weight": w, "own_row": a_own, "defense_allows": a_def,
+                            "quality_score": a_qs,
+                            "confidence": ("thin_sample" if a_own and a_own.get("_thin_sample") else "solid") if a_own is not None else "no_data",
+                            "defense_confidence": ("thin_sample" if a_def and a_def.get("_thin_sample") else "solid") if a_def is not None else "no_data",
+                        })
+                    breakdown.sort(key=lambda b: -b["weight"])
+                    entry["alignment_breakdown"] = breakdown
+                    total_w = sum(w for w, _ in weighted_scores)
+                    entry["quality_score"] = (
+                        round(sum(w * s for w, s in weighted_scores) / total_w, 1) if total_w else None
+                    )
+                else:
+                    own_row = own_data.get(field, {}).get(player_name)
+                    own_key = "qb_data" if position.upper() == "QB" else "receiver_data"
+                    if own_row is None:
+                        entry[own_key] = None
+                        entry["confidence"] = "no_data"
+                    else:
+                        entry[own_key] = own_row
+                        entry["confidence"] = "thin_sample" if own_row.get("_thin_sample") else "solid"
+                        entry["quality_score"] = _quality_score(own_row.get("_tiers", {}))
+                        if position.upper() != "QB":
+                            fit = check_alignment_fit(own_row, alignment)
+                            entry["alignment_fit_pct"] = fit
+                            entry["alignment_fit_warning"] = (fit is not None and fit < 60)
+
+                    def_row = def_data.get(field, {}).get(opp_profile.team_name)
+                    entry["defense_allows"] = def_row
+                    entry["defense_confidence"] = ("thin_sample" if def_row and def_row.get("_thin_sample")
+                                                    else "solid" if def_row else "no_data")
                 report.append(entry)
             return report, included, opp_profile
 
@@ -1318,7 +1499,7 @@ elif mode == "Coverage Matchup (premium data)":
                 report, included, opp_profile = _build_full_coverage_report(
                     bundle, player_name.strip(), position, opponent_team,
                     player_team=player_team.strip() or None, alignment=alignment,
-                    top_n=int(top_n_rank),
+                    top_n=int(top_n_rank), use_auto_weight=use_auto_weight,
                 )
                 st.session_state["_coverage_report"] = report
                 st.session_state["_coverage_report_ctx"] = (player_name.strip(), position, opponent_team, alignment)
@@ -1390,14 +1571,28 @@ elif mode == "Coverage Matchup (premium data)":
                     "Poor": "tier-poor",
                 }
 
-                def _stat_rows_html(row, tiers_source):
-                    """Renders EVERY tiered stat column in the row - the tiers
-                    dict already excludes identifier columns (Name, Team, G,
-                    etc.) and non-numeric fields, so this is the full real
-                    stat set for whatever file this row came from, not a
-                    curated guess at what matters."""
+                # Curated to just what actually decides "which prop is the
+                # play" - volume (TGT/REC), efficiency/reliability (CR %),
+                # production (YDS), per-route quality (YPRR), and upside
+                # (TD). Everything else the export has (RTE, aDOT, AY, TPRR,
+                # RecYDS/G, YPT, YPR, YAC, YAC/REC, YACO, YACO/REC, I20,
+                # EZTGT, etc.) is still there - see the expander below each
+                # block instead of cluttering the default view.
+                CURATED_STATS = {
+                    "QB": ("CMP %", "YPA", "TD", "INT", "RATE"),
+                    "WR": ("TGT", "REC", "CR %", "YDS", "YPRR", "TD"),
+                    "TE": ("TGT", "REC", "CR %", "YDS", "YPRR", "TD"),
+                    "RB": ("TGT", "REC", "CR %", "YDS", "YPRR", "TD"),
+                }
+
+                def _stat_rows_html(row, tiers_source, keys=None):
+                    """Renders tiered stat columns. keys=None -> every real
+                    column (full detail). keys=<tuple> -> just those, in
+                    that order, skipping any not present in this row."""
+                    fields = [k for k in keys if k in tiers_source] if keys else list(tiers_source.keys())
                     parts = []
-                    for s, tier in tiers_source.items():
+                    for s in fields:
+                        tier = tiers_source[s]
                         cls = TIER_CLASS.get(tier, "tier-average")
                         parts.append(
                             f'<div class="stat-row"><span class="stat-label">{s}</span>'
@@ -1405,6 +1600,21 @@ elif mode == "Coverage Matchup (premium data)":
                             f'<span class="tier-badge {cls}">{tier}</span></span></div>'
                         )
                     return "".join(parts)
+
+                def _stat_block_html(row, tiers_source):
+                    """Curated stats up front, everything else the export has
+                    tucked behind a native <details> toggle - nothing hidden,
+                    just not cluttering the default view."""
+                    curated = CURATED_STATS.get(p_pos, ())
+                    curated_html = _stat_rows_html(row, tiers_source, keys=curated)
+                    remaining = [k for k in tiers_source if k not in curated]
+                    if not remaining:
+                        return curated_html
+                    more_html = _stat_rows_html(row, tiers_source, keys=remaining)
+                    return (
+                        curated_html
+                        + f'<details class="cov-more"><summary>+{len(remaining)} more stats</summary>{more_html}</details>'
+                    )
 
                 for entry in report:
                     z = entry["opponent_z_score"]
@@ -1423,24 +1633,68 @@ elif mode == "Coverage Matchup (premium data)":
                             f'represent his usual usage.</div>'
                         )
 
-                    own_row = entry.get(own_key)
-                    if own_row is None:
-                        own_col_html = f'<div class="cov-no-data">{p_name}: no recorded {own_vol_label.lower()}s vs this coverage.</div>'
+                    if entry.get("auto_weighted"):
+                        # One mini-block per alignment the player actually plays,
+                        # each with its own real weight%, quality score, and stat
+                        # rows - not a single averaged-away number.
+                        blocks = []
+                        for b in entry["alignment_breakdown"]:
+                            b_qs = b["quality_score"]
+                            b_qs_badge = (
+                                f'<span class="tier-badge {_score_badge_class(b_qs)}">Quality {b_qs:.0f}</span>'
+                                if b_qs is not None else ""
+                            )
+                            if b["own_row"] is None:
+                                own_part = f'<div class="cov-no-data">no recorded {own_vol_label.lower()}s vs this coverage.</div>'
+                            else:
+                                thin = '<span class="cov-thin-flag">THIN SAMPLE</span>' if b["confidence"] == "thin_sample" else ""
+                                own_part = (
+                                    f'<div class="cov-col-title">{p_name} — {b["own_row"]["_att"]} {own_vol_label}{thin}</div>'
+                                    + _stat_block_html(b["own_row"], b["own_row"].get("_tiers", {}))
+                                )
+                            if b["defense_allows"] is None:
+                                def_part = f'<div class="cov-no-data">{opp}: no defense-allowed data for this alignment.</div>'
+                            else:
+                                thin = '<span class="cov-thin-flag">THIN SAMPLE</span>' if b["defense_confidence"] == "thin_sample" else ""
+                                def_part = (
+                                    f'<div class="cov-col-title">{opp} allows — {b["defense_allows"]["_att"]} {own_vol_label}{thin}</div>'
+                                    + _stat_block_html(b["defense_allows"], b["defense_allows"].get("_tiers", {}))
+                                )
+                            blocks.append(
+                                f'<div class="cov-align-block">'
+                                f'<div class="cov-align-header">{b["alignment"].upper()} '
+                                f'— {b["weight"]*100:.0f}% of real routes{b_qs_badge}</div>'
+                                f'<div class="cov-grid">'
+                                f'<div class="cov-col">{own_part}</div>'
+                                f'<div class="cov-col">{def_part}</div>'
+                                f'</div></div>'
+                            )
+                        grid_html = "".join(blocks)
                     else:
-                        thin = '<span class="cov-thin-flag">THIN SAMPLE</span>' if entry["confidence"] == "thin_sample" else ""
-                        own_col_html = (
-                            f'<div class="cov-col-title">{p_name} — {own_row["_att"]} {own_vol_label}{thin}</div>'
-                            + _stat_rows_html(own_row, own_row.get("_tiers", {}))
-                        )
+                        own_row = entry.get(own_key)
+                        if own_row is None:
+                            own_col_html = f'<div class="cov-no-data">{p_name}: no recorded {own_vol_label.lower()}s vs this coverage.</div>'
+                        else:
+                            thin = '<span class="cov-thin-flag">THIN SAMPLE</span>' if entry["confidence"] == "thin_sample" else ""
+                            own_col_html = (
+                                f'<div class="cov-col-title">{p_name} — {own_row["_att"]} {own_vol_label}{thin}</div>'
+                                + _stat_block_html(own_row, own_row.get("_tiers", {}))
+                            )
 
-                    def_row = entry.get("defense_allows")
-                    if def_row is None:
-                        def_col_html = f'<div class="cov-no-data">{opp}: no defense-allowed data vs this coverage.</div>'
-                    else:
-                        thin = '<span class="cov-thin-flag">THIN SAMPLE</span>' if entry.get("defense_confidence") == "thin_sample" else ""
-                        def_col_html = (
-                            f'<div class="cov-col-title">{opp} allows — {def_row["_att"]} {own_vol_label}{thin}</div>'
-                            + _stat_rows_html(def_row, def_row.get("_tiers", {}))
+                        def_row = entry.get("defense_allows")
+                        if def_row is None:
+                            def_col_html = f'<div class="cov-no-data">{opp}: no defense-allowed data vs this coverage.</div>'
+                        else:
+                            thin = '<span class="cov-thin-flag">THIN SAMPLE</span>' if entry.get("defense_confidence") == "thin_sample" else ""
+                            def_col_html = (
+                                f'<div class="cov-col-title">{opp} allows — {def_row["_att"]} {own_vol_label}{thin}</div>'
+                                + _stat_block_html(def_row, def_row.get("_tiers", {}))
+                            )
+                        grid_html = (
+                            '<div class="cov-grid">'
+                            f'<div class="cov-col">{own_col_html}</div>'
+                            f'<div class="cov-col">{def_col_html}</div>'
+                            '</div>'
                         )
 
                     # Built as ONE continuous line (no embedded newlines/indentation) -
@@ -1456,13 +1710,187 @@ elif mode == "Coverage Matchup (premium data)":
                         f'<div class="cov-card-usage">{opp} runs this coverage at '
                         f'{entry["opponent_usage_pct"]:.1f}% of snaps</div>'
                         f'{fit_html}'
-                        '<div class="cov-grid">'
-                        f'<div class="cov-col">{own_col_html}</div>'
-                        f'<div class="cov-col">{def_col_html}</div>'
-                        '</div>'
+                        f'{grid_html}'
                         '</div>'
                     )
                     st.markdown(card_html, unsafe_allow_html=True)
+
+                st.divider()
+                st.markdown("### Best Prop Verdict")
+                is_auto = bool(report[0].get("auto_weighted")) if report and isinstance(report[0], dict) else False
+                verdict_weights = _get_real_alignment_weights(bundle, p_name) if (is_auto and p_pos != "QB") else None
+                verdict_alignment = None if is_auto else align
+                verdict = _predict_best_prop(
+                    bundle, p_name, p_pos, opp, alignment=verdict_alignment,
+                    weights=verdict_weights, top_n=int(top_n_rank),
+                )
+                if not verdict or verdict["best"] is None:
+                    st.info("Not enough data across these coverages to determine a best prop.")
+                else:
+                    best = verdict["best"]
+                    ties = verdict["ties"]
+                    rows_html = "".join(
+                        f'<div class="stat-row"><span class="stat-label">{PROP_LABELS[p]}</span>'
+                        f'<span class="stat-value">{verdict["scores"][p] if verdict["scores"][p] is not None else "no data"}'
+                        f'<span class="tier-badge {_score_badge_class(verdict["scores"][p])}">'
+                        f'{"BEST" if p == best else ("TIE" if p in ties else "")}</span></span></div>'
+                        for p in PROP_LABELS
+                    )
+                    tie_note = f" (essentially tied with {', '.join(PROP_LABELS[t] for t in ties)})" if ties else ""
+                    verdict_html = (
+                        '<div class="cov-card">'
+                        f'<div class="cov-card-header">Best Prop: {PROP_LABELS[best]}{tie_note}</div>'
+                        f'<div class="cov-card-usage">Based on {p_name}\'s season splits vs '
+                        f'{opp}\'s top-{int(top_n_rank)} coverages</div>'
+                        f'<div class="cov-col">{rows_html}</div>'
+                        '</div>'
+                    )
+                    st.markdown(verdict_html, unsafe_allow_html=True)
+                st.caption(
+                    "TD props and longest catch aren't included yet - not confirmed columns "
+                    "anywhere in the pipeline. Only targets/receptions/rec yards, which are."
+                )
+
+                st.divider()
+                def _run_season_backtest(bundle, p_name, p_pos, verdict_alignment, verdict_weights,
+                                           game_log_season, top_n):
+                    """One full-season backtest run at a given top_n threshold. Pulled
+                    out as its own function so both the single-run button and the
+                    threshold sweep call the exact same logic - a sweep that secretly
+                    used different code per threshold would make the comparison
+                    meaningless."""
+                    bt_pstats = pull_player_stats([int(game_log_season)])
+                    bt_sched = pull_schedules([int(game_log_season)])
+                    bt_matches = bt_pstats[bt_pstats["position"].astype(str).str.upper() == p_pos.upper()]
+                    bt_name_col = "player_display_name" if "player_display_name" in bt_pstats.columns else (
+                        "player_name" if "player_name" in bt_pstats.columns else None)
+                    bt_gsis = None
+                    if bt_name_col:
+                        bt_hit = bt_matches[bt_matches[bt_name_col].astype(str).str.lower() == p_name.lower()]
+                        if not bt_hit.empty:
+                            bt_gsis = bt_hit.iloc[0]["gsis_id"]
+                    if bt_gsis is None:
+                        return {"error": f"Couldn't match '{p_name}' to a real nflreadpy player record for {game_log_season}."}
+
+                    all_abbrevs = set(TEAM_ABBREV_TO_FULL.keys())
+                    full_log = build_coverage_crossref_game_log(
+                        bt_gsis, p_pos, all_abbrevs, bt_pstats, bt_sched,
+                        seasons=[int(game_log_season)], max_games=25,
+                    )
+                    rows, strict_hits, generous_hits, graded = [], 0, 0, 0
+                    for g in full_log:
+                        opp_full = TEAM_ABBREV_TO_FULL.get(g["opponent"])
+                        pred = (_predict_best_prop(bundle, p_name, p_pos, opp_full,
+                                                    alignment=verdict_alignment, weights=verdict_weights,
+                                                    top_n=top_n) if opp_full else None)
+                        pred_best = pred["best"] if pred else None
+                        actual_best, actual_ties = _actual_best_prop(g.get("tiers", {}))
+                        result = "—"
+                        if pred_best is not None and actual_best is not None:
+                            graded += 1
+                            if pred_best == actual_best:
+                                strict_hits += 1
+                                generous_hits += 1
+                                result = "✅ Hit"
+                            elif pred_best in actual_ties:
+                                generous_hits += 1
+                                result = "〰️ Tie"
+                            else:
+                                result = "❌ Miss"
+                        rows.append({
+                            "Week": g["week"], "Opponent": g["opponent"],
+                            "Predicted Best": PROP_LABELS.get(pred_best, "no data"),
+                            "Actual Best": PROP_LABELS.get(actual_best, "no data"),
+                            "Result": result,
+                        })
+                    return {"rows": rows, "strict_hits": strict_hits, "generous_hits": generous_hits, "graded": graded}
+
+                st.markdown("### Backtest This Method — Full Season")
+                st.caption(
+                    "Checks, for every real game this player played, whether the prop this "
+                    "method would've picked (using the season coverage splits vs that week's "
+                    "real opponent) actually was the best-performing prop that week (graded "
+                    "against the player's own real season average). "
+                    "⚠️ Real limitation, stated plainly: the coverage splits are season-aggregate, "
+                    "so a prediction for week 4 technically has access to data through week 18 - "
+                    "a real look-ahead bias. This tests whether the underlying signal correlates "
+                    "at all, not a clean pre-game prediction."
+                )
+                bt_col1, bt_col2 = st.columns(2)
+                with bt_col1:
+                    run_single = st.button("Run season backtest (current top-N)", type="secondary")
+                with bt_col2:
+                    run_sweep = st.button("Sweep top-N thresholds (find the best N)", type="secondary")
+
+                if run_single:
+                    try:
+                        st.session_state["_prop_backtest"] = _run_season_backtest(
+                            bundle, p_name, p_pos, verdict_alignment, verdict_weights,
+                            game_log_season, int(top_n_rank),
+                        )
+                    except Exception as e:
+                        st.session_state["_prop_backtest"] = {"error": f"Backtest failed: {e}"}
+
+                if run_sweep:
+                    try:
+                        candidates = [3, 5, 8, 10, 12, 15, 20, 25, 32]
+                        sweep_rows = []
+                        for n in candidates:
+                            result = _run_season_backtest(
+                                bundle, p_name, p_pos, verdict_alignment, verdict_weights,
+                                game_log_season, n,
+                            )
+                            if result.get("error"):
+                                st.session_state["_prop_sweep"] = {"error": result["error"]}
+                                break
+                            graded = result["graded"]
+                            sweep_rows.append({
+                                "Top-N": n,
+                                "Strict Hit Rate": f"{result['strict_hits']}/{graded} ({result['strict_hits']/graded*100:.0f}%)" if graded else "no data",
+                                "Including Near-Ties": f"{result['generous_hits']}/{graded} ({result['generous_hits']/graded*100:.0f}%)" if graded else "no data",
+                                "_strict_pct": (result['strict_hits'] / graded * 100) if graded else -1,
+                            })
+                        else:
+                            st.session_state["_prop_sweep"] = {"rows": sweep_rows}
+                    except Exception as e:
+                        st.session_state["_prop_sweep"] = {"error": f"Sweep failed: {e}"}
+
+                sweep = st.session_state.get("_prop_sweep")
+                if sweep:
+                    if sweep.get("error"):
+                        st.warning(sweep["error"])
+                    else:
+                        rows = sweep["rows"]
+                        best_row = max(rows, key=lambda r: r["_strict_pct"]) if any(r["_strict_pct"] >= 0 for r in rows) else None
+                        if best_row:
+                            st.markdown(
+                                f"**Best-performing threshold for {p_name} vs {game_log_season}: "
+                                f"top-{best_row['Top-N']}** (strict hit rate {best_row['Strict Hit Rate']}) — "
+                                f"current setting is top-{int(top_n_rank)}."
+                            )
+                        display_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
+                        st.dataframe(pd.DataFrame(display_rows), width='stretch')
+                        st.caption(
+                            "Read this as a rough signal, not a precise optimum - each threshold is graded "
+                            "on the SAME small set of real games for one player/season, so differences of a "
+                            "game or two easily swing the percentage. Worth re-running for a few different "
+                            "players before locking in a threshold across the whole tool."
+                        )
+
+                bt = st.session_state.get("_prop_backtest")
+                if bt:
+                    if bt.get("error"):
+                        st.warning(bt["error"])
+                    elif bt["graded"] == 0:
+                        st.info("No graded weeks - not enough real data to backtest this player/season.")
+                    else:
+                        sr = bt["strict_hits"] / bt["graded"] * 100
+                        gr = bt["generous_hits"] / bt["graded"] * 100
+                        st.markdown(
+                            f"**Strict hit rate:** {bt['strict_hits']}/{bt['graded']} ({sr:.0f}%) "
+                            f"&nbsp;&nbsp;|&nbsp;&nbsp; **Including near-ties:** {bt['generous_hits']}/{bt['graded']} ({gr:.0f}%)"
+                        )
+                        st.dataframe(pd.DataFrame(bt["rows"]), width='stretch')
 
                 st.divider()
                 st.markdown("### Real Weekly Game Log — Cross-Referenced Opponents")
@@ -1511,8 +1939,6 @@ elif mode == "Coverage Matchup (premium data)":
                             '</div>'
                         )
                         st.markdown(game_card_html, unsafe_allow_html=True)
-
-
 
 elif mode not in ("Draft Rankings", "Coverage Matchup (premium data)"):
     st.info("Click the button above to load this week's props.")
