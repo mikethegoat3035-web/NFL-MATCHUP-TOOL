@@ -11,8 +11,9 @@ import numpy as np
 from nfl_model_combined import (
     scan_full_slate_nfl, rescore_quality_mu_row_nfl, backtest_week, build_season_accuracy_report,
     diagnose_participation_data, get_player_matchup_explanation, diagnose_injuries_data,
-    diagnose_alignment_data, pull_player_stats, pull_schedules,
+    diagnose_alignment_data, pull_player_stats, pull_schedules, pull_pbp,
     build_coverage_crossref_game_log, diagnose_player_stats_for_game_log,
+    build_longest_play_by_game,
 )
 from draft_rankings import (
     build_yahoo_style_rankings, detect_risers, build_league_settings,
@@ -21,6 +22,10 @@ from draft_rankings import (
 from coverage_matchup import (
     load_full_dataset, get_matchup, TEAM_ABBREV_TO_FULL, COVERAGE_FIELDS,
     _same_team, check_alignment_fit, ALIGNMENT_RTE_COLUMNS, ALIGNMENTS,
+)
+from rb_matchup import (
+    load_full_rb_dataset, get_rb_matchup, CONCEPT_FILES as RB_CONCEPT_FILES,
+    CRUCIAL_RB_STATS,
 )
 
 st.set_page_config(page_title="Dallas Cowboys Matchup Tool", layout="wide", page_icon="⭐")
@@ -77,6 +82,22 @@ st.markdown(f"""
     [data-testid="stCaptionContainer"],
     [data-testid="stCaptionContainer"] p {{
         color: {COWBOYS_NAVY} !important;
+    }}
+    /* BUG FIX: the rule above (needed to fix white-on-white report text)
+       was ALSO forcing navy text inside text inputs/text areas - but
+       those widgets keep Streamlit's own dark input background, so navy
+       text on a dark background was nearly unreadable (this is the
+       "dark, hard to read" bug reported when typing multiple player
+       names into a text area). Inputs get their own explicit light
+       color here, scoped narrowly so it doesn't leak back into report
+       text. -webkit-text-fill-color covers a real Chrome/Safari quirk
+       where autofill/theme styling can override plain color. */
+    input, textarea,
+    .stTextArea textarea, .stTextInput input, .stNumberInput input,
+    [data-testid="stTextAreaContainer"] textarea,
+    [data-testid="stTextInputRootElement"] input {{
+        color: {COWBOYS_WHITE} !important;
+        -webkit-text-fill-color: {COWBOYS_WHITE} !important;
     }}
     /* Coverage Matchup - StatRankings CoverageIQ-style cards */
     .cov-card {{
@@ -402,6 +423,10 @@ if "coverage_bundle" not in st.session_state:
     st.session_state.coverage_bundle = None
 if "coverage_data_dir" not in st.session_state:
     st.session_state.coverage_data_dir = None
+if "rb_bundle" not in st.session_state:
+    st.session_state.rb_bundle = None
+if "rb_data_dir" not in st.session_state:
+    st.session_state.rb_data_dir = None
 
 if mode == "Draft Rankings":
     st.subheader("League Settings")
@@ -1349,6 +1374,17 @@ elif mode == "Coverage Matchup (premium data)":
         PROP_STAT_MAP = {"targets": "TGT", "receptions": "REC", "rec_yards": "YDS"}
         GAME_LOG_PROP_MAP = {"targets": "targets", "receptions": "receptions", "rec_yards": "receiving_yards"}
         PROP_LABELS = {"targets": "Targets", "receptions": "Receptions", "rec_yards": "Receiving Yards"}
+        # longest_catch deliberately NOT in GAME_LOG_PROP_MAP/PROP_STAT_MAP -
+        # the backtest compares predicted-best vs actual-best, and there's
+        # no CSV column to PREDICT longest catch from at all. Adding it to
+        # GAME_LOG_PROP_MAP would let it win "actual best" some weeks while
+        # the predicted side could never pick it - every one of those weeks
+        # would silently register as a false miss and drag the hit rate
+        # down for no real reason. Kept in its own map instead, used only
+        # by the real-line comparison below (which needs real mu/sigma,
+        # not a predicted-vs-actual comparison).
+        LINE_COMPARE_PROP_MAP = dict(GAME_LOG_PROP_MAP, longest_catch="longest_play")
+        LINE_COMPARE_PROP_LABELS = dict(PROP_LABELS, longest_catch="Longest Catch")
 
         def _actual_best_prop(tiers: dict):
             """Same argmax-with-ties logic as _predict_best_prop, applied to a
@@ -1601,6 +1637,7 @@ elif mode == "Coverage Matchup (premium data)":
                     try:
                         pstats = pull_player_stats([int(game_log_season)])
                         sched = pull_schedules([int(game_log_season)])
+                        pbp = pull_pbp([int(game_log_season)])
                         matches = pstats[pstats["position"].astype(str).str.upper() == position.upper()]
                         name_col = "player_display_name" if "player_display_name" in pstats.columns else (
                             "player_name" if "player_name" in pstats.columns else None)
@@ -1620,7 +1657,7 @@ elif mode == "Coverage Matchup (premium data)":
                         else:
                             log = build_coverage_crossref_game_log(
                                 target_gsis, position, cross_team_abbrevs, pstats, sched,
-                                seasons=[int(game_log_season)],
+                                seasons=[int(game_log_season)], pbp_df=pbp,
                             )
                             st.session_state["_crossref_game_log"] = {
                                 "log": log, "cross_teams": sorted(cross_team_abbrevs),
@@ -1847,6 +1884,104 @@ elif mode == "Coverage Matchup (premium data)":
                     "anywhere in the pipeline. Only targets/receptions/rec yards, which are."
                 )
 
+                st.markdown("### Compare to a Real Line")
+                st.caption(
+                    "Once real lines exist (week 1+), enter them here. mu/sigma come from this "
+                    "player's REAL game log this season (same nflreadpy data as the backtest, "
+                    "not the season-aggregate coverage CSVs - those have no per-game numbers to "
+                    "compare a line against). Uses the exact same rescore_quality_mu_row_nfl "
+                    "function Scan mode uses, so edge/p_over here means the same thing it does "
+                    "there. Early in the season, current-season games are thin - mu/sigma still "
+                    "compute as soon as 2+ real games exist, but treat single-digit-game sigma "
+                    "as rough until more of the season is in."
+                )
+
+                def _get_player_mu_sigma(bundle, gsis_id, position, stat_col, pstats, sched, season, pbp=None):
+                    all_abbrevs = set(TEAM_ABBREV_TO_FULL.keys())
+                    log = build_coverage_crossref_game_log(
+                        gsis_id, position, all_abbrevs, pstats, sched, seasons=[season],
+                        max_games=25, pbp_df=pbp,
+                    )
+                    vals = [g["stats"].get(stat_col) for g in log if stat_col in g.get("stats", {})]
+                    vals = [v for v in vals if v is not None]
+                    if len(vals) < 2:
+                        return None, None, len(vals)
+                    mu = float(np.mean(vals))
+                    sigma = float(np.std(vals))
+                    if sigma == 0:
+                        sigma = max(mu * 0.15, 1.0)
+                    return mu, sigma, len(vals)
+
+                line_col1, line_col2, line_col3, line_col4 = st.columns(4)
+                with line_col1:
+                    tgt_line = st.number_input("Targets line", min_value=0.0, value=0.0, step=0.5, key="tgt_line")
+                with line_col2:
+                    rec_line = st.number_input("Receptions line", min_value=0.0, value=0.0, step=0.5, key="rec_line")
+                with line_col3:
+                    yds_line = st.number_input("Rec Yards line", min_value=0.0, value=0.0, step=0.5, key="yds_line")
+                with line_col4:
+                    lng_line = st.number_input("Longest Catch line", min_value=0.0, value=0.0, step=0.5, key="lng_catch_line")
+
+                if st.button("Check value vs these lines", type="secondary"):
+                    try:
+                        lc_pstats = pull_player_stats([int(game_log_season)])
+                        lc_sched = pull_schedules([int(game_log_season)])
+                        lc_pbp = pull_pbp([int(game_log_season)])
+                        lc_matches = lc_pstats[lc_pstats["position"].astype(str).str.upper() == p_pos.upper()]
+                        lc_name_col = "player_display_name" if "player_display_name" in lc_pstats.columns else (
+                            "player_name" if "player_name" in lc_pstats.columns else None)
+                        lc_gsis = None
+                        if lc_name_col:
+                            lc_hit = lc_matches[lc_matches[lc_name_col].astype(str).str.lower() == p_name.lower()]
+                            if not lc_hit.empty:
+                                lc_gsis = lc_hit.iloc[0]["gsis_id"]
+                        if lc_gsis is None:
+                            st.session_state["_line_compare"] = {
+                                "error": f"Couldn't match '{p_name}' to a real nflreadpy record for {game_log_season}."}
+                        else:
+                            lines = {"targets": tgt_line, "receptions": rec_line, "rec_yards": yds_line,
+                                     "longest_catch": lng_line}
+                            rows = []
+                            for prop, line_val in lines.items():
+                                if not line_val:
+                                    continue
+                                stat_col = LINE_COMPARE_PROP_MAP[prop]
+                                mu, sigma, n_games = _get_player_mu_sigma(
+                                    bundle, lc_gsis, p_pos, stat_col, lc_pstats, lc_sched,
+                                    int(game_log_season), pbp=lc_pbp,
+                                )
+                                if mu is None:
+                                    rows.append({"Prop": LINE_COMPARE_PROP_LABELS[prop], "Line": line_val,
+                                                 "mu": "no data", "sigma": "-", "Games": n_games,
+                                                 "p(Over)": "-", "Edge": "-"})
+                                    continue
+                                scored = rescore_quality_mu_row_nfl(mu, line_val, sigma)
+                                rows.append({
+                                    "Prop": LINE_COMPARE_PROP_LABELS[prop], "Line": line_val,
+                                    "mu": round(mu, 1), "sigma": round(sigma, 1), "Games": n_games,
+                                    "p(Over)": scored["p_over"], "Edge": scored["edge"],
+                                })
+                            st.session_state["_line_compare"] = {"rows": rows}
+                    except Exception as e:
+                        st.session_state["_line_compare"] = {"error": f"Line check failed: {e}"}
+
+                lc = st.session_state.get("_line_compare")
+                if lc:
+                    if lc.get("error"):
+                        st.warning(lc["error"])
+                    elif not lc.get("rows"):
+                        st.info("Enter at least one line above, then click the button.")
+                    else:
+                        st.dataframe(pd.DataFrame(lc["rows"]), width='stretch')
+                        st.caption(
+                            "Edge is 0 (coinflip) to 1 (max conviction) - same scale as Scan mode. "
+                            "mu/sigma here are the player's own real game-log average/spread this "
+                            "season, NOT adjusted for which specific coverages this week's opponent "
+                            "runs - that's what the coverage cards above are for. Read the two "
+                            "together: a real edge on the line PLUS a favorable coverage matchup "
+                            "above is a stronger case than either alone."
+                        )
+
                 st.divider()
                 def _run_season_backtest(bundle, p_name, p_pos, verdict_alignment, verdict_weights,
                                            game_log_season, top_n):
@@ -1857,6 +1992,7 @@ elif mode == "Coverage Matchup (premium data)":
                     meaningless."""
                     bt_pstats = pull_player_stats([int(game_log_season)])
                     bt_sched = pull_schedules([int(game_log_season)])
+                    bt_pbp = pull_pbp([int(game_log_season)])
                     bt_matches = bt_pstats[bt_pstats["position"].astype(str).str.upper() == p_pos.upper()]
                     bt_name_col = "player_display_name" if "player_display_name" in bt_pstats.columns else (
                         "player_name" if "player_name" in bt_pstats.columns else None)
@@ -1871,7 +2007,7 @@ elif mode == "Coverage Matchup (premium data)":
                     all_abbrevs = set(TEAM_ABBREV_TO_FULL.keys())
                     full_log = build_coverage_crossref_game_log(
                         bt_gsis, p_pos, all_abbrevs, bt_pstats, bt_sched,
-                        seasons=[int(game_log_season)], max_games=25,
+                        seasons=[int(game_log_season)], max_games=25, pbp_df=bt_pbp,
                     )
                     rows, strict_hits, generous_hits, graded = [], 0, 0, 0
                     for g in full_log:
@@ -1903,112 +2039,32 @@ elif mode == "Coverage Matchup (premium data)":
 
                 st.markdown("### Backtest This Method — Full Season")
                 st.caption(
-                    "Checks, for every real game this player played, whether the prop this "
-                    "method would've picked (using the season coverage splits vs that week's "
-                    "real opponent) actually was the best-performing prop that week (graded "
-                    "against the player's own real season average). "
+                    "Checks, for every real game entered player(s) played, whether the prop this "
+                    "method would've picked (using the season coverage splits vs that week's real "
+                    "opponent) actually was the best-performing prop that week. Works for one "
+                    "player or several - enter multiple names for an aggregate verdict instead of "
+                    "trusting one player's noisy ~19-game sample. "
                     "⚠️ Real limitation, stated plainly: the coverage splits are season-aggregate, "
                     "so a prediction for week 4 technically has access to data through week 18 - "
                     "a real look-ahead bias. This tests whether the underlying signal correlates "
-                    "at all, not a clean pre-game prediction."
+                    "at all, not a clean pre-game prediction. There are 3 real prop options "
+                    "(targets/receptions/rec yards), so random guessing lands around 33% strict."
                 )
-                bt_col1, bt_col2 = st.columns(2)
-                with bt_col1:
-                    run_single = st.button("Run season backtest (current top-N)", type="secondary")
-                with bt_col2:
-                    run_sweep = st.button("Sweep top-N thresholds (find the best N)", type="secondary")
-
-                if run_single:
-                    try:
-                        st.session_state["_prop_backtest"] = _run_season_backtest(
-                            bundle, p_name, p_pos, verdict_alignment, verdict_weights,
-                            game_log_season, int(top_n_rank),
-                        )
-                    except Exception as e:
-                        st.session_state["_prop_backtest"] = {"error": f"Backtest failed: {e}"}
-
-                if run_sweep:
-                    try:
-                        candidates = [3, 5, 8, 10, 12, 15, 20, 25, 32]
-                        sweep_rows = []
-                        for n in candidates:
-                            result = _run_season_backtest(
-                                bundle, p_name, p_pos, verdict_alignment, verdict_weights,
-                                game_log_season, n,
-                            )
-                            if result.get("error"):
-                                st.session_state["_prop_sweep"] = {"error": result["error"]}
-                                break
-                            graded = result["graded"]
-                            sweep_rows.append({
-                                "Top-N": n,
-                                "Strict Hit Rate": f"{result['strict_hits']}/{graded} ({result['strict_hits']/graded*100:.0f}%)" if graded else "no data",
-                                "Including Near-Ties": f"{result['generous_hits']}/{graded} ({result['generous_hits']/graded*100:.0f}%)" if graded else "no data",
-                                "_strict_pct": (result['strict_hits'] / graded * 100) if graded else -1,
-                            })
-                        else:
-                            st.session_state["_prop_sweep"] = {"rows": sweep_rows}
-                    except Exception as e:
-                        st.session_state["_prop_sweep"] = {"error": f"Sweep failed: {e}"}
-
-                sweep = st.session_state.get("_prop_sweep")
-                if sweep:
-                    if sweep.get("error"):
-                        st.warning(sweep["error"])
-                    else:
-                        rows = sweep["rows"]
-                        best_row = max(rows, key=lambda r: r["_strict_pct"]) if any(r["_strict_pct"] >= 0 for r in rows) else None
-                        if best_row:
-                            st.markdown(
-                                f"**Best-performing threshold for {p_name} vs {game_log_season}: "
-                                f"top-{best_row['Top-N']}** (strict hit rate {best_row['Strict Hit Rate']}) — "
-                                f"current setting is top-{int(top_n_rank)}."
-                            )
-                        display_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows]
-                        st.dataframe(pd.DataFrame(display_rows), width='stretch')
-                        st.caption(
-                            "Read this as a rough signal, not a precise optimum - each threshold is graded "
-                            "on the SAME small set of real games for one player/season, so differences of a "
-                            "game or two easily swing the percentage. Worth re-running for a few different "
-                            "players before locking in a threshold across the whole tool."
-                        )
-
-                bt = st.session_state.get("_prop_backtest")
-                if bt:
-                    if bt.get("error"):
-                        st.warning(bt["error"])
-                    elif bt["graded"] == 0:
-                        st.info("No graded weeks - not enough real data to backtest this player/season.")
-                    else:
-                        sr = bt["strict_hits"] / bt["graded"] * 100
-                        gr = bt["generous_hits"] / bt["graded"] * 100
-                        st.markdown(
-                            f"**Strict hit rate:** {bt['strict_hits']}/{bt['graded']} ({sr:.0f}%) "
-                            f"&nbsp;&nbsp;|&nbsp;&nbsp; **Including near-ties:** {bt['generous_hits']}/{bt['graded']} ({gr:.0f}%)"
-                        )
-                        st.dataframe(pd.DataFrame(bt["rows"]), width='stretch')
-
-                st.divider()
-                st.markdown("### Batch Backtest — Multiple Players (aggregate verdict)")
-                st.caption(
-                    "One player's ~19 games is a small, noisy sample - this runs the exact same "
-                    "method across several players at once and gives ONE aggregate hit rate, a "
-                    "far more honest read on whether it's ready. All players tested share the "
-                    "position selected above. There are 3 real prop options (targets/receptions/"
-                    "rec yards), so pure random guessing lands around 33% strict - meaningfully "
-                    "above that across multiple players is a real signal; near 33% means the "
-                    "method isn't adding much yet."
+                bt_names_raw = st.text_area(
+                    "Player name(s), one per line (exact, as they appear in the export)",
+                    value=p_name if p_name else "", height=80,
                 )
-                batch_names_raw = st.text_area(
-                    "Player names, one per line (exact, as they appear in the export)",
-                    value="", height=100,
+                bt_sweep_check = st.checkbox(
+                    "Also sweep top-N thresholds (aggregate across all entered players above)",
+                    value=False,
                 )
-                if st.button("Run batch backtest", type="secondary"):
-                    names = [n.strip() for n in batch_names_raw.splitlines() if n.strip()]
+
+                if st.button("Run Backtest", type="primary"):
+                    names = [n.strip() for n in bt_names_raw.splitlines() if n.strip()]
                     if not names:
                         st.warning("Enter at least one player name.")
                     else:
-                        batch_rows, errors = [], []
+                        per_player_rows, per_player_detail, errors = [], {}, []
                         total_strict = total_generous = total_graded = 0
                         for nm in names:
                             nm_weights = _get_real_alignment_weights(bundle, nm) if (use_auto_weight and p_pos != "QB") else None
@@ -2028,33 +2084,83 @@ elif mode == "Coverage Matchup (premium data)":
                             total_strict += result["strict_hits"]
                             total_generous += result["generous_hits"]
                             total_graded += g
-                            batch_rows.append({
+                            per_player_rows.append({
                                 "Player": nm, "Graded Games": g,
                                 "Strict Hit Rate": f"{result['strict_hits']}/{g} ({result['strict_hits']/g*100:.0f}%)" if g else "no data",
                                 "Including Near-Ties": f"{result['generous_hits']}/{g} ({result['generous_hits']/g*100:.0f}%)" if g else "no data",
                             })
-                        st.session_state["_prop_batch_backtest"] = {
-                            "rows": batch_rows, "errors": errors,
+                            per_player_detail[nm] = result["rows"]
+
+                        sweep_rows = None
+                        if bt_sweep_check and names:
+                            candidates = [3, 5, 8, 10, 12, 15, 20, 25, 32]
+                            sweep_rows = []
+                            for n in candidates:
+                                agg_strict = agg_generous = agg_graded = 0
+                                for nm in names:
+                                    nm_weights = _get_real_alignment_weights(bundle, nm) if (use_auto_weight and p_pos != "QB") else None
+                                    nm_alignment = None if use_auto_weight else align
+                                    try:
+                                        r = _run_season_backtest(bundle, nm, p_pos, nm_alignment, nm_weights, game_log_season, n)
+                                    except Exception:
+                                        continue
+                                    if r.get("error"):
+                                        continue
+                                    agg_strict += r["strict_hits"]
+                                    agg_generous += r["generous_hits"]
+                                    agg_graded += r["graded"]
+                                sweep_rows.append({
+                                    "Top-N": n,
+                                    "Strict Hit Rate": f"{agg_strict}/{agg_graded} ({agg_strict/agg_graded*100:.0f}%)" if agg_graded else "no data",
+                                    "Including Near-Ties": f"{agg_generous}/{agg_graded} ({agg_generous/agg_graded*100:.0f}%)" if agg_graded else "no data",
+                                    "_strict_pct": (agg_strict / agg_graded * 100) if agg_graded else -1,
+                                })
+
+                        st.session_state["_unified_backtest"] = {
+                            "rows": per_player_rows, "detail": per_player_detail, "errors": errors,
                             "total_strict": total_strict, "total_generous": total_generous,
-                            "total_graded": total_graded,
+                            "total_graded": total_graded, "sweep_rows": sweep_rows,
                         }
 
-                batch = st.session_state.get("_prop_batch_backtest")
-                if batch:
-                    for e in batch["errors"]:
+                ubt = st.session_state.get("_unified_backtest")
+                if ubt:
+                    for e in ubt["errors"]:
                         st.warning(e)
-                    if batch["total_graded"] == 0:
+                    if ubt["total_graded"] == 0:
                         st.info("No graded games across any tested player.")
                     else:
-                        osr = batch["total_strict"] / batch["total_graded"] * 100
-                        ogr = batch["total_generous"] / batch["total_graded"] * 100
+                        osr = ubt["total_strict"] / ubt["total_graded"] * 100
+                        ogr = ubt["total_generous"] / ubt["total_graded"] * 100
                         st.markdown(
-                            f"**Overall across {len(batch['rows'])} player(s), {batch['total_graded']} "
-                            f"real games — strict hit rate: {batch['total_strict']}/{batch['total_graded']} "
-                            f"({osr:.0f}%)** &nbsp;&nbsp;|&nbsp;&nbsp; including near-ties: "
-                            f"{batch['total_generous']}/{batch['total_graded']} ({ogr:.0f}%)"
+                            f"**Overall across {len(ubt['rows'])} player(s), {ubt['total_graded']} real "
+                            f"games — strict hit rate: {ubt['total_strict']}/{ubt['total_graded']} ({osr:.0f}%)** "
+                            f"&nbsp;&nbsp;|&nbsp;&nbsp; including near-ties: {ubt['total_generous']}/{ubt['total_graded']} "
+                            f"({ogr:.0f}%) &nbsp;&nbsp;(random baseline: ~33%)"
                         )
-                        st.dataframe(pd.DataFrame(batch["rows"]), width='stretch')
+                        st.dataframe(pd.DataFrame(ubt["rows"]), width='stretch')
+
+                        if ubt["rows"]:
+                            detail_pick = st.selectbox(
+                                "Show week-by-week detail for:", [r["Player"] for r in ubt["rows"]],
+                                key="bt_detail_pick",
+                            )
+                            if detail_pick and ubt["detail"].get(detail_pick):
+                                with st.expander(f"Week-by-week — {detail_pick}"):
+                                    st.dataframe(pd.DataFrame(ubt["detail"][detail_pick]), width='stretch')
+
+                    if ubt.get("sweep_rows"):
+                        st.markdown("**Threshold sweep** (aggregate across all entered players):")
+                        rows_s = ubt["sweep_rows"]
+                        best_row = max(rows_s, key=lambda r: r["_strict_pct"]) if any(r["_strict_pct"] >= 0 for r in rows_s) else None
+                        if best_row:
+                            st.caption(
+                                f"Best-performing threshold: top-{best_row['Top-N']} "
+                                f"(strict hit rate {best_row['Strict Hit Rate']}) — current setting is top-{int(top_n_rank)}. "
+                                f"Rough signal, not a precise optimum - small real sample, differences of a game or "
+                                f"two easily swing the percentage."
+                            )
+                        display_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows_s]
+                        st.dataframe(pd.DataFrame(display_rows), width='stretch')
 
                 st.divider()
                 st.markdown("### Real Weekly Game Log — Cross-Referenced Opponents")
@@ -2103,6 +2209,484 @@ elif mode == "Coverage Matchup (premium data)":
                             '</div>'
                         )
                         st.markdown(game_card_html, unsafe_allow_html=True)
+
+                if p_pos == "RB":
+                    st.divider()
+                    st.markdown("### RB Run Concept Matchup")
+                    st.caption(
+                        "Separate premium dataset (FantasyPoints run-concept exports), not the "
+                        "coverage CSVs above. All 6 real concepts always show - unlike coverage, "
+                        "run concept is called by the OFFENSE, so ranking defenses by how often "
+                        "they FACE a concept doesn't mean anything; the defense-allowed Quality "
+                        "Score on each card IS the signal here. No 'longest rush' column exists "
+                        "in this data - same real gap as longest catch, not guessed at."
+                    )
+
+                    def _rb_stat_block_html(row, tiers_source):
+                        """RB rushing has its own real crucial-stat set (ATT/
+                        YDS/YPC/Success%/MTF/ATT/YACO/ATT/TD) - NOT the same
+                        as CURATED_STATS above, which is keyed for the
+                        coverage-side receiving columns (TGT/REC/CR%) that
+                        don't exist in this rushing data at all."""
+                        curated = tuple(CRUCIAL_RB_STATS)
+                        curated_html = _stat_rows_html(row, tiers_source, keys=curated)
+                        remaining = [k for k in tiers_source if k not in curated]
+                        if not remaining:
+                            return curated_html
+                        more_html = _stat_rows_html(row, tiers_source, keys=remaining)
+                        return (
+                            curated_html
+                            + f'<details class="cov-more"><summary>+{len(remaining)} more stats</summary>{more_html}</details>'
+                        )
+
+                    rb_dir_col1, rb_dir_col2 = st.columns(2)
+                    with rb_dir_col1:
+                        rb_player_dir = st.text_input(
+                            "RB player-side data folder", value=st.session_state.rb_data_dir or "rb_data",
+                        )
+                    with rb_dir_col2:
+                        rb_def_dir = st.text_input(
+                            "RB defense-allowed data folder (must differ from above - same "
+                            "filenames, different content)",
+                            value=(st.session_state.rb_data_dir + "/defense") if st.session_state.rb_data_dir else "rb_data/defense",
+                        )
+                    if st.button("Load RB run-concept dataset", type="primary"):
+                        with st.spinner("Loading all 6 run concepts, both sides..."):
+                            try:
+                                st.session_state.rb_bundle = load_full_rb_dataset(
+                                    player_dir=rb_player_dir, def_dir=rb_def_dir,
+                                )
+                                st.session_state.rb_data_dir = rb_player_dir
+                                n_missing = len(st.session_state.rb_bundle.missing)
+                                if n_missing:
+                                    st.warning(f"Loaded with {n_missing} file(s) missing - see details below.")
+                                else:
+                                    st.success("Loaded all 12 files (6 concepts x 2 sides) - dataset complete.")
+                            except Exception as e:
+                                st.error(f"Failed to load RB dataset: {e}")
+                                st.session_state.rb_bundle = None
+
+                    rb_bundle = st.session_state.rb_bundle
+                    if rb_bundle is not None and rb_bundle.missing:
+                        with st.expander(f"{len(rb_bundle.missing)} file(s) not found"):
+                            st.write(rb_bundle.missing)
+
+                    if rb_bundle is None:
+                        st.info("Load the RB dataset above to see the run-concept matchup.")
+                    else:
+                        rb_report = get_rb_matchup(rb_bundle, p_name, opp, rb_team_name=player_team.strip() or None)
+                        if "error" in rb_report[0]:
+                            st.error(rb_report[0]["error"])
+                        elif "note" in rb_report[0]:
+                            st.info(rb_report[0]["note"])
+                        else:
+                            for entry in rb_report:
+                                own_row = entry["own_row"]
+                                def_row = entry["defense_allows"]
+                                own_qs = (_quality_score(own_row.get("_tiers", {}), position="RB",
+                                                          thin_sample=own_row.get("_thin_sample", False))
+                                          if own_row is not None else None)
+                                own_qs_badge = (
+                                    f'<span class="tier-badge {_score_badge_class(own_qs)}">Own Quality {own_qs:.0f}'
+                                    f'{" ~" if own_row and own_row.get("_thin_sample") else ""}</span>'
+                                    if own_qs is not None else ""
+                                )
+                                def_qs = (_quality_score(def_row.get("_tiers", {}), position="RB",
+                                                          thin_sample=def_row.get("_thin_sample", False))
+                                          if def_row is not None else None)
+                                def_qs_badge = (
+                                    f'<span class="tier-badge {_score_badge_class(def_qs)}">Def Allows {def_qs:.0f}'
+                                    f'{" ~" if def_row and def_row.get("_thin_sample") else ""}</span>'
+                                    if def_qs is not None else ""
+                                )
+                                if own_row is None:
+                                    own_col_html = f'<div class="cov-no-data">{p_name}: no recorded attempts on this concept.</div>'
+                                else:
+                                    thin = '<span class="cov-thin-flag">THIN SAMPLE</span>' if entry["own_confidence"] == "thin_sample" else ""
+                                    own_col_html = (
+                                        f'<div class="cov-col-title">{p_name} — {own_row["_att"]} ATT{thin}</div>'
+                                        + _rb_stat_block_html(own_row, own_row.get("_tiers", {}))
+                                    )
+                                if def_row is None:
+                                    def_col_html = f'<div class="cov-no-data">{opp}: no defense-allowed data on this concept.</div>'
+                                else:
+                                    thin = '<span class="cov-thin-flag">THIN SAMPLE</span>' if entry["defense_confidence"] == "thin_sample" else ""
+                                    def_col_html = (
+                                        f'<div class="cov-col-title">{opp} allows — {def_row["_att"]} ATT{thin}</div>'
+                                        + _rb_stat_block_html(def_row, def_row.get("_tiers", {}))
+                                    )
+                                rb_card_html = (
+                                    '<div class="cov-card">'
+                                    f'<div class="cov-card-header">{entry["concept"]}{own_qs_badge}{def_qs_badge}</div>'
+                                    '<div class="cov-grid">'
+                                    f'<div class="cov-col">{own_col_html}</div>'
+                                    f'<div class="cov-col">{def_col_html}</div>'
+                                    '</div></div>'
+                                )
+                                st.markdown(rb_card_html, unsafe_allow_html=True)
+
+                            st.divider()
+                            st.markdown("### Best Prop Verdict (Rush Attempts vs Rush Yards)")
+                            RB_PROP_LABELS = {"rush_attempts": "Rush Attempts", "rush_yards": "Rush Yards"}
+                            RB_PROP_STAT_MAP = {"rush_attempts": "ATT", "rush_yards": "YDS"}
+
+                            def _predict_best_rb_prop(rb_bundle, rb_name, opponent_team_full):
+                                """Blends BOTH the RB's own tier AND the opponent's
+                                defense-allowed tier per concept (50/50 when both
+                                exist) - NOT just the RB's own tendency. An
+                                earlier version of this only used his own side,
+                                which meant the verdict never actually changed
+                                based on who he was facing - the exact flaw
+                                already caught in the WR backtest (Jefferson
+                                predicting "Targets" every single week). Weighted
+                                by his real attempt share per concept either way."""
+                                rb_own_atts = {
+                                    c: (rb_bundle.rb_vs_concept.get(c, {}).get(rb_name, {}) or {}).get("_att", 0)
+                                    for c in RB_CONCEPT_FILES
+                                }
+                                total_att = sum(rb_own_atts.values())
+                                weights = {c: (a / total_att) for c, a in rb_own_atts.items() if total_att and a > 0}
+                                if not weights:
+                                    return None
+                                scores = {}
+                                for prop, stat_col in RB_PROP_STAT_MAP.items():
+                                    weighted_vals = []
+                                    for concept, w in weights.items():
+                                        own_row = rb_bundle.rb_vs_concept.get(concept, {}).get(rb_name)
+                                        own_tier = own_row.get("_tiers", {}).get(stat_col) if own_row else None
+                                        def_row = (rb_bundle.def_allowed.get(concept, {}).get(opponent_team_full)
+                                                   if opponent_team_full else None)
+                                        def_tier = def_row.get("_tiers", {}).get(stat_col) if def_row else None
+                                        own_w = TIER_WEIGHTS.get(own_tier)
+                                        def_w = TIER_WEIGHTS.get(def_tier)
+                                        if own_w is None and def_w is None:
+                                            continue
+                                        blended = (0.5 * own_w + 0.5 * def_w) if (own_w is not None and def_w is not None) \
+                                            else (own_w if own_w is not None else def_w)
+                                        weighted_vals.append((w, blended))
+                                    total_w = sum(w for w, _ in weighted_vals)
+                                    scores[prop] = round(sum(w * s for w, s in weighted_vals) / total_w, 1) if total_w else None
+                                valid = {p: s for p, s in scores.items() if s is not None}
+                                if not valid:
+                                    return {"scores": scores, "best": None, "ties": []}
+                                best = max(valid, key=valid.get)
+                                ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
+                                return {"scores": scores, "best": best, "ties": ties}
+
+                            rb_verdict = _predict_best_rb_prop(rb_bundle, p_name, opp)
+                            if rb_verdict is None or rb_verdict["best"] is None:
+                                st.info("Not enough real attempt volume across these concepts to determine a best prop.")
+                            else:
+                                rb_scores = rb_verdict["scores"]
+                                rb_best = rb_verdict["best"]
+                                rb_ties = rb_verdict["ties"]
+                                rb_tie_note = f" (essentially tied with {', '.join(RB_PROP_LABELS[t] for t in rb_ties)})" if rb_ties else ""
+                                rb_verdict_rows_html = "".join(
+                                    f'<div class="stat-row"><span class="stat-label">{RB_PROP_LABELS[p]}</span>'
+                                    f'<span class="stat-value">{rb_scores[p] if rb_scores[p] is not None else "no data"}'
+                                    f'<span class="tier-badge {_score_badge_class(rb_scores[p])}">'
+                                    f'{"BEST" if p == rb_best else ("TIE" if p in rb_ties else "")}</span></span></div>'
+                                    for p in RB_PROP_LABELS
+                                )
+                                rb_verdict_html = (
+                                    '<div class="cov-card">'
+                                    f'<div class="cov-card-header">Best Prop: {RB_PROP_LABELS[rb_best]}{rb_tie_note}</div>'
+                                    f'<div class="cov-card-usage">Blended across all 6 real concepts (his own tier + '
+                                    f'{opp}\'s defense-allowed tier, 50/50), weighted by {p_name}\'s real attempt '
+                                    f'share in each concept</div>'
+                                    f'<div class="cov-col">{rb_verdict_rows_html}</div>'
+                                    '</div>'
+                                )
+                                st.markdown(rb_verdict_html, unsafe_allow_html=True)
+                            st.caption(
+                                "TD isn't included yet - not a confirmed column in the real "
+                                "game-log pipeline. Longest rush IS now real (see the line "
+                                "comparison below) but isn't part of THIS verdict - there's no "
+                                "season-aggregate column for it in the concept CSVs to predict "
+                                "from, only real per-game data to compare a line against."
+                            )
+
+                            st.divider()
+                            st.markdown("### Compare to a Real Line (RB)")
+                            st.caption(
+                                "Same real mu/sigma-from-game-log approach as the WR line "
+                                "comparison. Longest Rush is real here (computed from real "
+                                "play-by-play, not guessed) even though it can't be part of the "
+                                "verdict above."
+                            )
+                            RB_LINE_PROP_MAP = {"rush_attempts": "carries", "rush_yards": "rushing_yards",
+                                                 "longest_rush": "longest_play"}
+                            RB_LINE_PROP_LABELS = {"rush_attempts": "Rush Attempts", "rush_yards": "Rush Yards",
+                                                    "longest_rush": "Longest Rush"}
+                            rb_line_col1, rb_line_col2, rb_line_col3 = st.columns(3)
+                            with rb_line_col1:
+                                rb_att_line = st.number_input("Rush Attempts line", min_value=0.0, value=0.0, step=0.5, key="rb_att_line")
+                            with rb_line_col2:
+                                rb_yds_line = st.number_input("Rush Yards line", min_value=0.0, value=0.0, step=0.5, key="rb_yds_line")
+                            with rb_line_col3:
+                                rb_lng_line = st.number_input("Longest Rush line", min_value=0.0, value=0.0, step=0.5, key="rb_lng_line")
+
+                            if st.button("Check RB value vs these lines", type="secondary"):
+                                try:
+                                    rbl_pstats = pull_player_stats([int(game_log_season)])
+                                    rbl_sched = pull_schedules([int(game_log_season)])
+                                    rbl_pbp = pull_pbp([int(game_log_season)])
+                                    rbl_matches = rbl_pstats[rbl_pstats["position"].astype(str).str.upper() == "RB"]
+                                    rbl_name_col = "player_display_name" if "player_display_name" in rbl_pstats.columns else (
+                                        "player_name" if "player_name" in rbl_pstats.columns else None)
+                                    rbl_gsis = None
+                                    if rbl_name_col:
+                                        rbl_hit = rbl_matches[rbl_matches[rbl_name_col].astype(str).str.lower() == p_name.lower()]
+                                        if not rbl_hit.empty:
+                                            rbl_gsis = rbl_hit.iloc[0]["gsis_id"]
+                                    if rbl_gsis is None:
+                                        st.session_state["_rb_line_compare"] = {
+                                            "error": f"Couldn't match '{p_name}' to a real nflreadpy record for {game_log_season}."}
+                                    else:
+                                        rb_lines = {"rush_attempts": rb_att_line, "rush_yards": rb_yds_line,
+                                                    "longest_rush": rb_lng_line}
+                                        rb_line_rows = []
+                                        for prop, line_val in rb_lines.items():
+                                            if not line_val:
+                                                continue
+                                            stat_col = RB_LINE_PROP_MAP[prop]
+                                            mu, sigma, n_games = _get_player_mu_sigma(
+                                                rb_bundle, rbl_gsis, "RB", stat_col, rbl_pstats, rbl_sched,
+                                                int(game_log_season), pbp=rbl_pbp,
+                                            )
+                                            if mu is None:
+                                                rb_line_rows.append({"Prop": RB_LINE_PROP_LABELS[prop], "Line": line_val,
+                                                                      "mu": "no data", "sigma": "-", "Games": n_games,
+                                                                      "p(Over)": "-", "Edge": "-"})
+                                                continue
+                                            scored = rescore_quality_mu_row_nfl(mu, line_val, sigma)
+                                            rb_line_rows.append({
+                                                "Prop": RB_LINE_PROP_LABELS[prop], "Line": line_val,
+                                                "mu": round(mu, 1), "sigma": round(sigma, 1), "Games": n_games,
+                                                "p(Over)": scored["p_over"], "Edge": scored["edge"],
+                                            })
+                                        st.session_state["_rb_line_compare"] = {"rows": rb_line_rows}
+                                except Exception as e:
+                                    st.session_state["_rb_line_compare"] = {"error": f"Line check failed: {e}"}
+
+                            rbl = st.session_state.get("_rb_line_compare")
+                            if rbl:
+                                if rbl.get("error"):
+                                    st.warning(rbl["error"])
+                                elif not rbl.get("rows"):
+                                    st.info("Enter at least one line above, then click the button.")
+                                else:
+                                    st.dataframe(pd.DataFrame(rbl["rows"]), width='stretch')
+
+                            st.divider()
+                            st.markdown("### Backtest This Method — Full Season (RB)")
+                            st.caption(
+                                "Same real backtest as the WR side: for every real game this RB "
+                                "played, checks whether Rush Attempts or Rush Yards (whichever the "
+                                "verdict above would've picked, using that week's REAL opponent) "
+                                "actually was the better-performing prop that week."
+                            )
+                            RB_GAME_LOG_PROP_MAP = {"rush_attempts": "carries", "rush_yards": "rushing_yards"}
+
+                            def _actual_best_rb_prop(tiers):
+                                valid = {p: TIER_WEIGHTS[tiers[c]] for p, c in RB_GAME_LOG_PROP_MAP.items()
+                                         if c in tiers and tiers[c] in TIER_WEIGHTS}
+                                if not valid:
+                                    return None, []
+                                best = max(valid, key=valid.get)
+                                ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
+                                return best, ties
+
+                            if st.button("Run RB season backtest", type="secondary"):
+                                try:
+                                    rbt_pstats = pull_player_stats([int(game_log_season)])
+                                    rbt_sched = pull_schedules([int(game_log_season)])
+                                    rbt_matches = rbt_pstats[rbt_pstats["position"].astype(str).str.upper() == "RB"]
+                                    rbt_name_col = "player_display_name" if "player_display_name" in rbt_pstats.columns else (
+                                        "player_name" if "player_name" in rbt_pstats.columns else None)
+                                    rbt_gsis = None
+                                    if rbt_name_col:
+                                        rbt_hit = rbt_matches[rbt_matches[rbt_name_col].astype(str).str.lower() == p_name.lower()]
+                                        if not rbt_hit.empty:
+                                            rbt_gsis = rbt_hit.iloc[0]["gsis_id"]
+                                    if rbt_gsis is None:
+                                        st.session_state["_rb_backtest"] = {
+                                            "error": f"Couldn't match '{p_name}' to a real nflreadpy record for {game_log_season}."}
+                                    else:
+                                        all_abbrevs = set(TEAM_ABBREV_TO_FULL.keys())
+                                        rbt_log = build_coverage_crossref_game_log(
+                                            rbt_gsis, "RB", all_abbrevs, rbt_pstats, rbt_sched,
+                                            seasons=[int(game_log_season)], max_games=25,
+                                        )
+                                        rbt_rows, rbt_strict, rbt_generous, rbt_graded = [], 0, 0, 0
+                                        for g in rbt_log:
+                                            g_opp_full = TEAM_ABBREV_TO_FULL.get(g["opponent"])
+                                            pred = _predict_best_rb_prop(rb_bundle, p_name, g_opp_full) if g_opp_full else None
+                                            pred_best = pred["best"] if pred else None
+                                            actual_best, actual_ties = _actual_best_rb_prop(g.get("tiers", {}))
+                                            result = "—"
+                                            if pred_best is not None and actual_best is not None:
+                                                rbt_graded += 1
+                                                if pred_best == actual_best:
+                                                    rbt_strict += 1
+                                                    rbt_generous += 1
+                                                    result = "✅ Hit"
+                                                elif pred_best in actual_ties:
+                                                    rbt_generous += 1
+                                                    result = "〰️ Tie"
+                                                else:
+                                                    result = "❌ Miss"
+                                            rbt_rows.append({
+                                                "Week": g["week"], "Opponent": g["opponent"],
+                                                "Predicted Best": RB_PROP_LABELS.get(pred_best, "no data"),
+                                                "Actual Best": RB_PROP_LABELS.get(actual_best, "no data"),
+                                                "Result": result,
+                                            })
+                                        st.session_state["_rb_backtest"] = {
+                                            "rows": rbt_rows, "strict_hits": rbt_strict,
+                                            "generous_hits": rbt_generous, "graded": rbt_graded,
+                                        }
+                                except Exception as e:
+                                    st.session_state["_rb_backtest"] = {"error": f"Backtest failed: {e}"}
+
+                            rbt = st.session_state.get("_rb_backtest")
+                            if rbt:
+                                if rbt.get("error"):
+                                    st.warning(rbt["error"])
+                                elif rbt["graded"] == 0:
+                                    st.info("No graded weeks - not enough real data to backtest this player/season.")
+                                else:
+                                    rsr = rbt["strict_hits"] / rbt["graded"] * 100
+                                    rgr = rbt["generous_hits"] / rbt["graded"] * 100
+                                    st.markdown(
+                                        f"**Strict hit rate:** {rbt['strict_hits']}/{rbt['graded']} ({rsr:.0f}%) "
+                                        f"&nbsp;&nbsp;|&nbsp;&nbsp; **Including near-ties:** {rbt['generous_hits']}/{rbt['graded']} ({rgr:.0f}%) "
+                                        f"&nbsp;&nbsp;(random baseline with 2 props: ~50%)"
+                                    )
+                                    st.dataframe(pd.DataFrame(rbt["rows"]), width='stretch')
+
+                            st.divider()
+                            st.markdown("### Real Weekly Game Log — Cross-Referenced Opponents")
+                            st.caption(
+                                "Same idea as the WR/TE cross-reference above, adapted for a real "
+                                "difference: run concept is called by the OFFENSE, so there's no "
+                                "'top-N usage' to match teams on. Instead, this finds OTHER teams "
+                                "whose defense-allowed grade lands in the SAME Elite/Poor direction "
+                                "as this opponent, specifically on the concepts THIS RB actually "
+                                "runs a lot (weighted by his real attempt share per concept) - then "
+                                "pulls his real weekly game logs against those teams. Still an "
+                                "APPROXIMATION, not verified per-play concept tracking - no source "
+                                "tracks that."
+                            )
+                            rb_gl_col1, rb_gl_col2 = st.columns(2)
+                            with rb_gl_col1:
+                                rb_gl_season = st.number_input(
+                                    "Game log season", min_value=2020, max_value=2030, value=2025, step=1,
+                                    key="rb_gl_season",
+                                )
+                            with rb_gl_col2:
+                                rb_min_match = st.number_input(
+                                    "Min matching extreme concepts with another team",
+                                    min_value=1, max_value=6, value=1, step=1, key="rb_min_match",
+                                )
+
+                            if st.button("Load RB cross-reference game log", type="secondary"):
+                                try:
+                                    own_atts = {
+                                        c: rb_bundle.rb_vs_concept.get(c, {}).get(p_name, {}).get("_att", 0)
+                                        for c in RB_CONCEPT_FILES
+                                    }
+                                    total_att = sum(own_atts.values())
+                                    rb_own_weights = {c: (a / total_att) for c, a in own_atts.items() if total_att and a > 0}
+
+                                    matches = {}
+                                    for concept, w in rb_own_weights.items():
+                                        opp_row = rb_bundle.def_allowed.get(concept, {}).get(opp)
+                                        if opp_row is None or opp_row.get("_thin_sample"):
+                                            continue
+                                        opp_tier = opp_row.get("_tiers", {}).get("YDS")
+                                        if opp_tier not in ("Elite", "Poor"):
+                                            continue
+                                        for team, row in rb_bundle.def_allowed.get(concept, {}).items():
+                                            if team == opp or row.get("_thin_sample"):
+                                                continue
+                                            if row.get("_tiers", {}).get("YDS") == opp_tier:
+                                                matches[team] = matches.get(team, 0) + 1
+                                    cross_teams_full = sorted([t for t, c in matches.items() if c >= int(rb_min_match)])
+
+                                    full_to_abbrevs = {}
+                                    for abbr, full in TEAM_ABBREV_TO_FULL.items():
+                                        full_to_abbrevs.setdefault(full, set()).add(abbr)
+                                    cross_team_abbrevs = set()
+                                    for full_name in cross_teams_full:
+                                        cross_team_abbrevs |= full_to_abbrevs.get(full_name, set())
+
+                                    rb_pstats = pull_player_stats([int(rb_gl_season)])
+                                    rb_sched = pull_schedules([int(rb_gl_season)])
+                                    rb_pbp = pull_pbp([int(rb_gl_season)])
+                                    rb_matches_df = rb_pstats[rb_pstats["position"].astype(str).str.upper() == "RB"]
+                                    rb_name_col = "player_display_name" if "player_display_name" in rb_pstats.columns else (
+                                        "player_name" if "player_name" in rb_pstats.columns else None)
+                                    rb_gsis = None
+                                    if rb_name_col:
+                                        rb_hit = rb_matches_df[rb_matches_df[rb_name_col].astype(str).str.lower() == p_name.lower()]
+                                        if not rb_hit.empty:
+                                            rb_gsis = rb_hit.iloc[0]["gsis_id"]
+
+                                    if rb_gsis is None or not cross_team_abbrevs:
+                                        st.session_state["_rb_crossref_game_log"] = {
+                                            "error": (f"Couldn't match '{p_name}' to a real nflreadpy player record."
+                                                      if rb_gsis is None else
+                                                      "No cross-reference teams found at this threshold.")
+                                        }
+                                    else:
+                                        rb_log = build_coverage_crossref_game_log(
+                                            rb_gsis, "RB", cross_team_abbrevs, rb_pstats, rb_sched,
+                                            seasons=[int(rb_gl_season)], pbp_df=rb_pbp,
+                                        )
+                                        st.session_state["_rb_crossref_game_log"] = {
+                                            "log": rb_log, "cross_teams": sorted(cross_team_abbrevs),
+                                        }
+                                except Exception as e:
+                                    st.session_state["_rb_crossref_game_log"] = {"error": f"Game log lookup failed: {e}"}
+
+                            rb_crossref = st.session_state.get("_rb_crossref_game_log")
+                            if rb_crossref:
+                                if rb_crossref.get("error"):
+                                    st.warning(rb_crossref["error"])
+                                else:
+                                    rb_gl_log = rb_crossref.get("log", [])
+                                    st.caption(f"Cross-reference teams at this threshold: {', '.join(rb_crossref.get('cross_teams', [])) or 'none'}")
+                                    if not rb_gl_log:
+                                        st.info("No real games found against a cross-reference team at this threshold/season.")
+                                    for g in rb_gl_log:
+                                        g_tiers = g.get("tiers", {})
+                                        g_stats = g.get("stats", {})
+                                        g_qs = _quality_score(g_tiers)
+                                        g_qs_badge = (
+                                            f'<span class="tier-badge {_score_badge_class(g_qs)}">Quality {g_qs:.0f}</span>'
+                                            if g_qs is not None else ""
+                                        )
+                                        g_rows_html = "".join(
+                                            f'<div class="stat-row"><span class="stat-label">{s}</span>'
+                                            f'<span class="stat-value">{g_stats.get(s)}'
+                                            f'<span class="tier-badge {TIER_CLASS.get(g_tiers.get(s), "tier-average")}">{g_tiers.get(s, "-")}</span>'
+                                            f'</span></div>'
+                                            for s in g_stats
+                                        )
+                                        g_note_html = (
+                                            f'<div class="cov-fit-warning">{g["sample_size_note"]}</div>'
+                                            if g.get("sample_size_note") else ""
+                                        )
+                                        rb_game_card_html = (
+                                            '<div class="cov-card">'
+                                            f'<div class="cov-card-header">{g["season"]} Week {g["week"]} '
+                                            f'— {g["team"]} vs {g["opponent"]}{g_qs_badge}</div>'
+                                            f'{g_note_html}'
+                                            f'<div class="cov-col">{g_rows_html}</div>'
+                                            '</div>'
+                                        )
+                                        st.markdown(rb_game_card_html, unsafe_allow_html=True)
 
 elif mode not in ("Draft Rankings", "Coverage Matchup (premium data)"):
     st.info("Click the button above to load this week's props.")
