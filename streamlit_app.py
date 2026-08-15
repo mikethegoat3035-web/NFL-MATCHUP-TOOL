@@ -18,7 +18,8 @@ from draft_rankings import (
     build_snake_draft_targets, compute_blended_rankings, build_draft_rankings_backtest,
 )
 from coverage_matchup import (
-    load_full_dataset, get_matchup, TEAM_ABBREV_TO_FULL,
+    load_full_dataset, get_matchup, TEAM_ABBREV_TO_FULL, COVERAGE_FIELDS,
+    _same_team, check_alignment_fit,
 )
 
 st.set_page_config(page_title="Dallas Cowboys Matchup Tool", layout="wide", page_icon="⭐")
@@ -1167,14 +1168,87 @@ elif mode == "Coverage Matchup (premium data)":
                 alignment = st.selectbox("Alignment", ["wide", "slot", "inline", "backfield"])
         with mcol3:
             opponent_team = st.selectbox("Opponent (defense)", team_names_sorted)
+            top_n_rank = st.number_input(
+                "Include coverages ranked in the top N by usage rate (vs all 32 teams)",
+                min_value=1, max_value=32, value=10, step=1,
+                help="Old behavior only showed a coverage if it was a statistical z-score "
+                     "outlier (z>=1.0). This instead includes ANY coverage this defense runs "
+                     "often enough to rank in the top N of all 32 teams for that specific "
+                     "coverage type - broader, so real heavy-usage tendencies aren't skipped "
+                     "just because they weren't a statistical outlier.",
+            )
+
+        def _build_full_coverage_report(bundle, player_name, position, opponent_team,
+                                          player_team=None, alignment=None, top_n=10):
+            """Same shape as get_matchup()'s output, but includes every coverage
+            where the opponent ranks in the top N of all 32 teams by usage rate
+            for that specific coverage - not just statistical z-score outliers.
+            Shows ALL tiered stat columns per row instead of a curated subset."""
+            opp_profile = bundle.def_coverage.get(opponent_team)
+            if opp_profile is None:
+                return [{"error": f"'{opponent_team}' not found in loaded team coverage data."}]
+            if player_team and _same_team(player_team, opp_profile.team_name):
+                return [{"error": f"{player_name} plays for {opp_profile.team_name} - "
+                                   f"cannot build a matchup report against his own team."}]
+
+            all_profiles = list(bundle.def_coverage.values())
+            included = []
+            for field in COVERAGE_FIELDS:
+                ranked = sorted(all_profiles, key=lambda p: p.rates.get(field, 0.0), reverse=True)
+                rank = next((i + 1 for i, p in enumerate(ranked) if p.team_name == opp_profile.team_name), None)
+                if rank is not None and rank <= top_n:
+                    included.append((field, opp_profile.z_scores.get(field, 0.0), rank))
+
+            if not included:
+                return [{"note": f"{opp_profile.team_name} has no coverage ranking in the top "
+                                  f"{top_n} of all 32 teams - no coverage edge to flag at this threshold."}]
+
+            if position.upper() == "QB":
+                own_data, def_data = bundle.qb_vs_coverage, bundle.def_allowed_to_qb
+            else:
+                if alignment is None or alignment.lower() not in bundle.receiver_by_alignment:
+                    return [{"error": f"alignment is required for position '{position}' "
+                                       f"(one of: wide, slot, inline, backfield)."}]
+                alignment = alignment.lower()
+                own_data = bundle.receiver_by_alignment[alignment]
+                def_data = bundle.def_allowed_by_alignment[alignment]
+
+            report = []
+            for field, z, rank in included:
+                entry = {
+                    "coverage": field.replace(" %", ""),
+                    "opponent_usage_pct": opp_profile.rates.get(field, 0.0),
+                    "opponent_z_score": round(z, 2),
+                    "opponent_rank": rank,
+                }
+                own_row = own_data.get(field, {}).get(player_name)
+                own_key = "qb_data" if position.upper() == "QB" else "receiver_data"
+                if own_row is None:
+                    entry[own_key] = None
+                    entry["confidence"] = "no_data"
+                else:
+                    entry[own_key] = own_row
+                    entry["confidence"] = "thin_sample" if own_row.get("_thin_sample") else "solid"
+                    if position.upper() != "QB":
+                        fit = check_alignment_fit(own_row, alignment)
+                        entry["alignment_fit_pct"] = fit
+                        entry["alignment_fit_warning"] = (fit is not None and fit < 60)
+
+                def_row = def_data.get(field, {}).get(opp_profile.team_name)
+                entry["defense_allows"] = def_row
+                entry["defense_confidence"] = ("thin_sample" if def_row and def_row.get("_thin_sample")
+                                                else "solid" if def_row else "no_data")
+                report.append(entry)
+            return report
 
         if st.button("Get matchup report", type="primary"):
             if not player_name.strip():
                 st.warning("Enter a player name first.")
             else:
-                report = get_matchup(
+                report = _build_full_coverage_report(
                     bundle, player_name.strip(), position, opponent_team,
                     player_team=player_team.strip() or None, alignment=alignment,
+                    top_n=int(top_n_rank),
                 )
                 st.session_state["_coverage_report"] = report
                 st.session_state["_coverage_report_ctx"] = (player_name.strip(), position, opponent_team, alignment)
@@ -1189,12 +1263,13 @@ elif mode == "Coverage Matchup (premium data)":
                 st.info(report[0]["note"])
             else:
                 st.markdown(f"### {p_name} ({p_pos}{f' - {align}' if align else ''}) vs {opp}")
+                st.caption(
+                    "Showing every real column from the export, not a curated subset - "
+                    "each stat's tier is computed against the actual distribution of "
+                    "players/teams who faced that specific coverage."
+                )
                 own_key = "qb_data" if p_pos == "QB" else "receiver_data"
                 own_vol_label = "ATT" if p_pos == "QB" else "TGT"
-                highlight_stats = (
-                    ("CMP %", "YPA", "TD", "INT", "RATE", "CPOE", "FP/G") if p_pos == "QB"
-                    else ("CR %", "YPRR", "TD", "CTGT %", "RATE", "FP/G")
-                )
 
                 TIER_CLASS = {
                     "Elite": "tier-elite", "Above Avg": "tier-above-avg",
@@ -1202,12 +1277,14 @@ elif mode == "Coverage Matchup (premium data)":
                     "Poor": "tier-poor",
                 }
 
-                def _stat_rows_html(row, tiers_source, stats):
+                def _stat_rows_html(row, tiers_source):
+                    """Renders EVERY tiered stat column in the row - the tiers
+                    dict already excludes identifier columns (Name, Team, G,
+                    etc.) and non-numeric fields, so this is the full real
+                    stat set for whatever file this row came from, not a
+                    curated guess at what matters."""
                     parts = []
-                    for s in stats:
-                        if s not in row:
-                            continue
-                        tier = tiers_source.get(s, "-")
+                    for s, tier in tiers_source.items():
                         cls = TIER_CLASS.get(tier, "tier-average")
                         parts.append(
                             f'<div class="stat-row"><span class="stat-label">{s}</span>'
@@ -1218,6 +1295,8 @@ elif mode == "Coverage Matchup (premium data)":
 
                 for entry in report:
                     z = entry["opponent_z_score"]
+                    rank = entry.get("opponent_rank")
+                    rank_badge = f'<span class="cov-z-badge">rank {rank} of 32</span>' if rank else ""
                     fit_html = ""
                     if entry.get("alignment_fit_warning"):
                         fit_html = (
@@ -1233,7 +1312,7 @@ elif mode == "Coverage Matchup (premium data)":
                         thin = '<span class="cov-thin-flag">THIN SAMPLE</span>' if entry["confidence"] == "thin_sample" else ""
                         own_col_html = (
                             f'<div class="cov-col-title">{p_name} — {own_row["_att"]} {own_vol_label}{thin}</div>'
-                            + _stat_rows_html(own_row, own_row.get("_tiers", {}), highlight_stats)
+                            + _stat_rows_html(own_row, own_row.get("_tiers", {}))
                         )
 
                     def_row = entry.get("defense_allows")
@@ -1243,15 +1322,16 @@ elif mode == "Coverage Matchup (premium data)":
                         thin = '<span class="cov-thin-flag">THIN SAMPLE</span>' if entry.get("defense_confidence") == "thin_sample" else ""
                         def_col_html = (
                             f'<div class="cov-col-title">{opp} allows — {def_row["_att"]} {own_vol_label}{thin}</div>'
-                            + _stat_rows_html(def_row, def_row.get("_tiers", {}), highlight_stats)
+                            + _stat_rows_html(def_row, def_row.get("_tiers", {}))
                         )
 
                     card_html = f"""
                     <div class="cov-card">
                         <div class="cov-card-header">{entry['coverage']}
                             <span class="cov-z-badge">z={z:+.2f}</span>
+                            {rank_badge}
                         </div>
-                        <div class="cov-card-usage">{opp} runs this coverage at {entry['opponent_usage_pct']:.1f}% of snaps (league-average outlier)</div>
+                        <div class="cov-card-usage">{opp} runs this coverage at {entry['opponent_usage_pct']:.1f}% of snaps</div>
                         {fit_html}
                         <div class="cov-grid">
                             <div class="cov-col">{own_col_html}</div>
