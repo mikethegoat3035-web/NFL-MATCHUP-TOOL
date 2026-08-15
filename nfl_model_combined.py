@@ -3849,3 +3849,170 @@ def build_season_accuracy_report(season: int, weeks: list = None, through_week: 
         "adjustment_direction_accuracy": adjustment_direction_accuracy,
         "role_verification_check": role_verification_check,
     }
+
+
+# ---------------------------------------------------------------------------
+# Coverage-crossref game log (links the FantasyPoints premium coverage
+# tendency data in coverage_matchup.py to REAL weekly game logs from the
+# free nflreadpy pipeline). coverage_matchup.py's 70-file dataset is
+# season-AGGREGATE only - no play-by-play coverage-call history exists
+# anywhere, free or paid. This is an approximation: "games against teams
+# that were ALSO heavy users of the same coverage(s) this week's opponent
+# leans on" - not verified per-play coverage tracking, since nothing gives
+# that. Framed honestly as a proxy, not a guarantee.
+# ---------------------------------------------------------------------------
+
+# Confirmed-real player_stats_df columns (each is already used elsewhere in
+# THIS file - see build_receiver_advanced_metrics/build_rb_advanced_metrics/
+# calc_offense_fantasy_points). Every one is checked with `in df.columns`
+# before use below anyway, so an unexpected schema change degrades
+# gracefully (skips the metric) instead of crashing.
+GAME_LOG_METRICS_BY_POSITION = {
+    "QB": ["completions", "attempts", "passing_yards", "passing_tds", "interceptions", "passing_epa"],
+    "RB": ["carries", "rushing_yards", "rushing_epa", "receptions", "targets", "receiving_yards", "target_share"],
+    "WR": ["targets", "target_share", "receptions", "receiving_yards", "air_yards_share", "wopr", "racr", "receiving_epa"],
+    "TE": ["targets", "target_share", "receptions", "receiving_yards", "air_yards_share", "wopr", "racr", "receiving_epa"],
+}
+
+# Stats where a HIGHER number is worse (mirrors coverage_matchup.py's
+# INVERSE_STATS convention, applied here for tiering direction).
+GAME_LOG_INVERSE_STATS = {"interceptions"}
+
+
+def diagnose_player_stats_for_game_log(season: int) -> dict:
+    """
+    DIAGNOSTIC ONLY - run this before trusting anything below. Confirms
+    which of GAME_LOG_METRICS_BY_POSITION's columns are REALLY present in
+    player_stats_df this season, and separately checks for any column that
+    could plausibly represent "long reception" / "long rush" (a single-game
+    max, not a season aggregate) - which is NOT currently used anywhere
+    else in this file, so its real existence/name is unverified. Follows
+    the same real-data-first approach as diagnose_injuries_data() rather
+    than guessing a column name and finding out via a KeyError in
+    production.
+    """
+    result = {"season": season}
+    try:
+        df = pull_player_stats([season])
+    except Exception as e:
+        result["error"] = f"pull_player_stats() itself failed: {e}"
+        return result
+
+    result["columns"] = list(df.columns)
+    result["n_rows"] = len(df)
+
+    for pos, cols in GAME_LOG_METRICS_BY_POSITION.items():
+        result[f"{pos}_confirmed_present"] = [c for c in cols if c in df.columns]
+        result[f"{pos}_MISSING"] = [c for c in cols if c not in df.columns]
+
+    long_like = [c for c in df.columns if "long" in c.lower()]
+    result["long_reception_or_rush_columns_found"] = long_like
+    if not long_like:
+        result["long_reception_note"] = (
+            "No column with 'long' in the name found in player_stats_df. "
+            "Real single-game long-reception/long-rush would need per-play "
+            "pbp data (max yards_gained per player per game) instead - not "
+            "wired yet since pbp's real column names for this specific use "
+            "aren't confirmed in this file either. Run this diagnostic's "
+            "output past Claude before that gets built, same discipline as "
+            "every other data source this session."
+        )
+    return result
+
+
+def build_coverage_crossref_game_log(player_gsis_id: str, position: str,
+                                      cross_team_abbrevs: set, player_stats_df: pd.DataFrame,
+                                      schedules_df: pd.DataFrame, seasons: list = None,
+                                      max_games: int = 20) -> list:
+    """
+    Real weekly game log rows for this player, filtered to games where the
+    REAL opponent that week (resolved via schedules_df, same lookup as
+    get_opponent_this_week - generalized here to any past week, not just
+    the current one) is in cross_team_abbrevs - the set of teams that also
+    lean on the same coverage(s) as this week's real opponent (computed by
+    the caller from the coverage_matchup.py dataset).
+
+    Each returned row is tiered (Elite/Above Avg/Average/Below Avg/Poor)
+    against the player's OWN full game log in player_stats_df (not a
+    league-wide benchmark - a WR1's "poor" game and a WR3's "poor" game
+    mean different things in raw yards, so grading against the player's
+    own real distribution is the honest comparison here, not a league
+    average that would just re-rank players by role/volume). Requires at
+    least 3 of the player's own real games to compute a meaningful
+    distribution - below that, values are shown ungraded.
+    """
+    if seasons is None:
+        seasons = list(player_stats_df["season"].dropna().unique())
+
+    pos = position.upper()
+    metrics = GAME_LOG_METRICS_BY_POSITION.get(pos, [])
+    metrics = [m for m in metrics if m in player_stats_df.columns]
+
+    own_games = player_stats_df[
+        (player_stats_df["gsis_id"] == player_gsis_id)
+        & (player_stats_df["season"].isin(seasons))
+    ].copy()
+    if own_games.empty:
+        return []
+
+    # Resolve the REAL opponent for every one of the player's own games -
+    # same schedules_df lookup this file already uses for the current
+    # week, just applied across the player's full game log instead of one
+    # week at a time.
+    def _resolve_opp(row):
+        game = schedules_df[
+            (schedules_df["season"] == row["season"]) & (schedules_df["week"] == row["week"])
+            & ((schedules_df["home_team"] == row["team"]) | (schedules_df["away_team"] == row["team"]))
+        ]
+        if game.empty:
+            return None
+        g = game.iloc[0]
+        return g["away_team"] if g["home_team"] == row["team"] else g["home_team"]
+
+    own_games["real_opponent"] = own_games.apply(_resolve_opp, axis=1)
+
+    # League distribution per metric, computed against the player's OWN
+    # full game log (all real games, any opponent) - used to grade each
+    # cross-referenced game's tier below.
+    field_stats = {}
+    for m in metrics:
+        vals = own_games[m].dropna().values
+        if len(vals) >= 3:
+            field_stats[m] = (float(np.mean(vals)), float(np.std(vals)))
+
+    matched = own_games[own_games["real_opponent"].isin(cross_team_abbrevs)]
+    matched = matched.sort_values(["season", "week"], ascending=False).head(max_games)
+
+    game_log = []
+    for _, row in matched.iterrows():
+        tiers = {}
+        stats = {}
+        for m in metrics:
+            v = row.get(m)
+            if pd.isna(v):
+                continue
+            stats[m] = round(float(v), 2) if isinstance(v, (int, float, np.floating)) else v
+            if m in field_stats:
+                avg, sd = field_stats[m]
+                if sd:
+                    z = (v - avg) / sd
+                    if m in GAME_LOG_INVERSE_STATS:
+                        z = -z
+                    if z >= 1.5:
+                        tiers[m] = "Elite"
+                    elif z >= 0.5:
+                        tiers[m] = "Above Avg"
+                    elif z > -0.5:
+                        tiers[m] = "Average"
+                    elif z > -1.5:
+                        tiers[m] = "Below Avg"
+                    else:
+                        tiers[m] = "Poor"
+        game_log.append({
+            "season": int(row["season"]), "week": int(row["week"]),
+            "team": row["team"], "opponent": row["real_opponent"],
+            "stats": stats, "tiers": tiers,
+            "sample_size_note": None if len(own_games) >= 3 else
+                f"Only {len(own_games)} real game(s) on file for this player - too few to grade tiers reliably.",
+        })
+    return game_log
