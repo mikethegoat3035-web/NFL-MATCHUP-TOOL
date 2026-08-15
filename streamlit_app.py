@@ -17,6 +17,9 @@ from draft_rankings import (
     build_yahoo_style_rankings, detect_risers, build_league_settings,
     build_snake_draft_targets, compute_blended_rankings, build_draft_rankings_backtest,
 )
+from coverage_matchup import (
+    load_full_dataset, get_matchup, TEAM_ABBREV_TO_FULL,
+)
 
 st.set_page_config(page_title="Dallas Cowboys Matchup Tool", layout="wide", page_icon="⭐")
 
@@ -209,32 +212,37 @@ with st.expander("🔍 Debug: Check for real receiver alignment data (wide/slot/
 
 mode = st.radio(
     "Mode",
-    ["Scan (adjustable lines)", "Backtest (compare mu vs actual results)", "Draft Rankings"],
+    ["Scan (adjustable lines)", "Backtest (compare mu vs actual results)", "Draft Rankings",
+     "Coverage Matchup (premium data)"],
     horizontal=True,
     help="Backtest mode only works for a week that's already been played. "
          "Draft Rankings builds a full season projection/ranking for your "
-         "league format, using last season's data as the projection basis.",
+         "league format, using last season's data as the projection basis. "
+         "Coverage Matchup uses the manually-collected FantasyPoints premium "
+         "dataset (Cover 0-6 shell-level splits) - separate from the free "
+         "nflreadpy pipeline the other three modes run on.",
 )
 
-col1, col2 = st.columns(2)
-with col1:
-    if mode == "Draft Rankings":
-        season = st.number_input(
-            "Draft season", min_value=2020, max_value=2030, value=2026, step=1,
-            help="This is the season you're drafting FOR. Projections are built from "
-                 "the completed prior season's per-game rates (season-1), applied to "
-                 "the CURRENT roster for this season - so 2026 rankings use 2025 stats "
-                 "but 2026 rosters (reflecting trades/signings like Etienne to NO).",
-        )
-    else:
-        season = st.number_input("Season", min_value=2020, max_value=2030, value=2025, step=1)
-with col2:
-    if mode == "Draft Rankings":
-        st.caption("Draft Rankings uses the prior completed season as the projection basis - "
-                   "week isn't used in this mode.")
-        week = None
-    else:
-        week = st.number_input("Week", min_value=1, max_value=18, value=10, step=1)
+if mode != "Coverage Matchup (premium data)":
+    col1, col2 = st.columns(2)
+    with col1:
+        if mode == "Draft Rankings":
+            season = st.number_input(
+                "Draft season", min_value=2020, max_value=2030, value=2026, step=1,
+                help="This is the season you're drafting FOR. Projections are built from "
+                     "the completed prior season's per-game rates (season-1), applied to "
+                     "the CURRENT roster for this season - so 2026 rankings use 2025 stats "
+                     "but 2026 rosters (reflecting trades/signings like Etienne to NO).",
+            )
+        else:
+            season = st.number_input("Season", min_value=2020, max_value=2030, value=2025, step=1)
+    with col2:
+        if mode == "Draft Rankings":
+            st.caption("Draft Rankings uses the prior completed season as the projection basis - "
+                       "week isn't used in this mode.")
+            week = None
+        else:
+            week = st.number_input("Week", min_value=1, max_value=18, value=10, step=1)
 
 if "slate_df" not in st.session_state:
     st.session_state.slate_df = None
@@ -246,6 +254,10 @@ if "season_report" not in st.session_state:
     st.session_state.season_report = None
 if "show_season_report" not in st.session_state:
     st.session_state.show_season_report = False
+if "coverage_bundle" not in st.session_state:
+    st.session_state.coverage_bundle = None
+if "coverage_data_dir" not in st.session_state:
+    st.session_state.coverage_data_dir = None
 
 if mode == "Draft Rankings":
     st.subheader("League Settings")
@@ -284,6 +296,8 @@ if mode == "Draft Rankings":
             except Exception as e:
                 st.error(f"Draft rankings failed: {e}")
                 st.session_state.draft_rankings_df = None
+elif mode == "Coverage Matchup (premium data)":
+    pass  # own section, rendered below alongside the Draft Rankings display block
 else:
     button_label = "Run backtest" if mode.startswith("Backtest") else "Scan full slate"
     if mode.startswith("Backtest"):
@@ -987,5 +1001,127 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                 "mu_before_box_adj to compare)."
             )
 
-elif mode != "Draft Rankings":
+elif mode == "Coverage Matchup (premium data)":
+    st.subheader("Coverage Matchup — Premium FantasyPoints Data")
+    st.caption(
+        "Season-aggregate Cover 0/1/2/2-Man/3/4/6 splits from the manually-collected "
+        "FantasyPoints Data Suite export (separate from the free nflreadpy pipeline the "
+        "other three modes run on). Flags each opponent's REAL statistically-outlier "
+        "coverage tendencies (z-score vs league, not raw rank), then shows the player's "
+        "own history plus what that defense specifically allows against that coverage."
+    )
+
+    data_dir = st.text_input(
+        "Coverage data folder (relative path in the repo)",
+        value=st.session_state.coverage_data_dir or "coverage_data",
+        help="Folder containing all 70 CSVs using the established naming convention "
+             "(OFF_COVG_.csv, DEF_COVG__.csv, VS_COVER_<N>.csv, def_allowed_cover<N>.csv, "
+             "<alignment>_vs_cover<N>.csv, def_<alignment>_cover<N>.csv).",
+    )
+
+    load_col1, load_col2 = st.columns([1, 3])
+    with load_col1:
+        if st.button("Load coverage dataset", type="primary"):
+            with st.spinner("Loading coverage matrix + all coverage/alignment files..."):
+                try:
+                    st.session_state.coverage_bundle = load_full_dataset(data_dir=data_dir)
+                    st.session_state.coverage_data_dir = data_dir
+                    n_missing = len(st.session_state.coverage_bundle.missing)
+                    if n_missing:
+                        st.warning(f"Loaded with {n_missing} file(s) missing - see details below.")
+                    else:
+                        st.success("Loaded all 70 files - dataset complete.")
+                except Exception as e:
+                    st.error(f"Failed to load coverage dataset: {e}")
+                    st.session_state.coverage_bundle = None
+    with load_col2:
+        if st.session_state.coverage_bundle is not None and st.session_state.coverage_bundle.missing:
+            with st.expander(f"{len(st.session_state.coverage_bundle.missing)} file(s) not found - gaps handled gracefully, but listed here"):
+                st.write(st.session_state.coverage_bundle.missing)
+
+    bundle = st.session_state.coverage_bundle
+    if bundle is None:
+        st.info("Load the dataset above before building a matchup report.")
+    else:
+        st.divider()
+        team_names_sorted = sorted(bundle.def_coverage.keys()) or sorted(set(TEAM_ABBREV_TO_FULL.values()))
+
+        mcol1, mcol2, mcol3 = st.columns(3)
+        with mcol1:
+            player_name = st.text_input("Player name (exact, as it appears in the export)", value="")
+            player_team = st.text_input("Player's own team (optional - abbrev or full name, blocks same-team matchups)", value="")
+        with mcol2:
+            position = st.selectbox("Position", ["QB", "WR", "TE", "RB"])
+            alignment = None
+            if position != "QB":
+                alignment = st.selectbox("Alignment", ["wide", "slot", "inline", "backfield"])
+        with mcol3:
+            opponent_team = st.selectbox("Opponent (defense)", team_names_sorted)
+
+        if st.button("Get matchup report", type="primary"):
+            if not player_name.strip():
+                st.warning("Enter a player name first.")
+            else:
+                report = get_matchup(
+                    bundle, player_name.strip(), position, opponent_team,
+                    player_team=player_team.strip() or None, alignment=alignment,
+                )
+                st.session_state["_coverage_report"] = report
+                st.session_state["_coverage_report_ctx"] = (player_name.strip(), position, opponent_team, alignment)
+
+        report = st.session_state.get("_coverage_report")
+        if report:
+            p_name, p_pos, opp, align = st.session_state["_coverage_report_ctx"]
+
+            if "error" in report[0]:
+                st.error(report[0]["error"])
+            elif "note" in report[0]:
+                st.info(report[0]["note"])
+            else:
+                st.markdown(f"### {p_name} ({p_pos}{f' - {align}' if align else ''}) vs {opp}")
+                own_key = "qb_data" if p_pos == "QB" else "receiver_data"
+                own_vol_label = "ATT" if p_pos == "QB" else "TGT"
+                highlight_stats = (
+                    ("CMP %", "YPA", "TD", "INT", "RATE", "CPOE", "FP/G") if p_pos == "QB"
+                    else ("CR %", "YPRR", "TD", "CTGT %", "RATE", "FP/G")
+                )
+
+                for entry in report:
+                    z = entry["opponent_z_score"]
+                    st.markdown(
+                        f"**{entry['coverage']}** — {opp} runs this at "
+                        f"**{entry['opponent_usage_pct']:.1f}%** (z={z:+.2f} vs league average)"
+                    )
+                    if entry.get("alignment_fit_warning"):
+                        st.caption(
+                            f"⚠️ Only {entry['alignment_fit_pct']:.0f}% of {p_name}'s routes are "
+                            f"{align} - this alignment split may not represent his usual usage."
+                        )
+
+                    rcol1, rcol2 = st.columns(2)
+                    with rcol1:
+                        own_row = entry.get(own_key)
+                        if own_row is None:
+                            st.caption(f"{p_name}: no recorded {own_vol_label.lower()}s vs this coverage.")
+                        else:
+                            thin = " ⚠️ THIN SAMPLE" if entry["confidence"] == "thin_sample" else ""
+                            st.markdown(f"**{p_name}** ({own_row['_att']} {own_vol_label}){thin}")
+                            for s in highlight_stats:
+                                if s in own_row:
+                                    tier = own_row["_tiers"].get(s, "-")
+                                    st.write(f"{s}: {own_row.get(s)}  _{tier}_")
+                    with rcol2:
+                        def_row = entry.get("defense_allows")
+                        if def_row is None:
+                            st.caption(f"{opp}: no defense-allowed data vs this coverage.")
+                        else:
+                            thin = " ⚠️ THIN SAMPLE" if entry.get("defense_confidence") == "thin_sample" else ""
+                            st.markdown(f"**{opp} allows** ({def_row['_att']} {own_vol_label}){thin}")
+                            for s in highlight_stats:
+                                if s in def_row:
+                                    tier = def_row["_tiers"].get(s, "-")
+                                    st.write(f"{s}: {def_row.get(s)}  _{tier}_")
+                    st.divider()
+
+elif mode not in ("Draft Rankings", "Coverage Matchup (premium data)"):
     st.info("Click the button above to load this week's props.")
