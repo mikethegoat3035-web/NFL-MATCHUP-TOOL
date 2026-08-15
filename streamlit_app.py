@@ -63,6 +63,19 @@ st.markdown(f"""
         color: {COWBOYS_NAVY};
         border: 1px solid {COWBOYS_NAVY};
     }}
+    /* Body text (markdown, write, caption) was defaulting to white in some
+       browser/theme combos, making report content invisible against the
+       forced-white app background - only headers (h1-h3, forced navy above)
+       were visible. This forces readable dark text everywhere EXCEPT
+       buttons, which stay white-on-navy via the more specific button rule
+       above (higher CSS specificity wins regardless of rule order). */
+    .stApp, .stApp p, .stApp li, .stApp span,
+    .stMarkdown, [data-testid="stMarkdownContainer"],
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stCaptionContainer"],
+    [data-testid="stCaptionContainer"] p {{
+        color: {COWBOYS_NAVY} !important;
+    }}
     [data-testid="stMetricValue"] {{
         color: {COWBOYS_NAVY};
     }}
