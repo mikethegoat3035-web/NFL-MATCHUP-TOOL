@@ -1339,6 +1339,20 @@ elif mode == "Coverage Matchup (premium data)":
             "WR": {"TGT", "REC", "CR %", "YDS", "YPRR", "TD", "aDOT", "YAC/REC", "YACO/REC"},
             "TE": {"TGT", "REC", "CR %", "YDS", "YPRR", "TD", "aDOT", "YAC/REC", "YACO/REC"},
             "RB": {"TGT", "REC", "CR %", "YDS", "YPRR", "TD", "aDOT", "YAC/REC", "YACO/REC"},
+            # Separate key for RB RUSHING (run-concept section) - real bug
+            # this fixes: "RB" above is the receiving-side set (RB as a
+            # pass-catcher in the coverage/alignment section), which uses
+            # completely different column names (TGT/REC/CR%) than the
+            # rushing concept data (ATT/YPC/Success%/etc). Both used to
+            # share the same "RB" key by coincidence of the dict having a
+            # single per-position entry - meaning the rushing Quality
+            # Score was only ever double-weighting YDS and TD (the only
+            # two names that happen to overlap), with every other real
+            # rushing crucial stat sitting at flat 1x weight the whole
+            # time. Reuses rb_matchup.py's CRUCIAL_RB_STATS directly so
+            # there's exactly one real list to maintain, not two that can
+            # drift out of sync with each other.
+            "RB_RUSH": CRUCIAL_RB_STATS,
         }
 
         def _quality_score(tiers: dict, position: str = None, thin_sample: bool = False) -> float:
@@ -2313,7 +2327,7 @@ elif mode == "Coverage Matchup (premium data)":
                             for entry in rb_report:
                                 own_row = entry["own_row"]
                                 def_row = entry["defense_allows"]
-                                own_qs = (_quality_score(own_row.get("_tiers", {}), position="RB",
+                                own_qs = (_quality_score(own_row.get("_tiers", {}), position="RB_RUSH",
                                                           thin_sample=own_row.get("_thin_sample", False))
                                           if own_row is not None else None)
                                 own_qs_badge = (
@@ -2321,7 +2335,7 @@ elif mode == "Coverage Matchup (premium data)":
                                     f'{" ~" if own_row and own_row.get("_thin_sample") else ""}</span>'
                                     if own_qs is not None else ""
                                 )
-                                def_qs = (_quality_score(def_row.get("_tiers", {}), position="RB",
+                                def_qs = (_quality_score(def_row.get("_tiers", {}), position="RB_RUSH",
                                                           thin_sample=def_row.get("_thin_sample", False))
                                           if def_row is not None else None)
                                 def_qs_badge = (
@@ -2329,6 +2343,31 @@ elif mode == "Coverage Matchup (premium data)":
                                     f'{" ~" if def_row and def_row.get("_thin_sample") else ""}</span>'
                                     if def_qs is not None else ""
                                 )
+                                # Per-CONCEPT prop lean - real gap this closes: Own/Def
+                                # Quality tells you if the matchup is good HERE, but not
+                                # which prop that good matchup actually favors. Blends
+                                # his own tier + the defense's tier 50/50 (same formula
+                                # as the whole-matchup verdict below), just scoped to
+                                # THIS one concept instead of blended across all 6.
+                                concept_prop_scores = {}
+                                for lean_prop, lean_stat_col in {"rush_attempts": "ATT", "rush_yards": "YDS"}.items():
+                                    lean_own_tier = own_row.get("_tiers", {}).get(lean_stat_col) if own_row else None
+                                    lean_def_tier = def_row.get("_tiers", {}).get(lean_stat_col) if def_row else None
+                                    lean_own_w = TIER_WEIGHTS.get(lean_own_tier)
+                                    lean_def_w = TIER_WEIGHTS.get(lean_def_tier)
+                                    if lean_own_w is None and lean_def_w is None:
+                                        continue
+                                    concept_prop_scores[lean_prop] = (
+                                        (0.5 * lean_own_w + 0.5 * lean_def_w) if (lean_own_w is not None and lean_def_w is not None)
+                                        else (lean_own_w if lean_own_w is not None else lean_def_w)
+                                    )
+                                lean_badge = ""
+                                if concept_prop_scores:
+                                    lean_best = max(concept_prop_scores, key=concept_prop_scores.get)
+                                    lean_label = "Rush Attempts" if lean_best == "rush_attempts" else "Rush Yards"
+                                    lean_ties = [p for p, s in concept_prop_scores.items()
+                                                 if p != lean_best and (concept_prop_scores[lean_best] - s) <= 10]
+                                    lean_badge = f'<span class="cov-z-badge">Lean: {lean_label}{" (toss-up)" if lean_ties else ""}</span>'
                                 if own_row is None:
                                     own_col_html = f'<div class="cov-no-data">{p_name}: no recorded attempts on this concept.</div>'
                                 else:
@@ -2347,7 +2386,7 @@ elif mode == "Coverage Matchup (premium data)":
                                     )
                                 rb_card_html = (
                                     '<div class="cov-card">'
-                                    f'<div class="cov-card-header">{entry["concept"]}{own_qs_badge}{def_qs_badge}</div>'
+                                    f'<div class="cov-card-header">{entry["concept"]}{own_qs_badge}{def_qs_badge}{lean_badge}</div>'
                                     '<div class="cov-grid">'
                                     f'<div class="cov-col">{own_col_html}</div>'
                                     f'<div class="cov-col">{def_col_html}</div>'
