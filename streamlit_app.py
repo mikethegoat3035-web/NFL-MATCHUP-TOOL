@@ -1513,6 +1513,37 @@ elif mode == "Coverage Matchup (premium data)":
             pct = pct if distance > 0 else -pct
             return round(mu * (1 + pct), 2), round(pct * 100, 1), True
 
+        def _resolve_real_player_name(bundle, position, typed_name):
+            """Real fix for a real, confirmed bug: every coverage-bundle
+            player lookup (bundle.receiver_by_alignment[...].get(player_name),
+            bundle.qb_vs_coverage[...].get(player_name), etc.) is a direct,
+            CASE-SENSITIVE dict-key match - no normalization at all. Meanwhile
+            the nflreadpy-side matching used throughout this tool (for real
+            game logs, CrossRef mu, GSIS lookup) IS case-insensitive
+            (.str.lower()). That split is exactly why George Pickens' Raw mu
+            and CrossRef mu worked fine (nflreadpy side) while Quality Score
+            came back "no data" on every single row (coverage-bundle side) -
+            not a data problem, a real case-sensitivity mismatch. Scans the
+            bundle's REAL keys case-insensitively once, returns the actual
+            cased name so every downstream .get(player_name) call succeeds
+            normally instead of requiring the user to type exact capitalization
+            every time. Returns None if genuinely not found under any casing."""
+            typed_lower = typed_name.strip().lower()
+            if not typed_lower:
+                return None
+            if position.upper() == "QB":
+                for field_data in bundle.qb_vs_coverage.values():
+                    for real_name in field_data.keys():
+                        if real_name.lower() == typed_lower:
+                            return real_name
+                return None
+            for align in ALIGNMENTS:
+                for field_data in bundle.receiver_by_alignment.get(align, {}).values():
+                    for real_name in field_data.keys():
+                        if real_name.lower() == typed_lower:
+                            return real_name
+            return None
+
         def _get_real_alignment_weights(bundle, player_name):
             """Real season-long alignment split for this player, read straight
             off any row we can find for them (WIDE/SLOT/INLINE/BACK RTE % -
@@ -2002,12 +2033,19 @@ elif mode == "Coverage Matchup (premium data)":
 
         if st.button("Run mu comparison backtest", type="primary", key="mucomp_run_btn"):
             try:
-                mc_weights = _get_real_alignment_weights(bundle, mucomp_name) if mucomp_pos != "QB" else None
-                mc_result = _run_mu_source_comparison_backtest(
-                    bundle, mucomp_name, mucomp_pos, None, mc_weights,
-                    int(mucomp_season), int(mucomp_top_n), mucomp_prop, float(mucomp_line),
-                )
-                st.session_state["_mucomp_result"] = mc_result
+                real_name = _resolve_real_player_name(bundle, mucomp_pos, mucomp_name)
+                if real_name is None:
+                    st.session_state["_mucomp_result"] = {
+                        "error": f"Couldn't find '{mucomp_name}' in the loaded coverage data under any "
+                                 f"capitalization - check the spelling matches the real export, or make "
+                                 f"sure the coverage dataset is actually loaded above."}
+                else:
+                    mc_weights = _get_real_alignment_weights(bundle, real_name) if mucomp_pos != "QB" else None
+                    mc_result = _run_mu_source_comparison_backtest(
+                        bundle, real_name, mucomp_pos, None, mc_weights,
+                        int(mucomp_season), int(mucomp_top_n), mucomp_prop, float(mucomp_line),
+                    )
+                    st.session_state["_mucomp_result"] = mc_result
             except Exception as e:
                 st.session_state["_mucomp_result"] = {"error": f"Backtest failed: {e}"}
 
@@ -2052,7 +2090,19 @@ elif mode == "Coverage Matchup (premium data)":
                             "adding much on top of what mu already knew."
                         )
 
-                st.dataframe(mc_df, width='stretch')
+                # Simple default view - just the real decision each week
+                # (what happened, which way the signal leaned, hit or miss)
+                # plus which cases the two signals actually agreed on. Full
+                # diagnostic detail (exact mu values, Quality Score number,
+                # sample sizes) moved to an expander - same "don't hide it,
+                # just don't force it into the default view" pattern used
+                # elsewhere in this tool (the "+more stats" toggles).
+                simple_cols = ["Week", "Opponent", "Actual", "Mu Lean", "Quality Lean",
+                                "Agreement", "Raw Hit", "Adjusted Hit", "CrossRef Hit"]
+                simple_cols = [c for c in simple_cols if c in mc_df.columns]
+                st.dataframe(mc_df[simple_cols], width='stretch')
+                with st.expander("Show full detail (exact mu values, Quality Score, sample sizes)"):
+                    st.dataframe(mc_df, width='stretch')
                 st.caption(
                     "Mu Lean = which way RAW mu (unadjusted) points vs the line. Quality Lean = "
                     "which way the matchup grade alone points, independent of mu. Agreement shows "
@@ -2062,6 +2112,129 @@ elif mode == "Coverage Matchup (premium data)":
                     "don't clear it by a real margin, the matchup data isn't adding value for THIS "
                     "prop/player yet, and that's a real finding worth knowing, not a failure to hide."
                 )
+
+        st.divider()
+        st.markdown("### League-Wide Mu Comparison Backtest — Raw vs Adjusted vs Cross-Reference")
+        st.caption(
+            "Same real test as above, but automatically across every real player at a position "
+            "(no names to type) - this is the number that actually tells you whether to trust "
+            "the coverage/alignment data at scale, not just for one player. One prop, one real "
+            "fixed line, tested on everyone who qualifies."
+        )
+        lwmc_col1, lwmc_col2, lwmc_col3, lwmc_col4 = st.columns(4)
+        with lwmc_col1:
+            lwmc_pos = st.selectbox("Position", ["WR", "TE", "RB"], key="lwmc_pos")
+        with lwmc_col2:
+            lwmc_prop = st.selectbox(
+                "Prop to test", ["targets", "receptions", "rec_yards", "receiving_td"], key="lwmc_prop")
+        with lwmc_col3:
+            lwmc_line = st.number_input("Real fixed line", min_value=0.0, value=55.5, step=0.5, key="lwmc_line")
+        with lwmc_col4:
+            lwmc_season = st.number_input("Season", min_value=2020, max_value=2030, value=2025, step=1, key="lwmc_season")
+        lwmc_col5, lwmc_col6, lwmc_col7 = st.columns(3)
+        with lwmc_col5:
+            lwmc_min_games = st.number_input("Min real games per player", min_value=1, max_value=18,
+                                              value=8, step=1, key="lwmc_min_games")
+        with lwmc_col6:
+            lwmc_max_players = st.number_input("Max players to scan", min_value=5, max_value=150,
+                                                value=40, step=5, key="lwmc_max_players")
+        with lwmc_col7:
+            lwmc_top_n = st.number_input("Top-N coverage threshold", min_value=1, max_value=32,
+                                          value=10, step=1, key="lwmc_top_n")
+
+        if st.button("Run league-wide mu comparison", type="primary", key="lwmc_run_btn"):
+            try:
+                with st.spinner(f"Testing up to {int(lwmc_max_players)} real {lwmc_pos}s on "
+                                 f"{lwmc_prop} vs {lwmc_line} - real network calls per player..."):
+                    lwmc_pstats = pull_player_stats([int(lwmc_season)])
+                    lwmc_name_col = "player_display_name" if "player_display_name" in lwmc_pstats.columns else (
+                        "player_name" if "player_name" in lwmc_pstats.columns else None)
+                    lwmc_rows, lwmc_errors = [], []
+                    lwmc_agg = {"Raw": [0, 0], "Adjusted": [0, 0], "CrossRef": [0, 0]}
+                    lwmc_agree = [0, 0]
+                    lwmc_conflict = [0, 0]
+                    if lwmc_name_col:
+                        pos_matches = lwmc_pstats[lwmc_pstats["position"].astype(str).str.upper() == lwmc_pos]
+                        games_per_player = pos_matches.groupby(lwmc_name_col)["week"].nunique()
+                        eligible = games_per_player[games_per_player >= int(lwmc_min_games)].sort_values(ascending=False)
+                        names_to_scan = list(eligible.index[:int(lwmc_max_players)])
+                        for nm in names_to_scan:
+                            try:
+                                real_nm = _resolve_real_player_name(bundle, lwmc_pos, nm)
+                                if real_nm is None:
+                                    continue
+                                nm_weights = _get_real_alignment_weights(bundle, real_nm)
+                                result = _run_mu_source_comparison_backtest(
+                                    bundle, real_nm, lwmc_pos, None, nm_weights,
+                                    int(lwmc_season), int(lwmc_top_n), lwmc_prop, float(lwmc_line),
+                                )
+                            except Exception as e:
+                                lwmc_errors.append(f"{nm}: {e}")
+                                continue
+                            if result.get("error") or not result.get("rows"):
+                                continue
+                            p_strict = {"Raw": 0, "Adjusted": 0, "CrossRef": 0}
+                            p_graded = {"Raw": 0, "Adjusted": 0, "CrossRef": 0}
+                            for wk_row in result["rows"]:
+                                for label in ["Raw", "Adjusted", "CrossRef"]:
+                                    hit = wk_row.get(f"{label} Hit")
+                                    if hit is not None:
+                                        p_graded[label] += 1
+                                        if hit:
+                                            p_strict[label] += 1
+                                        lwmc_agg[label][1] += 1
+                                        if hit:
+                                            lwmc_agg[label][0] += 1
+                                if wk_row.get("Agreement") == "Agree" and wk_row.get("Raw Hit") is not None:
+                                    lwmc_agree[1] += 1
+                                    if wk_row["Raw Hit"]:
+                                        lwmc_agree[0] += 1
+                                elif wk_row.get("Agreement") == "Conflict" and wk_row.get("Raw Hit") is not None:
+                                    lwmc_conflict[1] += 1
+                                    if wk_row["Raw Hit"]:
+                                        lwmc_conflict[0] += 1
+                            if p_graded["Raw"]:
+                                lwmc_rows.append({
+                                    "Player": nm, "Graded Games": p_graded["Raw"],
+                                    "Raw Hit Rate": f"{p_strict['Raw']}/{p_graded['Raw']} ({p_strict['Raw']/p_graded['Raw']*100:.0f}%)",
+                                })
+                    st.session_state["_lwmc_result"] = {
+                        "agg": lwmc_agg, "agree": lwmc_agree, "conflict": lwmc_conflict,
+                        "rows": lwmc_rows, "errors": lwmc_errors, "players_scanned": len(lwmc_rows),
+                    }
+            except Exception as e:
+                st.session_state["_lwmc_result"] = {"error": f"League-wide scan failed: {e}"}
+
+        lwmc = st.session_state.get("_lwmc_result")
+        if lwmc:
+            if lwmc.get("error"):
+                st.warning(lwmc["error"])
+            elif not lwmc.get("rows"):
+                st.info("No graded games came back across any scanned player - try lowering the "
+                         "minimum games filter, or check the line is realistic for this prop.")
+            else:
+                st.success(f"Tested {lwmc['players_scanned']} real {lwmc_pos}s with graded games.")
+                for label in ["Raw", "Adjusted", "CrossRef"]:
+                    hits, graded = lwmc["agg"][label]
+                    if graded:
+                        st.markdown(f"**{label}: {hits}/{graded} ({hits/graded*100:.0f}%)**")
+                a_hits, a_graded = lwmc["agree"]
+                c_hits, c_graded = lwmc["conflict"]
+                if a_graded or c_graded:
+                    st.markdown("**League-wide: when the two signals agree vs conflict:**")
+                    if a_graded:
+                        st.markdown(f"- Agree ({a_graded} weeks): {a_hits}/{a_graded} ({a_hits/a_graded*100:.0f}%)")
+                    if c_graded:
+                        st.markdown(f"- Conflict ({c_graded} weeks): {c_hits}/{c_graded} ({c_hits/c_graded*100:.0f}%)")
+                    st.caption(
+                        "This is the real, league-wide answer to whether the matchup grade adds "
+                        "trustworthy value beyond the raw trend - not just one player's noisy sample."
+                    )
+                st.dataframe(pd.DataFrame(lwmc["rows"]).sort_values("Graded Games", ascending=False),
+                             width='stretch')
+                if lwmc["errors"]:
+                    with st.expander(f"{len(lwmc['errors'])} skipped (name-match or data issues)"):
+                        st.write(lwmc["errors"])
 
         st.divider()
         st.markdown("### League-Wide Scan — All Positions, Best Matchups Only")
