@@ -1540,6 +1540,114 @@ elif mode == "Coverage Matchup (premium data)":
                 return None
             return {a: v / total for a, v in raw.items() if v > 0}
 
+        def _run_mu_source_comparison_backtest(bundle, p_name, p_pos, alignment, weights,
+                                                  game_log_season, top_n, prop, line):
+            """
+            MLB-format walk-forward backtest, real fixed line, ONE real prop
+            at a time - the direct test, not the "which of N props wins"
+            relative ranking. Compares THREE ways of computing mu, head to
+            head, same real games, same real line:
+
+              raw: flat trailing average of the player's own real games -
+              no matchup awareness at all. The control.
+
+              adjusted: raw mu nudged by the SAME Premium Adjustment logic
+              already used in Line Value (_predict_best_prop +
+              _apply_best_signal_adjustment) - only when the predicted
+              quality for THAT WEEK'S REAL opponent is genuinely strong.
+              Already includes both "grade both sides" (crucial-weighted
+              Quality Score) and "every heavy coverage, not just one"
+              (top-N inclusion) - reused, not rebuilt.
+
+              crossref: trailing average computed ONLY from real games
+              against teams that graded similarly (same coverage-lean
+              signature) to that week's real opponent - reuses
+              _find_cross_reference_teams directly.
+
+            No look-ahead in any of the three - only games strictly BEFORE
+            the one being graded feed that game's mu. Honest simplification
+            noted, not hidden: the adjusted-mu thin-sample check here is
+            simpler than the Line Value tool's (doesn't re-derive the full
+            report), so it's a slightly looser filter than that tool uses -
+            worth tightening in a later pass if this proves out.
+            """
+            pstats = pull_player_stats([int(game_log_season)])
+            sched = pull_schedules([int(game_log_season)])
+            matches = pstats[pstats["position"].astype(str).str.upper() == p_pos.upper()]
+            name_col = "player_display_name" if "player_display_name" in pstats.columns else (
+                "player_name" if "player_name" in pstats.columns else None)
+            gsis = None
+            if name_col:
+                hit = matches[matches[name_col].astype(str).str.lower() == p_name.lower()]
+                if not hit.empty:
+                    gsis = hit.iloc[0]["gsis_id"]
+            if gsis is None:
+                return {"error": f"Couldn't match '{p_name}' to a real nflreadpy record for {game_log_season}."}
+
+            stat_col = GAME_LOG_PROP_MAP.get(prop)
+            if stat_col is None:
+                return {"error": f"'{prop}' isn't a real receiving prop this tool tracks."}
+
+            all_abbrevs = set(TEAM_ABBREV_TO_FULL.keys())
+            full_log = build_coverage_crossref_game_log(
+                gsis, p_pos, all_abbrevs, pstats, sched, seasons=[int(game_log_season)], max_games=25,
+            )
+            # full_log is sorted most-recent-first (see build_coverage_crossref_game_log) -
+            # "games strictly before" game i means every game AFTER it in this list.
+            full_to_abbrevs = {}
+            for abbr, full in TEAM_ABBREV_TO_FULL.items():
+                full_to_abbrevs.setdefault(full, set()).add(abbr)
+
+            rows = []
+            for i, g in enumerate(full_log):
+                prior_games = full_log[i + 1:]
+                prior_vals = [pg["stats"].get(stat_col) for pg in prior_games if stat_col in pg.get("stats", {})]
+                prior_vals = [v for v in prior_vals if v is not None]
+                if len(prior_vals) < 3:
+                    continue
+                raw_mu = sum(prior_vals) / len(prior_vals)
+
+                opp_full = TEAM_ABBREV_TO_FULL.get(g["opponent"])
+                adjusted_mu = raw_mu
+                if opp_full and prop in PROP_STAT_MAP:
+                    pred = _predict_best_prop(bundle, p_name, p_pos, opp_full,
+                                                alignment=alignment, weights=weights, top_n=top_n)
+                    q_score = pred["scores"].get(prop) if pred else None
+                    adjusted_mu, _, _ = _apply_best_signal_adjustment(raw_mu, q_score, is_thin=False)
+
+                crossref_mu = None
+                if opp_full:
+                    opp_profile = bundle.def_coverage.get(opp_full)
+                    if opp_profile:
+                        included = _top_n_coverage_fields(bundle, opp_profile, top_n)
+                        cross_teams_full = _find_cross_reference_teams(bundle, included, opp_full, top_n, min_match=2)
+                        cross_abbrevs = set()
+                        for full_name in cross_teams_full:
+                            cross_abbrevs |= full_to_abbrevs.get(full_name, set())
+                        cr_vals = [pg["stats"].get(stat_col) for pg in prior_games
+                                   if stat_col in pg.get("stats", {}) and pg["opponent"] in cross_abbrevs]
+                        cr_vals = [v for v in cr_vals if v is not None]
+                        if len(cr_vals) >= 3:
+                            crossref_mu = sum(cr_vals) / len(cr_vals)
+
+                actual_value = g["stats"].get(stat_col)
+                if actual_value is None:
+                    continue
+
+                row = {"Week": g["week"], "Opponent": g["opponent"], "Actual": actual_value}
+                for label, mu_val in [("Raw", raw_mu), ("Adjusted", adjusted_mu), ("CrossRef", crossref_mu)]:
+                    if mu_val is None:
+                        row[f"{label} mu"] = "no data"
+                        row[f"{label} Hit"] = None
+                        continue
+                    predicted_over = mu_val > line
+                    actual_over = actual_value > line
+                    row[f"{label} mu"] = round(mu_val, 2)
+                    row[f"{label} Hit"] = predicted_over == actual_over
+                rows.append(row)
+
+            return {"rows": rows}
+
         def _run_season_backtest(bundle, p_name, p_pos, verdict_alignment, verdict_weights,
                                    game_log_season, top_n):
             """One full-season backtest run at a given top_n threshold, for
@@ -1825,6 +1933,65 @@ elif mode == "Coverage Matchup (premium data)":
                     "_pred_quality": pred_quality, "_pred_has_tie": pred_has_tie,
                 })
             return {"rows": rows, "strict_hits": strict_hits, "generous_hits": generous_hits, "graded": graded}
+
+        st.divider()
+        st.divider()
+        st.markdown("### Mu Comparison Backtest — Raw vs Adjusted vs Cross-Reference")
+        st.caption(
+            "The MLB-format direct test: does mu beat a REAL fixed line, one real prop at a "
+            "time - not 'which of several props wins.' Three mu sources compared head to head, "
+            "same real games, same real line: Raw (his own trailing average, no matchup "
+            "awareness), Adjusted (nudged by the coverage/alignment Quality Score - same "
+            "Premium Adjustment logic as Line Value, already grades both sides and every heavy "
+            "coverage a defense leans on, not just one), and CrossRef (his real games only "
+            "against teams that graded similarly to this week's real opponent). No look-ahead - "
+            "only real games strictly before the one being graded feed any of the three."
+        )
+        mucomp_col1, mucomp_col2, mucomp_col3 = st.columns(3)
+        with mucomp_col1:
+            mucomp_prop = st.selectbox(
+                "Prop to test", ["targets", "receptions", "rec_yards", "receiving_td"],
+                key="mucomp_prop")
+        with mucomp_col2:
+            mucomp_line = st.number_input("Real fixed line to test against", min_value=0.0,
+                                          value=5.5, step=0.5, key="mucomp_line")
+        with mucomp_col3:
+            mucomp_name = st.text_input("Player name (exact, as it appears in the export)",
+                                        value=p_name if p_name else "", key="mucomp_name")
+
+        if st.button("Run mu comparison backtest", type="primary", key="mucomp_run_btn"):
+            try:
+                mc_weights = _get_real_alignment_weights(bundle, mucomp_name) if (use_auto_weight and p_pos != "QB") else None
+                mc_alignment = None if use_auto_weight else align
+                mc_result = _run_mu_source_comparison_backtest(
+                    bundle, mucomp_name, p_pos, mc_alignment, mc_weights,
+                    game_log_season, int(top_n_rank), mucomp_prop, float(mucomp_line),
+                )
+                st.session_state["_mucomp_result"] = mc_result
+            except Exception as e:
+                st.session_state["_mucomp_result"] = {"error": f"Backtest failed: {e}"}
+
+        mc = st.session_state.get("_mucomp_result")
+        if mc:
+            if mc.get("error"):
+                st.warning(mc["error"])
+            elif not mc.get("rows"):
+                st.info("No graded games came back - try a lower minimum or a different player.")
+            else:
+                mc_df = pd.DataFrame(mc["rows"])
+                for label in ["Raw", "Adjusted", "CrossRef"]:
+                    hit_col = f"{label} Hit"
+                    if hit_col in mc_df.columns:
+                        valid = mc_df[hit_col].dropna()
+                        if len(valid):
+                            pct = valid.mean() * 100
+                            st.markdown(f"**{label}: {int(valid.sum())}/{len(valid)} ({pct:.0f}%)**")
+                st.dataframe(mc_df, width='stretch')
+                st.caption(
+                    "Read Raw as the honest baseline - if Adjusted and CrossRef don't clear it "
+                    "by a real margin, the matchup data isn't adding value for THIS prop/player "
+                    "yet, and that's a real finding worth knowing, not a failure to hide."
+                )
 
         st.divider()
         st.markdown("### League-Wide Scan — All Positions, Best Matchups Only")
