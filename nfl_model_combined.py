@@ -3869,9 +3869,12 @@ def build_season_accuracy_report(season: int, weeks: list = None, through_week: 
 # gracefully (skips the metric) instead of crashing.
 GAME_LOG_METRICS_BY_POSITION = {
     "QB": ["completions", "attempts", "passing_yards", "passing_tds", "interceptions", "passing_epa"],
-    "RB": ["carries", "rushing_yards", "rushing_epa", "receptions", "targets", "receiving_yards", "target_share"],
-    "WR": ["targets", "target_share", "receptions", "receiving_yards", "air_yards_share", "wopr", "racr", "receiving_epa"],
-    "TE": ["targets", "target_share", "receptions", "receiving_yards", "air_yards_share", "wopr", "racr", "receiving_epa"],
+    "RB": ["carries", "rushing_yards", "rushing_epa", "receptions", "targets", "receiving_yards",
+           "target_share", "receiving_tds"],
+    "WR": ["targets", "target_share", "receptions", "receiving_yards", "air_yards_share", "wopr",
+           "racr", "receiving_epa", "receiving_tds"],
+    "TE": ["targets", "target_share", "receptions", "receiving_yards", "air_yards_share", "wopr",
+           "racr", "receiving_epa", "receiving_tds"],
 }
 
 # Stats where a HIGHER number is worse (mirrors coverage_matchup.py's
