@@ -85,7 +85,20 @@ THIN_SAMPLE_ATT_THRESHOLD = {
 
 # Stats that actually decide rushing prop quality - double-weighted in the
 # quality score, same philosophy as CRUCIAL_QUALITY_STATS in streamlit_app.py
-CRUCIAL_RB_STATS = {"ATT", "YDS", "YPC", "Success %", "YACO/ATT", "MTF/ATT", "TD"}
+# Expanded per explicit real-world feedback: efficiency/explosiveness
+# metrics (EXP RUN %, EXP YDS %, TD RATE) and the full YACO/stuff family
+# genuinely separate a good rushing matchup from a bad one, not just raw
+# volume+YPC - a defense can allow decent YPC while still getting
+# stuffed at a high rate or giving up few explosive runs, and that
+# distinction matters for grading BOTH sides (player AND defense-allowed
+# use this same set). ATT % deliberately excluded: it only exists in the
+# Zone/Man-Gap Concept columns, and since each file is already a single
+# concept, that value is always ~100%/0% by definition - a redundant
+# confirmation number, not a real signal.
+CRUCIAL_RB_STATS = {
+    "ATT", "YDS", "YPC", "TD", "Success %", "EXP RUN %", "EXP YDS %",
+    "TD RATE", "MTF/ATT", "YACO", "YACO/ATT", "YACO %", "YBCO/ATT", "STUFF %",
+}
 
 # Stats where a HIGHER number is worse (mirrors coverage_matchup.py)
 INVERSE_STATS = {"FUM", "STUFF %"}
