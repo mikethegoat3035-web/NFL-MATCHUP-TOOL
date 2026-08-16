@@ -1335,10 +1335,18 @@ elif mode == "Coverage Matchup (premium data)":
         # curated DISPLAY set (CURATED_STATS below) - display and scoring
         # weight are two separate decisions.
         CRUCIAL_QUALITY_STATS = {
-            "QB": {"CMP %", "YPA", "TD", "INT", "RATE"},
-            "WR": {"TGT", "REC", "CR %", "YDS", "YPRR", "TD", "aDOT", "YAC/REC", "YACO/REC"},
-            "TE": {"TGT", "REC", "CR %", "YDS", "YPRR", "TD", "aDOT", "YAC/REC", "YACO/REC"},
-            "RB": {"TGT", "REC", "CR %", "YDS", "YPRR", "TD", "aDOT", "YAC/REC", "YACO/REC"},
+            "QB": {"CMP %", "YPA", "TD", "INT", "RATE", "CPOE", "ATT", "CMP", "YDS",
+                   "SACK %", "PRESS %", "Deep Throw %", "ACC %", "ADJ CMP %", "1Read %",
+                   "CHK %", "ANY/A", "EZATT"},
+            "WR": {"TGT", "REC", "CR %", "YDS", "YPRR", "TD", "aDOT", "YAC/REC", "YACO/REC",
+                   "TPRR", "YAC", "YPT", "YPR", "TGT %", "AY Share", "1READ %", "CTGT %",
+                   "CC %", "DRP %", "YPTOE", "EZTGT", "i20", "EZTD"},
+            "TE": {"TGT", "REC", "CR %", "YDS", "YPRR", "TD", "aDOT", "YAC/REC", "YACO/REC",
+                   "TPRR", "YAC", "YPT", "YPR", "TGT %", "AY Share", "1READ %", "CTGT %",
+                   "CC %", "DRP %", "YPTOE", "EZTGT", "i20", "EZTD"},
+            "RB": {"TGT", "REC", "CR %", "YDS", "YPRR", "TD", "aDOT", "YAC/REC", "YACO/REC",
+                   "TPRR", "YAC", "YPT", "YPR", "TGT %", "AY Share", "1READ %", "CTGT %",
+                   "CC %", "DRP %", "YPTOE", "EZTGT", "i20", "EZTD"},
             # Separate key for RB RUSHING (run-concept section) - real bug
             # this fixes: "RB" above is the receiving-side set (RB as a
             # pass-catcher in the coverage/alignment section), which uses
@@ -1388,10 +1396,18 @@ elif mode == "Coverage Matchup (premium data)":
         # column anywhere, and longest catch needs per-play pbp data not yet
         # wired (see diagnose_player_stats_for_game_log). Real crucial-stat
         # set here, not a guess: TGT=opportunity, REC=realized volume,
-        # YDS=production.
-        PROP_STAT_MAP = {"targets": "TGT", "receptions": "REC", "rec_yards": "YDS"}
-        GAME_LOG_PROP_MAP = {"targets": "targets", "receptions": "receptions", "rec_yards": "receiving_yards"}
-        PROP_LABELS = {"targets": "Targets", "receptions": "Receptions", "rec_yards": "Receiving Yards"}
+        # YDS=production. receiving_td added on BOTH sides (TD is a real
+        # confirmed column in the CSV predicted data - already tiered and
+        # shown on every coverage card - and receiving_tds is a confirmed
+        # real nflreadpy column, used elsewhere in this codebase for
+        # fantasy point math) - safe to add directly, unlike longest_catch
+        # below which only has an actual-side column and would corrupt
+        # the backtest if treated the same way.
+        PROP_STAT_MAP = {"targets": "TGT", "receptions": "REC", "rec_yards": "YDS", "receiving_td": "TD"}
+        GAME_LOG_PROP_MAP = {"targets": "targets", "receptions": "receptions", "rec_yards": "receiving_yards",
+                              "receiving_td": "receiving_tds"}
+        PROP_LABELS = {"targets": "Targets", "receptions": "Receptions", "rec_yards": "Receiving Yards",
+                        "receiving_td": "Receiving TD"}
         # longest_catch deliberately NOT in GAME_LOG_PROP_MAP/PROP_STAT_MAP -
         # the backtest compares predicted-best vs actual-best, and there's
         # no CSV column to PREDICT longest catch from at all. Adding it to
@@ -1475,6 +1491,27 @@ elif mode == "Coverage Matchup (premium data)":
             if score >= 20:
                 return "tier-below-avg"
             return "tier-poor"
+
+        def _apply_best_signal_adjustment(mu, quality_score, is_thin, max_pct=0.12):
+            """Only nudges mu when the premium matchup signal is genuinely
+            strong - not any signal, the BEST ones. Requires quality_score
+            to be at least 25 points from neutral (50) - i.e. real Above
+            Avg/Elite or Below Avg/Poor territory, not Average - AND not a
+            thin sample. Anything softer than that leaves mu untouched
+            rather than nudging on a mediocre or unreliable read.
+            Adjustment scales linearly from 0% (at the 25-point threshold)
+            up to max_pct (at the extremes, quality_score=0 or 100), so a
+            marginal-but-qualifying signal moves mu less than a truly
+            extreme one. Returns (adjusted_mu, pct_applied, applied: bool)."""
+            if quality_score is None or is_thin:
+                return mu, 0.0, False
+            distance = quality_score - 50  # -50..+50
+            if abs(distance) < 25:
+                return mu, 0.0, False
+            # scale from 25->0% up to 50->max_pct
+            pct = max_pct * (abs(distance) - 25) / 25
+            pct = pct if distance > 0 else -pct
+            return round(mu * (1 + pct), 2), round(pct * 100, 1), True
 
         def _get_real_alignment_weights(bundle, player_name):
             """Real season-long alignment split for this player, read straight
@@ -1898,20 +1935,21 @@ elif mode == "Coverage Matchup (premium data)":
                     )
                     st.markdown(verdict_html, unsafe_allow_html=True)
                 st.caption(
-                    "TD props and longest catch aren't included yet - not confirmed columns "
-                    "anywhere in the pipeline. Only targets/receptions/rec yards, which are."
+                    "Longest catch isn't included in this verdict - no season-aggregate CSV "
+                    "column to predict it from, only real per-game data (see the line "
+                    "comparison below, where it IS available). Targets/receptions/rec yards/"
+                    "receiving TD are all real on both the predicted and actual side."
                 )
 
-                st.markdown("### Compare to a Real Line")
+                st.markdown("### Line Value + Backtest Reliability")
                 st.caption(
-                    "Once real lines exist (week 1+), enter them here. mu/sigma come from this "
-                    "player's REAL game log this season (same nflreadpy data as the backtest, "
-                    "not the season-aggregate coverage CSVs - those have no per-game numbers to "
-                    "compare a line against). Uses the exact same rescore_quality_mu_row_nfl "
-                    "function Scan mode uses, so edge/p_over here means the same thing it does "
-                    "there. Early in the season, current-season games are thin - mu/sigma still "
-                    "compute as soon as 2+ real games exist, but treat single-digit-game sigma "
-                    "as rough until more of the season is in."
+                    "One table: real mu/edge for whatever lines you enter, PLUS how reliable "
+                    "this method has been historically for this player (run the backtest above "
+                    "first to populate that column - optional, but the honest context for how "
+                    "much to trust the edge shown). mu only gets adjusted by the premium coverage "
+                    "data when the signal is genuinely strong - Above Avg/Elite or Below Avg/Poor "
+                    "(25+ points from neutral) and NOT a thin sample. A merely Average matchup "
+                    "grade leaves mu untouched rather than nudging on a mediocre read."
                 )
 
                 def _get_player_mu_sigma(bundle, gsis_id, position, stat_col, pstats, sched, season, pbp=None):
@@ -1930,7 +1968,7 @@ elif mode == "Coverage Matchup (premium data)":
                         sigma = max(mu * 0.15, 1.0)
                     return mu, sigma, len(vals)
 
-                line_col1, line_col2, line_col3, line_col4 = st.columns(4)
+                line_col1, line_col2, line_col3, line_col4, line_col5 = st.columns(5)
                 with line_col1:
                     tgt_line = st.number_input("Targets line", min_value=0.0, value=0.0, step=0.5, key="tgt_line")
                 with line_col2:
@@ -1939,8 +1977,105 @@ elif mode == "Coverage Matchup (premium data)":
                     yds_line = st.number_input("Rec Yards line", min_value=0.0, value=0.0, step=0.5, key="yds_line")
                 with line_col4:
                     lng_line = st.number_input("Longest Catch line", min_value=0.0, value=0.0, step=0.5, key="lng_catch_line")
+                with line_col5:
+                    rtd_line = st.number_input("Receiving TD line", min_value=0.0, value=0.0, step=0.5, key="rtd_line")
 
-                if st.button("Check value vs these lines", type="secondary"):
+                if p_pos == "QB":
+                    st.caption(
+                        "QB props: mu/sigma come from real game logs (all 4 confirmed real "
+                        "nflreadpy columns). Premium Adj applies to all 4 props - Attempts, "
+                        "Completions, Yards, and TD are all confirmed real columns on the CSV "
+                        "side too, so every one can get the adjustment when the signal qualifies."
+                    )
+                    qb_line_col1, qb_line_col2, qb_line_col3, qb_line_col4 = st.columns(4)
+                    with qb_line_col1:
+                        patt_line = st.number_input("Pass Attempts line", min_value=0.0, value=0.0, step=0.5, key="patt_line")
+                    with qb_line_col2:
+                        pcmp_line = st.number_input("Pass Completions line", min_value=0.0, value=0.0, step=0.5, key="pcmp_line")
+                    with qb_line_col3:
+                        pyds_line = st.number_input("Pass Yards line", min_value=0.0, value=0.0, step=0.5, key="pyds_line")
+                    with qb_line_col4:
+                        ptd_line = st.number_input("Pass TD line", min_value=0.0, value=0.0, step=0.5, key="ptd_line")
+
+                    QB_LINE_PROP_MAP = {"pass_attempts": "attempts", "pass_completions": "completions",
+                                         "pass_yards": "passing_yards", "pass_td": "passing_tds"}
+                    QB_LINE_PROP_LABELS = {"pass_attempts": "Pass Attempts", "pass_completions": "Pass Completions",
+                                            "pass_yards": "Pass Yards", "pass_td": "Pass TD"}
+                    # pass_completions now included - CMP confirmed as a real
+                    # raw completions column (not just the CMP % rate this
+                    # was originally built against), so it gets the same
+                    # Premium Adjustment treatment as the other 3 props now.
+                    QB_PREDICT_STAT_MAP = {"pass_attempts": "ATT", "pass_completions": "CMP",
+                                            "pass_yards": "YDS", "pass_td": "TD"}
+
+                    if st.button("Check QB value vs these lines", type="primary"):
+                        try:
+                            qbl_pstats = pull_player_stats([int(game_log_season)])
+                            qbl_sched = pull_schedules([int(game_log_season)])
+                            qbl_matches = qbl_pstats[qbl_pstats["position"].astype(str).str.upper() == "QB"]
+                            qbl_name_col = "player_display_name" if "player_display_name" in qbl_pstats.columns else (
+                                "player_name" if "player_name" in qbl_pstats.columns else None)
+                            qbl_gsis = None
+                            if qbl_name_col:
+                                qbl_hit = qbl_matches[qbl_matches[qbl_name_col].astype(str).str.lower() == p_name.lower()]
+                                if not qbl_hit.empty:
+                                    qbl_gsis = qbl_hit.iloc[0]["gsis_id"]
+                            if qbl_gsis is None:
+                                st.session_state["_line_compare"] = {
+                                    "error": f"Couldn't match '{p_name}' to a real nflreadpy record for {game_log_season}."}
+                            else:
+                                qb_lines = {"pass_attempts": patt_line, "pass_completions": pcmp_line,
+                                            "pass_yards": pyds_line, "pass_td": ptd_line}
+                                ubt_cached = st.session_state.get("_unified_backtest")
+                                reliability = "run backtest above first"
+                                if ubt_cached and not ubt_cached.get("error") and ubt_cached.get("total_graded"):
+                                    match_row = next((r for r in ubt_cached["rows"] if r["Player"].lower() == p_name.lower()), None)
+                                    if match_row:
+                                        reliability = match_row["Strict Hit Rate"]
+                                rows = []
+                                for prop, line_val in qb_lines.items():
+                                    if not line_val:
+                                        continue
+                                    stat_col = QB_LINE_PROP_MAP[prop]
+                                    mu, sigma, n_games = _get_player_mu_sigma(
+                                        bundle, qbl_gsis, "QB", stat_col, qbl_pstats, qbl_sched, int(game_log_season),
+                                    )
+                                    if mu is None:
+                                        rows.append({"Prop": QB_LINE_PROP_LABELS[prop], "Line": line_val,
+                                                     "mu": "no data", "Premium Adj": "-", "sigma": "-", "Games": n_games,
+                                                     "p(Over)": "-", "Edge": "-", "Backtest Reliability": reliability})
+                                        continue
+                                    q_score = None
+                                    is_thin_signal = True
+                                    if prop in QB_PREDICT_STAT_MAP:
+                                        stat_col_csv = QB_PREDICT_STAT_MAP[prop]
+                                        weighted_vals = []
+                                        for e in report:
+                                            row = e.get(own_key)
+                                            if row is None:
+                                                continue
+                                            tier = row.get("_tiers", {}).get(stat_col_csv)
+                                            if tier in TIER_WEIGHTS:
+                                                weighted_vals.append(TIER_WEIGHTS[tier])
+                                            if not row.get("_thin_sample"):
+                                                is_thin_signal = False
+                                        if weighted_vals:
+                                            q_score = sum(weighted_vals) / len(weighted_vals)
+                                    adj_mu, adj_pct, applied = _apply_best_signal_adjustment(mu, q_score, is_thin_signal)
+                                    scored = rescore_quality_mu_row_nfl(adj_mu, line_val, sigma)
+                                    rows.append({
+                                        "Prop": QB_LINE_PROP_LABELS[prop], "Line": line_val,
+                                        "mu": round(mu, 1),
+                                        "Premium Adj": f"{adj_pct:+.1f}%" if applied else "none (not extreme enough)",
+                                        "sigma": round(sigma, 1), "Games": n_games,
+                                        "p(Over)": scored["p_over"], "Edge": scored["edge"],
+                                        "Backtest Reliability": reliability,
+                                    })
+                                st.session_state["_line_compare"] = {"rows": rows}
+                        except Exception as e:
+                            st.session_state["_line_compare"] = {"error": f"Line check failed: {e}"}
+
+                elif st.button("Check value vs these lines", type="primary"):
                     try:
                         lc_pstats = pull_player_stats([int(game_log_season)])
                         lc_sched = pull_schedules([int(game_log_season)])
@@ -1958,7 +2093,16 @@ elif mode == "Coverage Matchup (premium data)":
                                 "error": f"Couldn't match '{p_name}' to a real nflreadpy record for {game_log_season}."}
                         else:
                             lines = {"targets": tgt_line, "receptions": rec_line, "rec_yards": yds_line,
-                                     "longest_catch": lng_line}
+                                     "longest_catch": lng_line, "receiving_td": rtd_line}
+                            # Backtest reliability, if already run this session for this player -
+                            # optional context column, doesn't block the line check if absent.
+                            ubt_cached = st.session_state.get("_unified_backtest")
+                            reliability = "run backtest above first"
+                            if ubt_cached and not ubt_cached.get("error") and ubt_cached.get("total_graded"):
+                                match_row = next((r for r in ubt_cached["rows"] if r["Player"].lower() == p_name.lower()), None)
+                                if match_row:
+                                    reliability = match_row["Strict Hit Rate"]
+
                             rows = []
                             for prop, line_val in lines.items():
                                 if not line_val:
@@ -1970,14 +2114,42 @@ elif mode == "Coverage Matchup (premium data)":
                                 )
                                 if mu is None:
                                     rows.append({"Prop": LINE_COMPARE_PROP_LABELS[prop], "Line": line_val,
-                                                 "mu": "no data", "sigma": "-", "Games": n_games,
-                                                 "p(Over)": "-", "Edge": "-"})
+                                                 "mu": "no data", "Premium Adj": "-", "sigma": "-", "Games": n_games,
+                                                 "p(Over)": "-", "Edge": "-", "Backtest Reliability": reliability})
                                     continue
-                                scored = rescore_quality_mu_row_nfl(mu, line_val, sigma)
+                                # Only the props with a real CSV column to grade (targets/
+                                # receptions/rec_yards) get the premium adjustment -
+                                # longest_catch has no season-aggregate signal to pull from
+                                # (same reasoning as it being excluded from the verdict/backtest).
+                                q_score = verdict["scores"].get(prop) if verdict and prop in PROP_STAT_MAP else None
+                                # The blended verdict score looks precise even when EVERY
+                                # contributing coverage entry is thin - only trust it as a
+                                # "best possible" signal if at least ONE real solid-sample
+                                # entry backs it. Handles BOTH entry shapes: manual/QB
+                                # entries (own_key) and auto-weighted entries
+                                # (alignment_breakdown) - auto-weight is the default mode,
+                                # so skipping it here would've silently treated every
+                                # default-mode matchup as thin and never adjusted at all.
+                                has_solid_entry = False
+                                for e in report:
+                                    if e.get("auto_weighted"):
+                                        if any(b.get("own_row") and b.get("confidence") != "thin_sample"
+                                               for b in e.get("alignment_breakdown", [])):
+                                            has_solid_entry = True
+                                            break
+                                    elif e.get(own_key) and not e[own_key].get("_thin_sample"):
+                                        has_solid_entry = True
+                                        break
+                                is_thin_signal = not has_solid_entry
+                                adj_mu, adj_pct, applied = _apply_best_signal_adjustment(mu, q_score, is_thin_signal)
+                                scored = rescore_quality_mu_row_nfl(adj_mu, line_val, sigma)
                                 rows.append({
                                     "Prop": LINE_COMPARE_PROP_LABELS[prop], "Line": line_val,
-                                    "mu": round(mu, 1), "sigma": round(sigma, 1), "Games": n_games,
+                                    "mu": round(mu, 1),
+                                    "Premium Adj": f"{adj_pct:+.1f}%" if applied else "none (not extreme enough)",
+                                    "sigma": round(sigma, 1), "Games": n_games,
                                     "p(Over)": scored["p_over"], "Edge": scored["edge"],
+                                    "Backtest Reliability": reliability,
                                 })
                             st.session_state["_line_compare"] = {"rows": rows}
                     except Exception as e:
@@ -1993,11 +2165,11 @@ elif mode == "Coverage Matchup (premium data)":
                         st.dataframe(pd.DataFrame(lc["rows"]), width='stretch')
                         st.caption(
                             "Edge is 0 (coinflip) to 1 (max conviction) - same scale as Scan mode. "
-                            "mu/sigma here are the player's own real game-log average/spread this "
-                            "season, NOT adjusted for which specific coverages this week's opponent "
-                            "runs - that's what the coverage cards above are for. Read the two "
-                            "together: a real edge on the line PLUS a favorable coverage matchup "
-                            "above is a stronger case than either alone."
+                            "'mu' is the player's raw real game-log average; 'Premium Adj' shows "
+                            "whether the coverage matchup data was strong enough to nudge it (Edge/"
+                            "p(Over) above are computed from the ADJUSTED number when a nudge "
+                            "applied). 'Backtest Reliability' is this method's real historical hit "
+                            "rate for this player, if you've run the backtest above."
                         )
 
                 st.divider()
@@ -2476,12 +2648,14 @@ elif mode == "Coverage Matchup (premium data)":
                             )
 
                             st.divider()
-                            st.markdown("### Compare to a Real Line (RB)")
+                            st.markdown("### Line Value + Backtest Reliability (RB)")
                             st.caption(
-                                "Same real mu/sigma-from-game-log approach as the WR line "
-                                "comparison. Longest Rush is real here (computed from real "
-                                "play-by-play, not guessed) even though it can't be part of the "
-                                "verdict above."
+                                "Same merged table as the WR side: real mu/edge for whatever lines "
+                                "you enter, PLUS this method's real historical hit rate for this RB "
+                                "(run the RB backtest below first to populate that column). mu only "
+                                "gets adjusted by the run-concept data when the signal is genuinely "
+                                "strong (25+ points from neutral, not a thin sample) - a merely "
+                                "Average concept grade leaves mu untouched."
                             )
                             RB_LINE_PROP_MAP = {"rush_attempts": "carries", "rush_yards": "rushing_yards",
                                                  "longest_rush": "longest_play"}
@@ -2495,7 +2669,7 @@ elif mode == "Coverage Matchup (premium data)":
                             with rb_line_col3:
                                 rb_lng_line = st.number_input("Longest Rush line", min_value=0.0, value=0.0, step=0.5, key="rb_lng_line")
 
-                            if st.button("Check RB value vs these lines", type="secondary"):
+                            if st.button("Check RB value vs these lines", type="primary"):
                                 try:
                                     rbl_pstats = pull_player_stats([int(game_log_season)])
                                     rbl_sched = pull_schedules([int(game_log_season)])
@@ -2514,6 +2688,11 @@ elif mode == "Coverage Matchup (premium data)":
                                     else:
                                         rb_lines = {"rush_attempts": rb_att_line, "rush_yards": rb_yds_line,
                                                     "longest_rush": rb_lng_line}
+                                        rb_ubt_cached = st.session_state.get("_rb_backtest")
+                                        rb_reliability = "run RB backtest below first"
+                                        if rb_ubt_cached and not rb_ubt_cached.get("error") and rb_ubt_cached.get("graded"):
+                                            rb_sr = rb_ubt_cached["strict_hits"] / rb_ubt_cached["graded"] * 100
+                                            rb_reliability = f"{rb_ubt_cached['strict_hits']}/{rb_ubt_cached['graded']} ({rb_sr:.0f}%)"
                                         rb_line_rows = []
                                         for prop, line_val in rb_lines.items():
                                             if not line_val:
@@ -2525,14 +2704,28 @@ elif mode == "Coverage Matchup (premium data)":
                                             )
                                             if mu is None:
                                                 rb_line_rows.append({"Prop": RB_LINE_PROP_LABELS[prop], "Line": line_val,
-                                                                      "mu": "no data", "sigma": "-", "Games": n_games,
-                                                                      "p(Over)": "-", "Edge": "-"})
+                                                                      "mu": "no data", "Premium Adj": "-", "sigma": "-",
+                                                                      "Games": n_games, "p(Over)": "-", "Edge": "-",
+                                                                      "Backtest Reliability": rb_reliability})
                                                 continue
-                                            scored = rescore_quality_mu_row_nfl(mu, line_val, sigma)
+                                            # longest_rush has no season-aggregate concept
+                                            # column to grade from - same reasoning as WR's
+                                            # longest_catch, no adjustment applies to it.
+                                            rb_q_score = rb_verdict["scores"].get(prop) if rb_verdict and prop in RB_PROP_STAT_MAP else None
+                                            rb_has_solid = any(
+                                                e.get("own_row") and not e["own_row"].get("_thin_sample")
+                                                for e in rb_report if e.get("own_row")
+                                            )
+                                            rb_is_thin = not rb_has_solid
+                                            rb_adj_mu, rb_adj_pct, rb_applied = _apply_best_signal_adjustment(mu, rb_q_score, rb_is_thin)
+                                            scored = rescore_quality_mu_row_nfl(rb_adj_mu, line_val, sigma)
                                             rb_line_rows.append({
                                                 "Prop": RB_LINE_PROP_LABELS[prop], "Line": line_val,
-                                                "mu": round(mu, 1), "sigma": round(sigma, 1), "Games": n_games,
+                                                "mu": round(mu, 1),
+                                                "Premium Adj": f"{rb_adj_pct:+.1f}%" if rb_applied else "none (not extreme enough)",
+                                                "sigma": round(sigma, 1), "Games": n_games,
                                                 "p(Over)": scored["p_over"], "Edge": scored["edge"],
+                                                "Backtest Reliability": rb_reliability,
                                             })
                                         st.session_state["_rb_line_compare"] = {"rows": rb_line_rows}
                                 except Exception as e:
