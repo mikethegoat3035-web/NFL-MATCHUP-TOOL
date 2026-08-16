@@ -70,6 +70,10 @@ OUTLIER_Z_THRESHOLD = 1.0
 
 # Stats where a HIGHER number is worse for the QB (need to flip tiering direction)
 INVERSE_STATS = {"INT", "SACK", "SACK %", "SK YDS", "DROP %", "DROP YDS",
+                  "DRP", "DRP %",  # real column names confirmed from actual
+                  # WR/TE exports - "DROP %" above never matched real data at
+                  # all, meaning drop rate tiering direction was silently
+                  # wrong (higher drops looked "better") until this fix
                   "PRESS %", "PRESS SK %", "TTSK", "QB SK", "QBP", "BAT", "SPK"}
 
 # Non-numeric / identifier columns - never tier these
