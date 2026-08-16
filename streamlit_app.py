@@ -2206,6 +2206,13 @@ elif mode == "Coverage Matchup (premium data)":
                                                     alignment=verdict_alignment, weights=verdict_weights,
                                                     top_n=top_n) if opp_full else None)
                         pred_best = pred["best"] if pred else None
+                        # How strong was THIS week's prediction, not just which prop won -
+                        # a prop that barely edged out the others (score near 50, or tied
+                        # with another prop) is a much weaker call than one that scored
+                        # 85+ standalone. Kept per-week so the auto-scan below can filter
+                        # to genuinely strong weeks instead of grading every call equally.
+                        pred_quality = pred["scores"].get(pred_best) if (pred and pred_best) else None
+                        pred_has_tie = bool(pred["ties"]) if pred else False
                         actual_best, actual_ties = _actual_best_prop(g.get("tiers", {}))
                         result = "—"
                         if pred_best is not None and actual_best is not None:
@@ -2224,6 +2231,7 @@ elif mode == "Coverage Matchup (premium data)":
                             "Predicted Best": PROP_LABELS.get(pred_best, "no data"),
                             "Actual Best": PROP_LABELS.get(actual_best, "no data"),
                             "Result": result,
+                            "_pred_quality": pred_quality, "_pred_has_tie": pred_has_tie,
                         })
                     return {"rows": rows, "strict_hits": strict_hits, "generous_hits": generous_hits, "graded": graded}
 
@@ -2336,7 +2344,9 @@ elif mode == "Coverage Matchup (premium data)":
                             )
                             if detail_pick and ubt["detail"].get(detail_pick):
                                 with st.expander(f"Week-by-week — {detail_pick}"):
-                                    st.dataframe(pd.DataFrame(ubt["detail"][detail_pick]), width='stretch')
+                                    detail_rows = [{k: v for k, v in r.items() if not k.startswith("_")}
+                                                    for r in ubt["detail"][detail_pick]]
+                                    st.dataframe(pd.DataFrame(detail_rows), width='stretch')
 
                     if ubt.get("sweep_rows"):
                         st.markdown("**Threshold sweep** (aggregate across all entered players):")
@@ -2351,6 +2361,157 @@ elif mode == "Coverage Matchup (premium data)":
                             )
                         display_rows = [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows_s]
                         st.dataframe(pd.DataFrame(display_rows), width='stretch')
+
+                st.divider()
+                st.markdown("### League-Wide Auto-Scan Backtest (no typing required)")
+                st.caption(
+                    "Automatically finds every real player at this position with enough games "
+                    "to be worth grading (no names to type), runs the full-season backtest on "
+                    "each one using their REAL weekly opponents. By default this only counts "
+                    "the BEST possible calls - weeks where the predicted prop scored genuinely "
+                    "strong (Above Avg/Elite territory) AND wasn't a toss-up with another prop - "
+                    "not every prediction regardless of strength. Uncheck below to see the "
+                    "unfiltered number for comparison. Same look-ahead-bias caveat as every "
+                    "other backtest on this page: season-aggregate splits, not a clean pre-game "
+                    "test."
+                )
+                scan_col1, scan_col2 = st.columns(2)
+                with scan_col1:
+                    scan_min_games = st.number_input(
+                        "Minimum real games played this season (filters out thin/irrelevant players)",
+                        min_value=1, max_value=18, value=8, step=1,
+                    )
+                with scan_col2:
+                    scan_max_players = st.number_input(
+                        "Max players to scan (higher = more complete, slower)",
+                        min_value=5, max_value=150, value=40, step=5,
+                    )
+                scan_high_conf_only = st.checkbox(
+                    "Only count the BEST possible calls (score ≥ 70, no toss-ups)", value=True,
+                )
+
+                if st.button("Scan full season — all players", type="primary"):
+                    try:
+                        with st.spinner(f"Scanning up to {int(scan_max_players)} real {p_pos} seasons - this can take a bit..."):
+                            scan_pstats = pull_player_stats([int(game_log_season)])
+                            scan_matches = scan_pstats[scan_pstats["position"].astype(str).str.upper() == p_pos.upper()]
+                            scan_name_col = "player_display_name" if "player_display_name" in scan_pstats.columns else (
+                                "player_name" if "player_name" in scan_pstats.columns else None)
+                            if not scan_name_col:
+                                st.session_state["_league_scan"] = {"error": "Couldn't find a player name column in the real data."}
+                            else:
+                                games_per_player = scan_matches.groupby(scan_name_col)["week"].nunique()
+                                eligible = games_per_player[games_per_player >= int(scan_min_games)].sort_values(ascending=False)
+                                names_to_scan = list(eligible.index[:int(scan_max_players)])
+
+                                per_player_rows = []
+                                prop_totals = {}  # prop label -> [strict_hits, generous_hits, graded]
+                                total_strict = total_generous = total_graded = 0
+                                total_weeks_seen = total_weeks_kept = 0
+                                errors = []
+                                for nm in names_to_scan:
+                                    nm_weights = _get_real_alignment_weights(bundle, nm) if (use_auto_weight and p_pos != "QB") else None
+                                    nm_alignment = None if use_auto_weight else align
+                                    try:
+                                        result = _run_season_backtest(
+                                            bundle, nm, p_pos, nm_alignment, nm_weights,
+                                            game_log_season, int(top_n_rank),
+                                        )
+                                    except Exception as e:
+                                        errors.append(f"{nm}: {e}")
+                                        continue
+                                    if result.get("error"):
+                                        continue
+
+                                    # Filter to genuinely strong weeks only, unless the box
+                                    # above is unchecked - a call that barely edged out the
+                                    # others (score near 50, or tied) isn't a "best possible"
+                                    # matchup, it's a coin flip the method happened to lean on.
+                                    kept_rows = []
+                                    for wk_row in result["rows"]:
+                                        if wk_row["Predicted Best"] == "no data":
+                                            continue
+                                        total_weeks_seen += 1
+                                        if scan_high_conf_only:
+                                            q = wk_row.get("_pred_quality")
+                                            if q is None or q < 70 or wk_row.get("_pred_has_tie"):
+                                                continue
+                                        total_weeks_kept += 1
+                                        kept_rows.append(wk_row)
+
+                                    if not kept_rows:
+                                        continue
+
+                                    p_strict = sum(1 for r in kept_rows if r["Result"] == "✅ Hit")
+                                    p_generous = sum(1 for r in kept_rows if r["Result"] in ("✅ Hit", "〰️ Tie"))
+                                    p_graded = len(kept_rows)
+                                    total_strict += p_strict
+                                    total_generous += p_generous
+                                    total_graded += p_graded
+                                    per_player_rows.append({
+                                        "Player": nm, "Graded Games": p_graded,
+                                        "Strict Hit Rate": f"{p_strict}/{p_graded} ({p_strict/p_graded*100:.0f}%)",
+                                    })
+                                    for wk_row in kept_rows:
+                                        prop = wk_row["Predicted Best"]
+                                        prop_totals.setdefault(prop, [0, 0, 0])
+                                        if wk_row["Result"] == "✅ Hit":
+                                            prop_totals[prop][0] += 1
+                                            prop_totals[prop][1] += 1
+                                        elif wk_row["Result"] == "〰️ Tie":
+                                            prop_totals[prop][1] += 1
+                                        prop_totals[prop][2] += 1
+
+                                prop_rows = []
+                                for prop, (sh, gh, gr) in prop_totals.items():
+                                    if gr:
+                                        prop_rows.append({
+                                            "Predicted Prop": prop, "Times Predicted": gr,
+                                            "Strict Hit Rate": f"{sh}/{gr} ({sh/gr*100:.0f}%)",
+                                            "Including Near-Ties": f"{gh}/{gr} ({gh/gr*100:.0f}%)",
+                                        })
+                                prop_rows.sort(key=lambda r: -r["Times Predicted"])
+
+                                st.session_state["_league_scan"] = {
+                                    "players_scanned": len(names_to_scan),
+                                    "players_graded": len(per_player_rows),
+                                    "per_player_rows": per_player_rows,
+                                    "prop_rows": prop_rows,
+                                    "total_strict": total_strict, "total_generous": total_generous,
+                                    "total_graded": total_graded, "errors": errors,
+                                    "high_conf_only": scan_high_conf_only,
+                                    "weeks_seen": total_weeks_seen, "weeks_kept": total_weeks_kept,
+                                }
+                    except Exception as e:
+                        st.session_state["_league_scan"] = {"error": f"Scan failed: {e}"}
+
+                lscan = st.session_state.get("_league_scan")
+                if lscan:
+                    if lscan.get("error"):
+                        st.warning(lscan["error"])
+                    elif lscan["total_graded"] == 0:
+                        st.info("No graded games at this filter level - try unchecking 'best possible calls only', or lowering the minimum games filter.")
+                    else:
+                        lsr = lscan["total_strict"] / lscan["total_graded"] * 100
+                        lgr = lscan["total_generous"] / lscan["total_graded"] * 100
+                        filter_note = (
+                            f" (filtered to {lscan['weeks_kept']}/{lscan['weeks_seen']} weeks that were genuinely strong calls)"
+                            if lscan.get("high_conf_only") else " (unfiltered - every prediction counted, weak or strong)"
+                        )
+                        st.markdown(
+                            f"**Scanned {lscan['players_scanned']} real {p_pos}s ({lscan['players_graded']} had "
+                            f"gradable games), {lscan['total_graded']} total real games — overall strict hit rate: "
+                            f"{lscan['total_strict']}/{lscan['total_graded']} ({lsr:.0f}%)** &nbsp;&nbsp;|&nbsp;&nbsp; "
+                            f"including near-ties: {lscan['total_generous']}/{lscan['total_graded']} ({lgr:.0f}%) "
+                            f"&nbsp;&nbsp;(random baseline: ~33%){filter_note}"
+                        )
+                        st.markdown("**By prop — which one the method actually predicts best:**")
+                        st.dataframe(pd.DataFrame(lscan["prop_rows"]), width='stretch')
+                        with st.expander(f"Per-player breakdown ({lscan['players_graded']} players)"):
+                            st.dataframe(pd.DataFrame(lscan["per_player_rows"]), width='stretch')
+                        if lscan["errors"]:
+                            with st.expander(f"{len(lscan['errors'])} player(s) skipped (name-match issues)"):
+                                st.write(lscan["errors"])
 
                 st.divider()
                 st.markdown("### Real Weekly Game Log — Cross-Referenced Opponents")
