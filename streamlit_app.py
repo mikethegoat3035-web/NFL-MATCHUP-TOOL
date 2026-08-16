@@ -1713,6 +1713,119 @@ elif mode == "Coverage Matchup (premium data)":
                 })
             return {"rows": rows, "strict_hits": strict_hits, "generous_hits": generous_hits, "graded": graded}
 
+        # ---- RB rushing equivalent - genuinely different props again
+        # (Rush Attempts/Rush Yards, from the SEPARATE rb_matchup.py concept
+        # data, not the coverage bundle at all). Relocated here from deep
+        # inside the single-matchup RB report flow - same reason
+        # _run_season_backtest was relocated earlier: the League-Wide scan
+        # needs these callable WITHOUT a report/player already built first.
+        # Real gap this closes: the League-Wide scan previously routed RB
+        # through the WR/TE receiving-prop pipeline (targets/receptions/
+        # rec_yards/receiving_td) - correct for RBs as pass-catchers, but
+        # it meant Rush Attempts/Rush Yards were NEVER actually tested for
+        # RBs in that scan at all, despite the RB rushing backtest already
+        # existing as its own separate single-player tool.
+        RB_PROP_LABELS = {"rush_attempts": "Rush Attempts", "rush_yards": "Rush Yards"}
+        RB_PROP_STAT_MAP = {"rush_attempts": "ATT", "rush_yards": "YDS"}
+        RB_GAME_LOG_PROP_MAP = {"rush_attempts": "carries", "rush_yards": "rushing_yards"}
+
+        def _predict_best_rb_prop(rb_bundle, rb_name, opponent_team_full):
+            """Blends BOTH the RB's own tier AND the opponent's
+            defense-allowed tier per concept (50/50 when both exist),
+            weighted by his real attempt share per concept - identical
+            logic to the single-matchup version, just callable standalone."""
+            rb_own_atts = {
+                c: (rb_bundle.rb_vs_concept.get(c, {}).get(rb_name, {}) or {}).get("_att", 0)
+                for c in RB_CONCEPT_FILES
+            }
+            total_att = sum(rb_own_atts.values())
+            weights = {c: (a / total_att) for c, a in rb_own_atts.items() if total_att and a > 0}
+            if not weights:
+                return None
+            scores = {}
+            for prop, stat_col in RB_PROP_STAT_MAP.items():
+                weighted_vals = []
+                for concept, w in weights.items():
+                    own_row = rb_bundle.rb_vs_concept.get(concept, {}).get(rb_name)
+                    own_tier = own_row.get("_tiers", {}).get(stat_col) if own_row else None
+                    def_row = (rb_bundle.def_allowed.get(concept, {}).get(opponent_team_full)
+                               if opponent_team_full else None)
+                    def_tier = def_row.get("_tiers", {}).get(stat_col) if def_row else None
+                    own_w = TIER_WEIGHTS.get(own_tier)
+                    def_w = TIER_WEIGHTS.get(def_tier)
+                    if own_w is None and def_w is None:
+                        continue
+                    blended = (0.5 * own_w + 0.5 * def_w) if (own_w is not None and def_w is not None) \
+                        else (own_w if own_w is not None else def_w)
+                    weighted_vals.append((w, blended))
+                total_w = sum(w for w, _ in weighted_vals)
+                scores[prop] = round(sum(w * s for w, s in weighted_vals) / total_w, 1) if total_w else None
+            valid = {p: s for p, s in scores.items() if s is not None}
+            if not valid:
+                return {"scores": scores, "best": None, "ties": []}
+            best = max(valid, key=valid.get)
+            ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
+            return {"scores": scores, "best": best, "ties": ties}
+
+        def _actual_best_rb_prop(tiers):
+            valid = {p: TIER_WEIGHTS[tiers[c]] for p, c in RB_GAME_LOG_PROP_MAP.items()
+                     if c in tiers and tiers[c] in TIER_WEIGHTS}
+            if not valid:
+                return None, []
+            best = max(valid, key=valid.get)
+            ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
+            return best, ties
+
+        def _run_rb_season_backtest(rb_bundle, rb_name, game_log_season):
+            """RB rushing version of _run_season_backtest/_run_qb_season_backtest -
+            same real per-week grading logic, RB's own rushing-concept props."""
+            rbt_pstats = pull_player_stats([int(game_log_season)])
+            rbt_sched = pull_schedules([int(game_log_season)])
+            rbt_matches = rbt_pstats[rbt_pstats["position"].astype(str).str.upper() == "RB"]
+            rbt_name_col = "player_display_name" if "player_display_name" in rbt_pstats.columns else (
+                "player_name" if "player_name" in rbt_pstats.columns else None)
+            rbt_gsis = None
+            if rbt_name_col:
+                rbt_hit = rbt_matches[rbt_matches[rbt_name_col].astype(str).str.lower() == rb_name.lower()]
+                if not rbt_hit.empty:
+                    rbt_gsis = rbt_hit.iloc[0]["gsis_id"]
+            if rbt_gsis is None:
+                return {"error": f"Couldn't match '{rb_name}' to a real nflreadpy player record for {game_log_season}."}
+
+            all_abbrevs = set(TEAM_ABBREV_TO_FULL.keys())
+            rbt_log = build_coverage_crossref_game_log(
+                rbt_gsis, "RB", all_abbrevs, rbt_pstats, rbt_sched,
+                seasons=[int(game_log_season)], max_games=25,
+            )
+            rows, strict_hits, generous_hits, graded = [], 0, 0, 0
+            for g in rbt_log:
+                g_opp_full = TEAM_ABBREV_TO_FULL.get(g["opponent"])
+                pred = _predict_best_rb_prop(rb_bundle, rb_name, g_opp_full) if g_opp_full else None
+                pred_best = pred["best"] if pred else None
+                pred_quality = pred["scores"].get(pred_best) if (pred and pred_best) else None
+                pred_has_tie = bool(pred["ties"]) if pred else False
+                actual_best, actual_ties = _actual_best_rb_prop(g.get("tiers", {}))
+                result = "—"
+                if pred_best is not None and actual_best is not None:
+                    graded += 1
+                    if pred_best == actual_best:
+                        strict_hits += 1
+                        generous_hits += 1
+                        result = "✅ Hit"
+                    elif pred_best in actual_ties:
+                        generous_hits += 1
+                        result = "〰️ Tie"
+                    else:
+                        result = "❌ Miss"
+                rows.append({
+                    "Week": g["week"], "Opponent": g["opponent"],
+                    "Predicted Best": RB_PROP_LABELS.get(pred_best, "no data"),
+                    "Actual Best": RB_PROP_LABELS.get(actual_best, "no data"),
+                    "Result": result,
+                    "_pred_quality": pred_quality, "_pred_has_tie": pred_has_tie,
+                })
+            return {"rows": rows, "strict_hits": strict_hits, "generous_hits": generous_hits, "graded": graded}
+
         st.divider()
         st.markdown("### League-Wide Scan — All Positions, Best Matchups Only")
         st.caption(
@@ -1774,29 +1887,54 @@ elif mode == "Coverage Matchup (premium data)":
                         for nm in names_to_scan:
                             try:
                                 if scan_pos == "QB":
-                                    result = _run_qb_season_backtest(bundle, nm, awide_season, int(awide_top_n))
-                                else:
+                                    results_list = [_run_qb_season_backtest(bundle, nm, awide_season, int(awide_top_n))]
+                                elif scan_pos == "RB":
+                                    # Real fix: RB used to ONLY get the WR/TE
+                                    # receiving-prop test (targets/receptions/
+                                    # rec_yards/receiving_td) - correct for RBs
+                                    # as pass-catchers, but Rush Attempts/Rush
+                                    # Yards were NEVER tested at all. RBs are
+                                    # genuinely both, so both get tested and
+                                    # merged - not one replacing the other.
+                                    results_list = []
                                     nm_weights = _get_real_alignment_weights(bundle, nm)
-                                    result = _run_season_backtest(
+                                    rec_result = _run_season_backtest(
                                         bundle, nm, scan_pos, None, nm_weights, awide_season, int(awide_top_n),
                                     )
+                                    if not rec_result.get("error"):
+                                        results_list.append(rec_result)
+                                    rb_bundle_live = st.session_state.get("rb_bundle")
+                                    if rb_bundle_live is not None:
+                                        rush_result = _run_rb_season_backtest(rb_bundle_live, nm, awide_season)
+                                        if not rush_result.get("error"):
+                                            results_list.append(rush_result)
+                                    elif not results_list:
+                                        errors.append(f"RB {nm}: rushing skipped - RB run-concept dataset "
+                                                       f"not loaded (load it in the RB Run Concept Matchup "
+                                                       f"section above, then re-run this scan for rushing props).")
+                                else:
+                                    nm_weights = _get_real_alignment_weights(bundle, nm)
+                                    results_list = [_run_season_backtest(
+                                        bundle, nm, scan_pos, None, nm_weights, awide_season, int(awide_top_n),
+                                    )]
                             except Exception as e:
                                 errors.append(f"{scan_pos} {nm}: {e}")
                                 continue
-                            if result.get("error"):
-                                continue
 
                             kept_rows = []
-                            for wk_row in result["rows"]:
-                                if wk_row["Predicted Best"] == "no data":
+                            for result in results_list:
+                                if result.get("error"):
                                     continue
-                                total_weeks_seen += 1
-                                if awide_high_conf:
-                                    q = wk_row.get("_pred_quality")
-                                    if q is None or q < 70 or wk_row.get("_pred_has_tie"):
+                                for wk_row in result["rows"]:
+                                    if wk_row["Predicted Best"] == "no data":
                                         continue
-                                total_weeks_kept += 1
-                                kept_rows.append(wk_row)
+                                    total_weeks_seen += 1
+                                    if awide_high_conf:
+                                        q = wk_row.get("_pred_quality")
+                                        if q is None or q < 70 or wk_row.get("_pred_has_tie"):
+                                            continue
+                                    total_weeks_kept += 1
+                                    kept_rows.append(wk_row)
                             if not kept_rows:
                                 continue
 
