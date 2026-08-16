@@ -427,6 +427,10 @@ if "rb_bundle" not in st.session_state:
     st.session_state.rb_bundle = None
 if "rb_data_dir" not in st.session_state:
     st.session_state.rb_data_dir = None
+if "rb_player_dir" not in st.session_state:
+    st.session_state.rb_player_dir = None
+if "rb_def_dir" not in st.session_state:
+    st.session_state.rb_def_dir = None
 
 if mode == "Draft Rankings":
     st.subheader("League Settings")
@@ -2239,24 +2243,50 @@ elif mode == "Coverage Matchup (premium data)":
                             + f'<details class="cov-more"><summary>+{len(remaining)} more stats</summary>{more_html}</details>'
                         )
 
-                    rb_dir_col1, rb_dir_col2 = st.columns(2)
-                    with rb_dir_col1:
-                        rb_player_dir = st.text_input(
-                            "RB player-side data folder", value=st.session_state.rb_data_dir or "rb_data",
+                    rb_folder_mode = st.radio(
+                        "RB data folder layout",
+                        ["Two folders (no renaming needed)", "One folder (DEF_ prefix)"],
+                        horizontal=True,
+                        help="Two folders: upload your player-side folder and defense-allowed "
+                             "folder exactly as you already have them named, no renaming. One "
+                             "folder: matches the coverage_data convention (DEF_ prefix on the "
+                             "defense-side filenames, everything in one folder).",
+                    )
+                    if rb_folder_mode.startswith("Two"):
+                        rb_dir_col1, rb_dir_col2 = st.columns(2)
+                        with rb_dir_col1:
+                            rb_player_dir_input = st.text_input(
+                                "Player-side folder (as named in your repo)",
+                                value=st.session_state.get("rb_player_dir", "") or "RUSH METRICS",
+                            )
+                        with rb_dir_col2:
+                            rb_def_dir_input = st.text_input(
+                                "Defense-allowed folder (as named in your repo)",
+                                value=st.session_state.get("rb_def_dir", "") or "RUSH METRICS ALLOWED",
+                            )
+                        rb_data_dir_input = None
+                    else:
+                        rb_data_dir_input = st.text_input(
+                            "RB data folder (one flat folder, defense files prefixed DEF_)",
+                            value=st.session_state.rb_data_dir or "rb_data",
+                            help="Player-side: INSIDE_ZONE.csv, OUTSIDE_ZONE.csv, MAN-DUO.csv, "
+                                 "COUNTER.csv, POWER.csv, PULL_LEAD.csv. Defense-allowed: same 6 "
+                                 "names with DEF_ in front (DEF_INSIDE_ZONE.csv, etc.).",
                         )
-                    with rb_dir_col2:
-                        rb_def_dir = st.text_input(
-                            "RB defense-allowed data folder (must differ from above - same "
-                            "filenames, different content)",
-                            value=(st.session_state.rb_data_dir + "/defense") if st.session_state.rb_data_dir else "rb_data/defense",
-                        )
+                        rb_player_dir_input = rb_def_dir_input = None
+
                     if st.button("Load RB run-concept dataset", type="primary"):
                         with st.spinner("Loading all 6 run concepts, both sides..."):
                             try:
-                                st.session_state.rb_bundle = load_full_rb_dataset(
-                                    player_dir=rb_player_dir, def_dir=rb_def_dir,
-                                )
-                                st.session_state.rb_data_dir = rb_player_dir
+                                if rb_folder_mode.startswith("Two"):
+                                    st.session_state.rb_bundle = load_full_rb_dataset(
+                                        player_dir=rb_player_dir_input, def_dir=rb_def_dir_input,
+                                    )
+                                    st.session_state.rb_player_dir = rb_player_dir_input
+                                    st.session_state.rb_def_dir = rb_def_dir_input
+                                else:
+                                    st.session_state.rb_bundle = load_full_rb_dataset(data_dir=rb_data_dir_input)
+                                    st.session_state.rb_data_dir = rb_data_dir_input
                                 n_missing = len(st.session_state.rb_bundle.missing)
                                 if n_missing:
                                     st.warning(f"Loaded with {n_missing} file(s) missing - see details below.")
