@@ -1675,11 +1675,20 @@ elif mode == "Coverage Matchup (premium data)":
                     if mu_val is None:
                         row[f"{label} mu"] = "no data"
                         row[f"{label} Hit"] = None
+                        row[f"{label} Error"] = None
                         continue
                     predicted_over = mu_val > line
                     actual_over = actual_value > line
                     row[f"{label} mu"] = round(mu_val, 2)
                     row[f"{label} Hit"] = predicted_over == actual_over
+                    # Line-free accuracy: real absolute error between the
+                    # prediction and what actually happened - no line
+                    # involved at all, so this can't be skewed by an
+                    # arbitrarily-chosen fixed number the way the Hit
+                    # column can be. Whichever mu source has the smaller
+                    # average error here is the genuinely more accurate
+                    # predictor, independent of any betting line.
+                    row[f"{label} Error"] = round(abs(actual_value - mu_val), 2)
 
                 # The real distinction the user is drawing: mu-vs-line is a
                 # STATISTICAL trend (does his trailing average sit above or
@@ -2057,13 +2066,34 @@ elif mode == "Coverage Matchup (premium data)":
                 st.info("No graded games came back - try a lower minimum or a different player.")
             else:
                 mc_df = pd.DataFrame(mc["rows"])
+                st.markdown("**Line-based hit rate (needs the fixed line above):**")
                 for label in ["Raw", "Adjusted", "CrossRef"]:
                     hit_col = f"{label} Hit"
                     if hit_col in mc_df.columns:
                         valid = mc_df[hit_col].dropna()
                         if len(valid):
                             pct = valid.mean() * 100
-                            st.markdown(f"**{label}: {int(valid.sum())}/{len(valid)} ({pct:.0f}%)**")
+                            st.markdown(f"- {label}: {int(valid.sum())}/{len(valid)} ({pct:.0f}%)")
+
+                st.markdown("**Line-free accuracy (real average error - no line involved at all):**")
+                mae_vals = {}
+                for label in ["Raw", "Adjusted", "CrossRef"]:
+                    err_col = f"{label} Error"
+                    if err_col in mc_df.columns:
+                        valid = mc_df[err_col].dropna()
+                        if len(valid):
+                            mae = valid.mean()
+                            mae_vals[label] = mae
+                            st.markdown(f"- {label}: avg error {mae:.2f}")
+                if mae_vals:
+                    best_label = min(mae_vals, key=mae_vals.get)
+                    st.caption(
+                        f"Lowest average error: **{best_label}** - this is the cleanest read on which "
+                        f"mu source is genuinely more accurate, since it doesn't depend on which line "
+                        f"was chosen at all. Compare this against the line-based hit rate above: if "
+                        f"they agree on which source is best, that's real confidence; if they disagree, "
+                        f"the line-based result may be more sensitive to where this specific line landed."
+                    )
 
                 # Does the two-signal agreement itself predict better than
                 # either signal alone? Split real-hit-rate by whether the
@@ -2151,6 +2181,8 @@ elif mode == "Coverage Matchup (premium data)":
                         "player_name" if "player_name" in lwmc_pstats.columns else None)
                     lwmc_rows, lwmc_errors = [], []
                     lwmc_agg = {"Raw": [0, 0], "Adjusted": [0, 0], "CrossRef": [0, 0]}
+                    lwmc_mae_sum = {"Raw": 0.0, "Adjusted": 0.0, "CrossRef": 0.0}
+                    lwmc_mae_n = {"Raw": 0, "Adjusted": 0, "CrossRef": 0}
                     lwmc_agree = [0, 0]
                     lwmc_conflict = [0, 0]
                     if lwmc_name_col:
@@ -2185,6 +2217,10 @@ elif mode == "Coverage Matchup (premium data)":
                                         lwmc_agg[label][1] += 1
                                         if hit:
                                             lwmc_agg[label][0] += 1
+                                    err = wk_row.get(f"{label} Error")
+                                    if err is not None:
+                                        lwmc_mae_sum[label] += err
+                                        lwmc_mae_n[label] += 1
                                 if wk_row.get("Agreement") == "Agree" and wk_row.get("Raw Hit") is not None:
                                     lwmc_agree[1] += 1
                                     if wk_row["Raw Hit"]:
@@ -2198,8 +2234,10 @@ elif mode == "Coverage Matchup (premium data)":
                                     "Player": nm, "Graded Games": p_graded["Raw"],
                                     "Raw Hit Rate": f"{p_strict['Raw']}/{p_graded['Raw']} ({p_strict['Raw']/p_graded['Raw']*100:.0f}%)",
                                 })
+                    lwmc_mae = {label: (lwmc_mae_sum[label] / lwmc_mae_n[label] if lwmc_mae_n[label] else None)
+                                for label in ["Raw", "Adjusted", "CrossRef"]}
                     st.session_state["_lwmc_result"] = {
-                        "agg": lwmc_agg, "agree": lwmc_agree, "conflict": lwmc_conflict,
+                        "agg": lwmc_agg, "mae": lwmc_mae, "agree": lwmc_agree, "conflict": lwmc_conflict,
                         "rows": lwmc_rows, "errors": lwmc_errors, "players_scanned": len(lwmc_rows),
                     }
             except Exception as e:
@@ -2214,10 +2252,24 @@ elif mode == "Coverage Matchup (premium data)":
                          "minimum games filter, or check the line is realistic for this prop.")
             else:
                 st.success(f"Tested {lwmc['players_scanned']} real {lwmc_pos}s with graded games.")
+                st.markdown("**Line-based hit rate (needs the fixed line above):**")
                 for label in ["Raw", "Adjusted", "CrossRef"]:
                     hits, graded = lwmc["agg"][label]
                     if graded:
-                        st.markdown(f"**{label}: {hits}/{graded} ({hits/graded*100:.0f}%)**")
+                        st.markdown(f"- {label}: {hits}/{graded} ({hits/graded*100:.0f}%)")
+
+                mae_dict = lwmc.get("mae", {})
+                if any(v is not None for v in mae_dict.values()):
+                    st.markdown("**Line-free accuracy (real average error - no line involved):**")
+                    valid_mae = {k: v for k, v in mae_dict.items() if v is not None}
+                    for label, mae in valid_mae.items():
+                        st.markdown(f"- {label}: avg error {mae:.2f}")
+                    best_label = min(valid_mae, key=valid_mae.get)
+                    st.caption(
+                        f"Lowest league-wide average error: **{best_label}** - the cleanest, "
+                        f"line-independent read on which mu source is genuinely more accurate "
+                        f"across the whole scanned population."
+                    )
                 a_hits, a_graded = lwmc["agree"]
                 c_hits, c_graded = lwmc["conflict"]
                 if a_graded or c_graded:
