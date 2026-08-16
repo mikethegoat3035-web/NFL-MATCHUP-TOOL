@@ -1540,6 +1540,346 @@ elif mode == "Coverage Matchup (premium data)":
                 return None
             return {a: v / total for a, v in raw.items() if v > 0}
 
+        def _run_season_backtest(bundle, p_name, p_pos, verdict_alignment, verdict_weights,
+                                   game_log_season, top_n):
+            """One full-season backtest run at a given top_n threshold, for
+            WR/TE/RB receiving props (targets/receptions/rec_yards/
+            receiving_td). Moved to this outer scope (was originally nested
+            inside the single-matchup report block) so it's usable WITHOUT
+            requiring a player name/report to exist first - needed for the
+            standalone league-wide scan below, which doesn't ask for a name
+            at all. Pulled out as its own function so the single-run
+            button, the threshold sweep, and the league-wide scan all call
+            the exact same logic - having any of them secretly use
+            different code would make the comparisons meaningless."""
+            bt_pstats = pull_player_stats([int(game_log_season)])
+            bt_sched = pull_schedules([int(game_log_season)])
+            bt_pbp = pull_pbp([int(game_log_season)])
+            bt_matches = bt_pstats[bt_pstats["position"].astype(str).str.upper() == p_pos.upper()]
+            bt_name_col = "player_display_name" if "player_display_name" in bt_pstats.columns else (
+                "player_name" if "player_name" in bt_pstats.columns else None)
+            bt_gsis = None
+            if bt_name_col:
+                bt_hit = bt_matches[bt_matches[bt_name_col].astype(str).str.lower() == p_name.lower()]
+                if not bt_hit.empty:
+                    bt_gsis = bt_hit.iloc[0]["gsis_id"]
+            if bt_gsis is None:
+                return {"error": f"Couldn't match '{p_name}' to a real nflreadpy player record for {game_log_season}."}
+
+            all_abbrevs = set(TEAM_ABBREV_TO_FULL.keys())
+            full_log = build_coverage_crossref_game_log(
+                bt_gsis, p_pos, all_abbrevs, bt_pstats, bt_sched,
+                seasons=[int(game_log_season)], max_games=25, pbp_df=bt_pbp,
+            )
+            rows, strict_hits, generous_hits, graded = [], 0, 0, 0
+            for g in full_log:
+                opp_full = TEAM_ABBREV_TO_FULL.get(g["opponent"])
+                pred = (_predict_best_prop(bundle, p_name, p_pos, opp_full,
+                                            alignment=verdict_alignment, weights=verdict_weights,
+                                            top_n=top_n) if opp_full else None)
+                pred_best = pred["best"] if pred else None
+                # How strong was THIS week's prediction, not just which prop won -
+                # a prop that barely edged out the others (score near 50, or tied
+                # with another prop) is a much weaker call than one that scored
+                # 85+ standalone. Kept per-week so the auto-scan below can filter
+                # to genuinely strong weeks instead of grading every call equally.
+                pred_quality = pred["scores"].get(pred_best) if (pred and pred_best) else None
+                pred_has_tie = bool(pred["ties"]) if pred else False
+                actual_best, actual_ties = _actual_best_prop(g.get("tiers", {}))
+                result = "—"
+                if pred_best is not None and actual_best is not None:
+                    graded += 1
+                    if pred_best == actual_best:
+                        strict_hits += 1
+                        generous_hits += 1
+                        result = "✅ Hit"
+                    elif pred_best in actual_ties:
+                        generous_hits += 1
+                        result = "〰️ Tie"
+                    else:
+                        result = "❌ Miss"
+                rows.append({
+                    "Week": g["week"], "Opponent": g["opponent"],
+                    "Predicted Best": PROP_LABELS.get(pred_best, "no data"),
+                    "Actual Best": PROP_LABELS.get(actual_best, "no data"),
+                    "Result": result,
+                    "_pred_quality": pred_quality, "_pred_has_tie": pred_has_tie,
+                })
+            return {"rows": rows, "strict_hits": strict_hits, "generous_hits": generous_hits, "graded": graded}
+
+        # ---- QB equivalent of everything above - QB has genuinely different
+        # props (Pass Attempts/Completions/Yards/TD, not Targets/Receptions),
+        # confirmed real on both the CSV predicted side (ATT/CMP/YDS/TD) and
+        # the nflreadpy actual side (attempts/completions/passing_yards/
+        # passing_tds) during the QB Line Value work earlier. QB has no
+        # alignment concept (no Wide/Slot/Inline/Backfield), so this is
+        # simpler than the receiving version - no weights/alignment params.
+        QB_BT_PREDICT_MAP = {"pass_attempts": "ATT", "pass_completions": "CMP",
+                               "pass_yards": "YDS", "pass_td": "TD"}
+        QB_BT_ACTUAL_MAP = {"pass_attempts": "attempts", "pass_completions": "completions",
+                              "pass_yards": "passing_yards", "pass_td": "passing_tds"}
+        QB_BT_LABELS = {"pass_attempts": "Pass Attempts", "pass_completions": "Pass Completions",
+                          "pass_yards": "Pass Yards", "pass_td": "Pass TD"}
+
+        def _predict_best_qb_prop(bundle, qb_name, opponent_team_full, top_n):
+            """QB version of _predict_best_prop - same real logic (top-N +
+            extreme-low-usage coverage inclusion, weighted blend of own tier
+            across included coverages), just against QB's own real prop set
+            instead of receiving props."""
+            opp_profile = bundle.def_coverage.get(opponent_team_full)
+            if opp_profile is None:
+                return None
+            included = _top_n_coverage_fields(bundle, opp_profile, top_n)
+            already_fields = {f for f, _, _ in included}
+            included = included + _find_extreme_low_usage_fields(
+                bundle, opp_profile, "QB", None, None, already_fields,
+            )
+            if not included:
+                return None
+            scores = {}
+            for prop, stat_col in QB_BT_PREDICT_MAP.items():
+                weighted_vals = []
+                for field, z, rank in included:
+                    row = bundle.qb_vs_coverage.get(field, {}).get(qb_name)
+                    if row is not None:
+                        tier = row.get("_tiers", {}).get(stat_col)
+                        if tier in TIER_WEIGHTS:
+                            weighted_vals.append((1.0, TIER_WEIGHTS[tier]))
+                total_w = sum(w for w, _ in weighted_vals)
+                scores[prop] = round(sum(w * s for w, s in weighted_vals) / total_w, 1) if total_w else None
+            valid = {p: s for p, s in scores.items() if s is not None}
+            if not valid:
+                return {"scores": scores, "best": None, "ties": []}
+            best = max(valid, key=valid.get)
+            ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
+            return {"scores": scores, "best": best, "ties": ties}
+
+        def _actual_best_qb_prop(tiers: dict):
+            valid = {p: TIER_WEIGHTS[tiers[c]] for p, c in QB_BT_ACTUAL_MAP.items()
+                     if c in tiers and tiers[c] in TIER_WEIGHTS}
+            if not valid:
+                return None, []
+            best = max(valid, key=valid.get)
+            ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
+            return best, ties
+
+        def _run_qb_season_backtest(bundle, qb_name, game_log_season, top_n):
+            """QB version of _run_season_backtest - same real per-week
+            grading logic, QB's own prop set and no alignment concept."""
+            bt_pstats = pull_player_stats([int(game_log_season)])
+            bt_sched = pull_schedules([int(game_log_season)])
+            bt_matches = bt_pstats[bt_pstats["position"].astype(str).str.upper() == "QB"]
+            bt_name_col = "player_display_name" if "player_display_name" in bt_pstats.columns else (
+                "player_name" if "player_name" in bt_pstats.columns else None)
+            bt_gsis = None
+            if bt_name_col:
+                bt_hit = bt_matches[bt_matches[bt_name_col].astype(str).str.lower() == qb_name.lower()]
+                if not bt_hit.empty:
+                    bt_gsis = bt_hit.iloc[0]["gsis_id"]
+            if bt_gsis is None:
+                return {"error": f"Couldn't match '{qb_name}' to a real nflreadpy player record for {game_log_season}."}
+
+            all_abbrevs = set(TEAM_ABBREV_TO_FULL.keys())
+            full_log = build_coverage_crossref_game_log(
+                bt_gsis, "QB", all_abbrevs, bt_pstats, bt_sched,
+                seasons=[int(game_log_season)], max_games=25,
+            )
+            rows, strict_hits, generous_hits, graded = [], 0, 0, 0
+            for g in full_log:
+                opp_full = TEAM_ABBREV_TO_FULL.get(g["opponent"])
+                pred = _predict_best_qb_prop(bundle, qb_name, opp_full, top_n) if opp_full else None
+                pred_best = pred["best"] if pred else None
+                pred_quality = pred["scores"].get(pred_best) if (pred and pred_best) else None
+                pred_has_tie = bool(pred["ties"]) if pred else False
+                actual_best, actual_ties = _actual_best_qb_prop(g.get("tiers", {}))
+                result = "—"
+                if pred_best is not None and actual_best is not None:
+                    graded += 1
+                    if pred_best == actual_best:
+                        strict_hits += 1
+                        generous_hits += 1
+                        result = "✅ Hit"
+                    elif pred_best in actual_ties:
+                        generous_hits += 1
+                        result = "〰️ Tie"
+                    else:
+                        result = "❌ Miss"
+                rows.append({
+                    "Week": g["week"], "Opponent": g["opponent"],
+                    "Predicted Best": QB_BT_LABELS.get(pred_best, "no data"),
+                    "Actual Best": QB_BT_LABELS.get(actual_best, "no data"),
+                    "Result": result,
+                    "_pred_quality": pred_quality, "_pred_has_tie": pred_has_tie,
+                })
+            return {"rows": rows, "strict_hits": strict_hits, "generous_hits": generous_hits, "graded": graded}
+
+        st.divider()
+        st.markdown("### League-Wide Scan — All Positions, Best Matchups Only")
+        st.caption(
+            "No name, no position to pick - scans QB, WR, TE, and RB all at once, finds every "
+            "real player at each position with enough games to be worth grading, and only "
+            "counts the BEST possible calls (score ≥ 70, no toss-ups) unless you uncheck that "
+            "below. Results are grouped by prop across ALL positions together - Targets, "
+            "Receptions, Rec Yards, Receiving TD, Pass Attempts, Pass Completions, Pass Yards, "
+            "Pass TD all in one table. Same look-ahead-bias caveat as every other backtest here: "
+            "season-aggregate splits, not a clean pre-game test."
+        )
+        awide_col1, awide_col2, awide_col3 = st.columns(3)
+        with awide_col1:
+            awide_season = st.number_input(
+                "Season", min_value=2020, max_value=2030, value=2025, step=1, key="awide_season",
+            )
+        with awide_col2:
+            awide_top_n = st.number_input(
+                "Top-N coverage threshold", min_value=1, max_value=32, value=10, step=1, key="awide_top_n",
+            )
+        with awide_col3:
+            awide_min_games = st.number_input(
+                "Min real games per player", min_value=1, max_value=18, value=8, step=1, key="awide_min_games",
+            )
+        awide_max_col1, awide_max_col2 = st.columns(2)
+        with awide_max_col1:
+            awide_max_per_pos = st.number_input(
+                "Max players to scan PER position (higher = more complete, slower)",
+                min_value=5, max_value=150, value=30, step=5, key="awide_max_per_pos",
+            )
+        with awide_max_col2:
+            awide_high_conf = st.checkbox(
+                "Only count the BEST possible calls (score ≥ 70, no toss-ups)",
+                value=True, key="awide_high_conf",
+            )
+
+        if st.button("Scan ALL positions, full season", type="primary"):
+            try:
+                with st.spinner("Scanning QB, WR, TE, and RB - this takes a while, real work happening..."):
+                    aw_pstats_cache = pull_player_stats([int(awide_season)])
+                    aw_name_col = "player_display_name" if "player_display_name" in aw_pstats_cache.columns else (
+                        "player_name" if "player_name" in aw_pstats_cache.columns else None)
+                    prop_totals = {}
+                    per_pos_summary = []
+                    per_player_rows = []
+                    total_strict = total_generous = total_graded = 0
+                    total_weeks_seen = total_weeks_kept = 0
+                    errors = []
+
+                    for scan_pos in ["QB", "WR", "TE", "RB"]:
+                        if not aw_name_col:
+                            break
+                        pos_matches = aw_pstats_cache[aw_pstats_cache["position"].astype(str).str.upper() == scan_pos]
+                        games_per_player = pos_matches.groupby(aw_name_col)["week"].nunique()
+                        eligible = games_per_player[games_per_player >= int(awide_min_games)].sort_values(ascending=False)
+                        names_to_scan = list(eligible.index[:int(awide_max_per_pos)])
+
+                        pos_strict = pos_generous = pos_graded = 0
+                        for nm in names_to_scan:
+                            try:
+                                if scan_pos == "QB":
+                                    result = _run_qb_season_backtest(bundle, nm, awide_season, int(awide_top_n))
+                                else:
+                                    nm_weights = _get_real_alignment_weights(bundle, nm)
+                                    result = _run_season_backtest(
+                                        bundle, nm, scan_pos, None, nm_weights, awide_season, int(awide_top_n),
+                                    )
+                            except Exception as e:
+                                errors.append(f"{scan_pos} {nm}: {e}")
+                                continue
+                            if result.get("error"):
+                                continue
+
+                            kept_rows = []
+                            for wk_row in result["rows"]:
+                                if wk_row["Predicted Best"] == "no data":
+                                    continue
+                                total_weeks_seen += 1
+                                if awide_high_conf:
+                                    q = wk_row.get("_pred_quality")
+                                    if q is None or q < 70 or wk_row.get("_pred_has_tie"):
+                                        continue
+                                total_weeks_kept += 1
+                                kept_rows.append(wk_row)
+                            if not kept_rows:
+                                continue
+
+                            p_strict = sum(1 for r in kept_rows if r["Result"] == "✅ Hit")
+                            p_generous = sum(1 for r in kept_rows if r["Result"] in ("✅ Hit", "〰️ Tie"))
+                            p_graded = len(kept_rows)
+                            total_strict += p_strict
+                            total_generous += p_generous
+                            total_graded += p_graded
+                            pos_strict += p_strict
+                            pos_generous += p_generous
+                            pos_graded += p_graded
+                            per_player_rows.append({
+                                "Position": scan_pos, "Player": nm, "Graded Games": p_graded,
+                                "Strict Hit Rate": f"{p_strict}/{p_graded} ({p_strict/p_graded*100:.0f}%)",
+                            })
+                            for wk_row in kept_rows:
+                                prop = wk_row["Predicted Best"]
+                                prop_totals.setdefault(prop, [0, 0, 0])
+                                if wk_row["Result"] == "✅ Hit":
+                                    prop_totals[prop][0] += 1
+                                    prop_totals[prop][1] += 1
+                                elif wk_row["Result"] == "〰️ Tie":
+                                    prop_totals[prop][1] += 1
+                                prop_totals[prop][2] += 1
+
+                        if pos_graded:
+                            per_pos_summary.append({
+                                "Position": scan_pos, "Players Graded": sum(1 for r in per_player_rows if r["Position"] == scan_pos),
+                                "Graded Games": pos_graded,
+                                "Strict Hit Rate": f"{pos_strict}/{pos_graded} ({pos_strict/pos_graded*100:.0f}%)",
+                            })
+
+                    prop_rows = []
+                    for prop, (sh, gh, gr) in prop_totals.items():
+                        if gr:
+                            prop_rows.append({
+                                "Predicted Prop": prop, "Times Predicted": gr,
+                                "Strict Hit Rate": f"{sh}/{gr} ({sh/gr*100:.0f}%)",
+                                "Including Near-Ties": f"{gh}/{gr} ({gh/gr*100:.0f}%)",
+                            })
+                    prop_rows.sort(key=lambda r: -r["Times Predicted"])
+
+                    st.session_state["_all_pos_scan"] = {
+                        "per_pos_summary": per_pos_summary, "per_player_rows": per_player_rows,
+                        "prop_rows": prop_rows, "total_strict": total_strict,
+                        "total_generous": total_generous, "total_graded": total_graded,
+                        "errors": errors, "high_conf_only": awide_high_conf,
+                        "weeks_seen": total_weeks_seen, "weeks_kept": total_weeks_kept,
+                    }
+            except Exception as e:
+                st.session_state["_all_pos_scan"] = {"error": f"Scan failed: {e}"}
+
+        awide = st.session_state.get("_all_pos_scan")
+        if awide:
+            if awide.get("error"):
+                st.warning(awide["error"])
+            elif awide["total_graded"] == 0:
+                st.info("No graded games at this filter level - try unchecking 'best possible calls only', or lowering the minimum games filter.")
+            else:
+                awsr = awide["total_strict"] / awide["total_graded"] * 100
+                awgr = awide["total_generous"] / awide["total_graded"] * 100
+                filter_note = (
+                    f" (filtered to {awide['weeks_kept']}/{awide['weeks_seen']} weeks that were genuinely strong calls)"
+                    if awide.get("high_conf_only") else " (unfiltered - every prediction counted, weak or strong)"
+                )
+                st.markdown(
+                    f"**Across all 4 positions, {awide['total_graded']} total real games — overall strict hit rate: "
+                    f"{awide['total_strict']}/{awide['total_graded']} ({awsr:.0f}%)** &nbsp;&nbsp;|&nbsp;&nbsp; "
+                    f"including near-ties: {awide['total_generous']}/{awide['total_graded']} ({awgr:.0f}%) "
+                    f"&nbsp;&nbsp;(random baseline varies by position - ~33% for WR/TE/RB with 3 props, ~25% for QB with 4)"
+                    f"{filter_note}"
+                )
+                st.markdown("**By prop — across every position, which one the method actually predicts best:**")
+                st.dataframe(pd.DataFrame(awide["prop_rows"]), width='stretch')
+                st.markdown("**By position:**")
+                st.dataframe(pd.DataFrame(awide["per_pos_summary"]), width='stretch')
+                with st.expander(f"Per-player breakdown ({len(awide['per_player_rows'])} players)"):
+                    st.dataframe(pd.DataFrame(awide["per_player_rows"]), width='stretch')
+                if awide["errors"]:
+                    with st.expander(f"{len(awide['errors'])} skipped (name-match issues)"):
+                        st.write(awide["errors"])
+
         def _build_full_coverage_report(bundle, player_name, position, opponent_team,
                                           player_team=None, alignment=None, top_n=10,
                                           use_auto_weight=False):
@@ -2173,68 +2513,6 @@ elif mode == "Coverage Matchup (premium data)":
                         )
 
                 st.divider()
-                def _run_season_backtest(bundle, p_name, p_pos, verdict_alignment, verdict_weights,
-                                           game_log_season, top_n):
-                    """One full-season backtest run at a given top_n threshold. Pulled
-                    out as its own function so both the single-run button and the
-                    threshold sweep call the exact same logic - a sweep that secretly
-                    used different code per threshold would make the comparison
-                    meaningless."""
-                    bt_pstats = pull_player_stats([int(game_log_season)])
-                    bt_sched = pull_schedules([int(game_log_season)])
-                    bt_pbp = pull_pbp([int(game_log_season)])
-                    bt_matches = bt_pstats[bt_pstats["position"].astype(str).str.upper() == p_pos.upper()]
-                    bt_name_col = "player_display_name" if "player_display_name" in bt_pstats.columns else (
-                        "player_name" if "player_name" in bt_pstats.columns else None)
-                    bt_gsis = None
-                    if bt_name_col:
-                        bt_hit = bt_matches[bt_matches[bt_name_col].astype(str).str.lower() == p_name.lower()]
-                        if not bt_hit.empty:
-                            bt_gsis = bt_hit.iloc[0]["gsis_id"]
-                    if bt_gsis is None:
-                        return {"error": f"Couldn't match '{p_name}' to a real nflreadpy player record for {game_log_season}."}
-
-                    all_abbrevs = set(TEAM_ABBREV_TO_FULL.keys())
-                    full_log = build_coverage_crossref_game_log(
-                        bt_gsis, p_pos, all_abbrevs, bt_pstats, bt_sched,
-                        seasons=[int(game_log_season)], max_games=25, pbp_df=bt_pbp,
-                    )
-                    rows, strict_hits, generous_hits, graded = [], 0, 0, 0
-                    for g in full_log:
-                        opp_full = TEAM_ABBREV_TO_FULL.get(g["opponent"])
-                        pred = (_predict_best_prop(bundle, p_name, p_pos, opp_full,
-                                                    alignment=verdict_alignment, weights=verdict_weights,
-                                                    top_n=top_n) if opp_full else None)
-                        pred_best = pred["best"] if pred else None
-                        # How strong was THIS week's prediction, not just which prop won -
-                        # a prop that barely edged out the others (score near 50, or tied
-                        # with another prop) is a much weaker call than one that scored
-                        # 85+ standalone. Kept per-week so the auto-scan below can filter
-                        # to genuinely strong weeks instead of grading every call equally.
-                        pred_quality = pred["scores"].get(pred_best) if (pred and pred_best) else None
-                        pred_has_tie = bool(pred["ties"]) if pred else False
-                        actual_best, actual_ties = _actual_best_prop(g.get("tiers", {}))
-                        result = "—"
-                        if pred_best is not None and actual_best is not None:
-                            graded += 1
-                            if pred_best == actual_best:
-                                strict_hits += 1
-                                generous_hits += 1
-                                result = "✅ Hit"
-                            elif pred_best in actual_ties:
-                                generous_hits += 1
-                                result = "〰️ Tie"
-                            else:
-                                result = "❌ Miss"
-                        rows.append({
-                            "Week": g["week"], "Opponent": g["opponent"],
-                            "Predicted Best": PROP_LABELS.get(pred_best, "no data"),
-                            "Actual Best": PROP_LABELS.get(actual_best, "no data"),
-                            "Result": result,
-                            "_pred_quality": pred_quality, "_pred_has_tie": pred_has_tie,
-                        })
-                    return {"rows": rows, "strict_hits": strict_hits, "generous_hits": generous_hits, "graded": graded}
-
                 st.markdown("### Backtest This Method — Full Season")
                 st.caption(
                     "Checks, for every real game entered player(s) played, whether the prop this "
