@@ -1947,25 +1947,34 @@ elif mode == "Coverage Matchup (premium data)":
             "against teams that graded similarly to this week's real opponent). No look-ahead - "
             "only real games strictly before the one being graded feed any of the three."
         )
-        mucomp_col1, mucomp_col2, mucomp_col3 = st.columns(3)
+        mucomp_col1, mucomp_col2, mucomp_col3, mucomp_col4 = st.columns(4)
         with mucomp_col1:
+            mucomp_pos = st.selectbox("Position", ["WR", "TE", "RB"], key="mucomp_pos",
+                                       help="Receiving props only for now (QB/rushing versions "
+                                            "follow this same pattern next).")
+        with mucomp_col2:
             mucomp_prop = st.selectbox(
                 "Prop to test", ["targets", "receptions", "rec_yards", "receiving_td"],
                 key="mucomp_prop")
-        with mucomp_col2:
+        with mucomp_col3:
             mucomp_line = st.number_input("Real fixed line to test against", min_value=0.0,
                                           value=5.5, step=0.5, key="mucomp_line")
-        with mucomp_col3:
-            mucomp_name = st.text_input("Player name (exact, as it appears in the export)",
-                                        value=p_name if p_name else "", key="mucomp_name")
+        with mucomp_col4:
+            mucomp_season = st.number_input("Season", min_value=2020, max_value=2030, value=2025,
+                                            step=1, key="mucomp_season")
+
+        mucomp_name = st.text_input("Player name (exact, as it appears in the export)",
+                                     value="", key="mucomp_name")
+        mucomp_top_n = st.number_input(
+            "Top-N coverage threshold (for the Adjusted/CrossRef mu sources)",
+            min_value=1, max_value=32, value=10, step=1, key="mucomp_top_n")
 
         if st.button("Run mu comparison backtest", type="primary", key="mucomp_run_btn"):
             try:
-                mc_weights = _get_real_alignment_weights(bundle, mucomp_name) if (use_auto_weight and p_pos != "QB") else None
-                mc_alignment = None if use_auto_weight else align
+                mc_weights = _get_real_alignment_weights(bundle, mucomp_name) if mucomp_pos != "QB" else None
                 mc_result = _run_mu_source_comparison_backtest(
-                    bundle, mucomp_name, p_pos, mc_alignment, mc_weights,
-                    game_log_season, int(top_n_rank), mucomp_prop, float(mucomp_line),
+                    bundle, mucomp_name, mucomp_pos, None, mc_weights,
+                    int(mucomp_season), int(mucomp_top_n), mucomp_prop, float(mucomp_line),
                 )
                 st.session_state["_mucomp_result"] = mc_result
             except Exception as e:
