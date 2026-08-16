@@ -1609,6 +1609,7 @@ elif mode == "Coverage Matchup (premium data)":
 
                 opp_full = TEAM_ABBREV_TO_FULL.get(g["opponent"])
                 adjusted_mu = raw_mu
+                q_score = None
                 if opp_full and prop in PROP_STAT_MAP:
                     pred = _predict_best_prop(bundle, p_name, p_pos, opp_full,
                                                 alignment=alignment, weights=weights, top_n=top_n)
@@ -1616,6 +1617,7 @@ elif mode == "Coverage Matchup (premium data)":
                     adjusted_mu, _, _ = _apply_best_signal_adjustment(raw_mu, q_score, is_thin=False)
 
                 crossref_mu = None
+                cr_sample_size = 0
                 if opp_full:
                     opp_profile = bundle.def_coverage.get(opp_full)
                     if opp_profile:
@@ -1627,14 +1629,17 @@ elif mode == "Coverage Matchup (premium data)":
                         cr_vals = [pg["stats"].get(stat_col) for pg in prior_games
                                    if stat_col in pg.get("stats", {}) and pg["opponent"] in cross_abbrevs]
                         cr_vals = [v for v in cr_vals if v is not None]
-                        if len(cr_vals) >= 3:
-                            crossref_mu = sum(cr_vals) / len(cr_vals)
+                        cr_sample_size = len(cr_vals)
+                        if cr_sample_size >= 3:
+                            crossref_mu = sum(cr_vals) / cr_sample_size
 
                 actual_value = g["stats"].get(stat_col)
                 if actual_value is None:
                     continue
 
-                row = {"Week": g["week"], "Opponent": g["opponent"], "Actual": actual_value}
+                row = {"Week": g["week"], "Opponent": g["opponent"], "Actual": actual_value,
+                       "Quality Score": round(q_score, 1) if q_score is not None else "no data",
+                       "CrossRef Sample": cr_sample_size}
                 for label, mu_val in [("Raw", raw_mu), ("Adjusted", adjusted_mu), ("CrossRef", crossref_mu)]:
                     if mu_val is None:
                         row[f"{label} mu"] = "no data"
@@ -1644,6 +1649,32 @@ elif mode == "Coverage Matchup (premium data)":
                     actual_over = actual_value > line
                     row[f"{label} mu"] = round(mu_val, 2)
                     row[f"{label} Hit"] = predicted_over == actual_over
+
+                # The real distinction the user is drawing: mu-vs-line is a
+                # STATISTICAL trend (does his trailing average sit above or
+                # below this number), Quality Score is a MATCHUP GRADE (is
+                # this a favorable or unfavorable coverage/scheme fit for
+                # him specifically) - two genuinely different signals that
+                # were being blended into one "Adjusted mu" number without
+                # ever showing whether they actually agree. Quality Lean:
+                # >50 means the matchup grade itself leans favorable (more
+                # OVER-supportive conditions), <50 leans unfavorable.
+                # Mu Lean uses RAW mu specifically (the pure statistical
+                # trend, unadjusted) so the comparison isn't circular -
+                # comparing Quality against a mu that Quality already
+                # nudged would trivially "agree" by construction.
+                mu_lean = "OVER" if raw_mu > line else "UNDER"
+                if q_score is None:
+                    quality_lean = "no data"
+                    agreement = "N/A"
+                else:
+                    quality_lean = "Favorable" if q_score > 50 else "Unfavorable"
+                    mu_wants_over = mu_lean == "OVER"
+                    quality_wants_over = quality_lean == "Favorable"
+                    agreement = "Agree" if mu_wants_over == quality_wants_over else "Conflict"
+                row["Mu Lean"] = mu_lean
+                row["Quality Lean"] = quality_lean
+                row["Agreement"] = agreement
                 rows.append(row)
 
             return {"rows": rows}
@@ -1995,11 +2026,41 @@ elif mode == "Coverage Matchup (premium data)":
                         if len(valid):
                             pct = valid.mean() * 100
                             st.markdown(f"**{label}: {int(valid.sum())}/{len(valid)} ({pct:.0f}%)**")
+
+                # Does the two-signal agreement itself predict better than
+                # either signal alone? Split real-hit-rate by whether the
+                # statistical trend (Raw mu vs line) and the matchup grade
+                # (Quality Score) actually pointed the same direction that
+                # week, using "Raw Hit" as the real outcome check either way.
+                if "Agreement" in mc_df.columns and "Raw Hit" in mc_df.columns:
+                    agree_rows = mc_df[(mc_df["Agreement"] == "Agree") & mc_df["Raw Hit"].notna()]
+                    conflict_rows = mc_df[(mc_df["Agreement"] == "Conflict") & mc_df["Raw Hit"].notna()]
+                    if len(agree_rows) or len(conflict_rows):
+                        st.markdown("**When the two signals agree vs conflict:**")
+                        if len(agree_rows):
+                            a_pct = agree_rows["Raw Hit"].mean() * 100
+                            st.markdown(f"- Agree ({len(agree_rows)} weeks): "
+                                        f"{int(agree_rows['Raw Hit'].sum())}/{len(agree_rows)} ({a_pct:.0f}%)")
+                        if len(conflict_rows):
+                            c_pct = conflict_rows["Raw Hit"].mean() * 100
+                            st.markdown(f"- Conflict ({len(conflict_rows)} weeks): "
+                                        f"{int(conflict_rows['Raw Hit'].sum())}/{len(conflict_rows)} ({c_pct:.0f}%)")
+                        st.caption(
+                            "If 'Agree' weeks hit noticeably more often than 'Conflict' weeks, that's "
+                            "real proof the matchup grade adds something beyond the raw trend alone - "
+                            "the actual question you're asking. If they're close, the grade isn't "
+                            "adding much on top of what mu already knew."
+                        )
+
                 st.dataframe(mc_df, width='stretch')
                 st.caption(
-                    "Read Raw as the honest baseline - if Adjusted and CrossRef don't clear it "
-                    "by a real margin, the matchup data isn't adding value for THIS prop/player "
-                    "yet, and that's a real finding worth knowing, not a failure to hide."
+                    "Mu Lean = which way RAW mu (unadjusted) points vs the line. Quality Lean = "
+                    "which way the matchup grade alone points, independent of mu. Agreement shows "
+                    "whether those two genuinely different signals point the same way that week - "
+                    "'Agree' is a real convergence of two independent reads, not the same signal "
+                    "counted twice. Read Raw as the honest baseline - if Adjusted and CrossRef "
+                    "don't clear it by a real margin, the matchup data isn't adding value for THIS "
+                    "prop/player yet, and that's a real finding worth knowing, not a failure to hide."
                 )
 
         st.divider()
