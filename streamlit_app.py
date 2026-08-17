@@ -2389,6 +2389,234 @@ elif mode == "Coverage Matchup (premium data)":
             return {"rows": rows}
 
         st.divider()
+        st.markdown("## 🎯 Backtest Mu Tool — everything, one place")
+        st.caption(
+            "One section, all positions, all props, no scrolling through separate tools. Pick a "
+            "position, the prop list updates automatically (receiving for WR/TE, receiving AND "
+            "rushing for RB - it's dual-threat, both are real). Leave Player Name blank to scan "
+            "the whole league; type a name for one player only. Same real logic as everything "
+            "else built this session - two-sided coverage/alignment match, thin samples excluded, "
+            "judged against each player's own baseline, no external line needed."
+        )
+
+        BT_PROPS_BY_POS = {
+            "WR": [("targets", "Targets"), ("receptions", "Receptions"), ("rec_yards", "Rec Yards"),
+                   ("receiving_td", "Receiving TD")],
+            "TE": [("targets", "Targets"), ("receptions", "Receptions"), ("rec_yards", "Rec Yards"),
+                   ("receiving_td", "Receiving TD")],
+            "RB": [("targets", "Targets"), ("receptions", "Receptions"), ("rec_yards", "Rec Yards"),
+                   ("receiving_td", "Receiving TD"), ("rush_attempts", "Rush Attempts"),
+                   ("rush_yards", "Rush Yards")],
+        }
+        bt_col1, bt_col2 = st.columns(2)
+        with bt_col1:
+            bt_pos = st.selectbox("Position", ["WR", "TE", "RB"], key="bt_pos",
+                                   help="QB isn't wired into this specific backtest yet - Best Prop "
+                                        "Verdict and Line Value above still work for QB.")
+        prop_options = BT_PROPS_BY_POS[bt_pos]
+        with bt_col2:
+            bt_prop_label = st.selectbox("Prop", [lbl for _, lbl in prop_options], key="bt_prop_label")
+        bt_prop = next(p for p, lbl in prop_options if lbl == bt_prop_label)
+        bt_is_rush = bt_prop in ("rush_attempts", "rush_yards")
+
+        bt_name = st.text_input(
+            "Player name (leave BLANK to scan the whole league instead of one player)",
+            value="", key="bt_name")
+
+        bt_col3, bt_col4, bt_col5, bt_col6 = st.columns(4)
+        with bt_col3:
+            bt_line = st.number_input("Real fixed line", min_value=0.0,
+                                       value=(12.5 if bt_is_rush and bt_prop == "rush_attempts" else
+                                              55.5 if bt_prop in ("rec_yards", "rush_yards") else 5.5),
+                                       step=0.5, key="bt_line")
+        with bt_col4:
+            bt_season = st.number_input("Season", min_value=2020, max_value=2030, value=2025, step=1, key="bt_season2")
+        with bt_col5:
+            bt_top_n = st.number_input("Top-N threshold", min_value=1, max_value=32, value=10, step=1, key="bt_top_n2")
+        with bt_col6:
+            bt_min_games = st.number_input("Min real games (league-wide only)", min_value=1, max_value=18,
+                                            value=8, step=1, key="bt_min_games2")
+        bt_max_players = st.number_input("Max players to scan (league-wide only)", min_value=5, max_value=150,
+                                          value=60, step=5, key="bt_max_players2")
+
+        if bt_is_rush and st.session_state.get("rb_bundle") is None:
+            st.info("Rush props need the RB Run Concept dataset loaded (RB Run Concept Matchup "
+                    "section above) before this can run.")
+        elif st.button("Run Backtest Mu Tool", type="primary", key="bt_run_btn2"):
+            with st.spinner("Running - real network calls, this takes a bit..."):
+                try:
+                    if bt_name.strip():
+                        # SINGLE PLAYER MODE
+                        if bt_is_rush:
+                            result = _run_rb_mu_source_comparison_backtest(
+                                st.session_state["rb_bundle"], bt_name.strip(), int(bt_season), bt_prop, float(bt_line))
+                        else:
+                            real_nm = _resolve_real_player_name(bundle, bt_pos, bt_name.strip())
+                            if real_nm is None:
+                                result = {"error": f"Couldn't find '{bt_name}' in the loaded coverage data."}
+                            else:
+                                nm_weights = _get_real_alignment_weights(bundle, real_nm)
+                                result = _run_mu_source_comparison_backtest(
+                                    bundle, real_nm, bt_pos, None, nm_weights,
+                                    int(bt_season), int(bt_top_n), bt_prop, float(bt_line))
+                        st.session_state["_bt_unified_single"] = result
+                        st.session_state["_bt_unified_league"] = None
+                    else:
+                        # LEAGUE-WIDE MODE
+                        pstats = pull_player_stats([int(bt_season)])
+                        name_col = "player_display_name" if "player_display_name" in pstats.columns else (
+                            "player_name" if "player_name" in pstats.columns else None)
+                        agg = {"Raw": [0, 0], "Adjusted": [0, 0], "CrossRef": [0, 0]}
+                        consistent_hits = [0, 0]
+                        diag_hits = [0, 0]
+                        matchup_rows, diag_rows, errors = [], [], []
+                        players_tested = 0
+                        if name_col:
+                            pos_filter = "RB" if bt_pos == "RB" else bt_pos
+                            pos_matches = pstats[pstats["position"].astype(str).str.upper() == pos_filter]
+                            games_per_player = pos_matches.groupby(name_col)["week"].nunique()
+                            eligible = games_per_player[games_per_player >= int(bt_min_games)].sort_values(ascending=False)
+                            names_to_scan = list(eligible.index[:int(bt_max_players)])
+                            for nm in names_to_scan:
+                                try:
+                                    if bt_is_rush:
+                                        r = _run_rb_mu_source_comparison_backtest(
+                                            st.session_state["rb_bundle"], nm, int(bt_season), bt_prop, float(bt_line))
+                                    else:
+                                        real_nm = _resolve_real_player_name(bundle, bt_pos, nm)
+                                        if real_nm is None:
+                                            continue
+                                        nm_weights = _get_real_alignment_weights(bundle, real_nm)
+                                        r = _run_mu_source_comparison_backtest(
+                                            bundle, real_nm, bt_pos, None, nm_weights,
+                                            int(bt_season), int(bt_top_n), bt_prop, float(bt_line))
+                                except Exception as e:
+                                    errors.append(f"{nm}: {e}")
+                                    continue
+                                if r.get("error") or not r.get("rows"):
+                                    continue
+                                players_tested += 1
+                                for wk in r["rows"]:
+                                    for label in ["Raw", "Adjusted", "CrossRef"]:
+                                        hit = wk.get(f"{label} Hit")
+                                        if hit is not None:
+                                            agg[label][1] += 1
+                                            if hit:
+                                                agg[label][0] += 1
+                                    quality = wk.get("Coverage Agreement") or wk.get("Concept Agreement")
+                                    ob_hit = wk.get("Own-Baseline Hit")
+                                    cr = wk.get("CrossRef Confirms")
+                                    row_out = {
+                                        "Player": nm, "Week": wk.get("Week"), "Opponent": wk.get("Opponent"),
+                                        "Quality Score": wk.get("Quality Score"),
+                                        "Direction": wk.get("Own-Baseline Direction"),
+                                        "Raw mu": wk.get("Raw mu"), "Actual": wk.get("Actual"),
+                                        "Deviation": wk.get("Deviation from Own Baseline"),
+                                        "Games Similar": ("Yes" if cr is True else "No" if cr is False else "no data"),
+                                        "Result": "✅ Hit" if ob_hit else ("❌ Miss" if ob_hit is False else "-"),
+                                    }
+                                    if quality == "Consistent" and ob_hit is not None:
+                                        consistent_hits[1] += 1
+                                        if ob_hit:
+                                            consistent_hits[0] += 1
+                                        matchup_rows.append(row_out)
+                                    elif quality == "Single Real Match" and ob_hit is not None:
+                                        diag_hits[1] += 1
+                                        if ob_hit:
+                                            diag_hits[0] += 1
+                                        diag_rows.append(row_out)
+                        st.session_state["_bt_unified_league"] = {
+                            "agg": agg, "consistent_hits": consistent_hits, "diag_hits": diag_hits,
+                            "matchup_rows": matchup_rows, "diag_rows": diag_rows,
+                            "errors": errors, "players_tested": players_tested,
+                        }
+                        st.session_state["_bt_unified_single"] = None
+                except Exception as e:
+                    st.error(f"Backtest failed: {e}")
+
+        def _bt_color_dev(val):
+            if not isinstance(val, (int, float)):
+                return ""
+            intensity = min(abs(val) / 3.0, 1.0)
+            color = "0, 200, 0" if val > 0 else "200, 0, 0"
+            return f"background-color: rgba({color}, {intensity * 0.5})"
+
+        def _bt_color_result(val):
+            return "background-color: rgba(0, 200, 0, 0.3)" if "Hit" in str(val) \
+                else ("background-color: rgba(200, 0, 0, 0.3)" if "Miss" in str(val) else "")
+
+        def _bt_style(df):
+            try:
+                return df.style.map(_bt_color_dev, subset=["Deviation"]).map(_bt_color_result, subset=["Result"])
+            except AttributeError:
+                return df.style.applymap(_bt_color_dev, subset=["Deviation"]).applymap(_bt_color_result, subset=["Result"])
+
+        bt_single = st.session_state.get("_bt_unified_single")
+        if bt_single:
+            if bt_single.get("error"):
+                st.warning(bt_single["error"])
+            elif not bt_single.get("rows"):
+                st.info("No graded games came back.")
+            else:
+                st.markdown("#### Perfect Fit Verdict")
+                def _bt_verdict_row(r):
+                    quality = r.get("Coverage Agreement") or r.get("Concept Agreement") or "no data"
+                    quality_disp = ("🟢 Consistent" if quality == "Consistent" else
+                                     "🟡 Single Match" if quality == "Single Real Match" else "⚪ No Signal")
+                    ob_hit = r.get("Own-Baseline Hit")
+                    actual_disp = ("🟢 Beat Baseline" if ob_hit is True else
+                                    "🔴 Missed Baseline" if ob_hit is False else "⚪ No Call")
+                    cr = r.get("CrossRef Confirms")
+                    cr_disp = ("🟢 Confirms" if cr is True else
+                                "🔴 Contradicts" if cr is False else "⚪ Not enough games")
+                    return {"Week": r.get("Week"), "Opponent": r.get("Opponent"),
+                            "Matchup Lean": r.get("Own-Baseline Direction") or "-",
+                            "Signal Quality": quality_disp, "Actual": actual_disp, "Games Similar": cr_disp,
+                            "Real Deviation": r.get("Deviation from Own Baseline")}
+                vdf = pd.DataFrame([_bt_verdict_row(r) for r in bt_single["rows"]])
+                perfect = (vdf["Signal Quality"] == "🟢 Consistent") & (vdf["Actual"] == "🟢 Beat Baseline") & \
+                          (vdf["Games Similar"].isin(["🟢 Confirms", "⚪ Not enough games"]))
+                if perfect.sum():
+                    st.success(f"{int(perfect.sum())} real perfect-fit week(s) - shown first.")
+                st.dataframe(pd.concat([vdf[perfect], vdf[~perfect]]), width='stretch', hide_index=True)
+
+        bt_league = st.session_state.get("_bt_unified_league")
+        if bt_league:
+            if bt_league["players_tested"] == 0:
+                st.info("No graded games across any scanned player - try lowering min games or "
+                        "check the line is realistic for this prop.")
+            else:
+                st.success(f"Tested {bt_league['players_tested']} real {bt_pos}s.")
+                for label in ["Raw", "Adjusted", "CrossRef"]:
+                    hits, graded = bt_league["agg"][label]
+                    if graded:
+                        st.markdown(f"- **{label}**: {hits}/{graded} ({hits/graded*100:.0f}%)")
+                c_hits, c_graded = bt_league["consistent_hits"]
+                st.markdown("**Consistent-triggered (strict, no line):**")
+                if c_graded:
+                    st.markdown(f"{c_hits}/{c_graded} ({c_hits/c_graded*100:.0f}%)")
+                    st.dataframe(_bt_style(pd.DataFrame(bt_league["matchup_rows"])), width='stretch')
+                else:
+                    st.info("Never fired.")
+                d_hits, d_graded = bt_league["diag_hits"]
+                st.markdown("**Single Real Match (diagnostic, not the strict bar):**")
+                if d_graded:
+                    st.markdown(f"{d_hits}/{d_graded} ({d_hits/d_graded*100:.0f}%)")
+                    st.dataframe(_bt_style(pd.DataFrame(bt_league["diag_rows"])), width='stretch')
+                else:
+                    st.info("Never fired.")
+                if bt_league["errors"]:
+                    with st.expander(f"{len(bt_league['errors'])} skipped"):
+                        st.write(bt_league["errors"])
+
+        st.divider()
+        st.info("⬇️ Everything below this line is the older, separate tools (single-player Mu "
+                "Comparison, League-Wide receiving, League-Wide RB Rush, League-Wide Scan, Best "
+                "Prop Verdict, Line Value, etc.) - still fully working, kept for reference. The "
+                "unified tool above does the same job in one place; you shouldn't need to scroll "
+                "further unless you want the extra detail these give.")
+
+        st.divider()
         st.markdown("### Mu Comparison Backtest — Raw vs Adjusted vs Cross-Reference")
         st.caption(
             "The MLB-format direct test: does mu beat a REAL fixed line, one real prop at a "
