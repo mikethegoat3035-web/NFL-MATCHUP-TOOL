@@ -377,15 +377,16 @@ with st.expander("🔍 Debug: Check for real receiver alignment data (wide/slot/
 
 mode = st.radio(
     "Mode",
-    ["Scan (adjustable lines)", "Backtest (compare mu vs actual results)", "Draft Rankings",
-     "Coverage Matchup (premium data)"],
+    ["Scan (adjustable lines)", "Draft Rankings", "Coverage Matchup (premium data)"],
     horizontal=True,
-    help="Backtest mode only works for a week that's already been played. "
-         "Draft Rankings builds a full season projection/ranking for your "
+    help="Draft Rankings builds a full season projection/ranking for your "
          "league format, using last season's data as the projection basis. "
          "Coverage Matchup uses the manually-collected FantasyPoints premium "
          "dataset (Cover 0-6 shell-level splits) - separate from the free "
-         "nflreadpy pipeline the other three modes run on.",
+         "nflreadpy pipeline the other two modes run on. Real-results "
+         "backtesting now lives inside Coverage Matchup's 'Backtest Mu Tool' "
+         "and 'Scan Everything' sections - more thorough than the old "
+         "separate Backtest mode, so that mode was removed.",
 )
 
 if mode != "Coverage Matchup (premium data)":
@@ -1217,6 +1218,60 @@ elif mode == "Coverage Matchup (premium data)":
         st.info("Load the dataset above before building a matchup report.")
     else:
         st.divider()
+        st.markdown("#### RB Run Concept Dataset (optional, needed for RB rushing anywhere in this app)")
+        st.caption(
+            "Real fix, not a workaround: this used to only be reachable by first selecting a "
+            "single RB player below and building their report - genuinely bad UX, since none of "
+            "that data was actually needed just to LOAD the dataset. Load it here, once, and "
+            "every rushing tool below (Backtest Mu Tool, Scan Everything, League-Wide RB Rush, "
+            "the single-matchup RB card) works without that detour. The original load button "
+            "further down still works too if you're already there - loading from either place "
+            "fills the same real data."
+        )
+        rb_folder_mode_top = st.radio(
+            "RB data folder layout", ["Two folders (no renaming needed)", "One folder (DEF_ prefix)"],
+            horizontal=True, key="rb_folder_mode_top",
+        )
+        if rb_folder_mode_top.startswith("Two"):
+            rbt_col1, rbt_col2 = st.columns(2)
+            with rbt_col1:
+                rb_player_dir_top = st.text_input(
+                    "Player-side folder", value=st.session_state.get("rb_player_dir", "") or "RUSH METRICS",
+                    key="rb_player_dir_top")
+            with rbt_col2:
+                rb_def_dir_top = st.text_input(
+                    "Defense-allowed folder", value=st.session_state.get("rb_def_dir", "") or "RUSH METRICS ALLOWED",
+                    key="rb_def_dir_top")
+            rb_data_dir_top = None
+        else:
+            rb_data_dir_top = st.text_input(
+                "RB data folder (one flat folder, defense files prefixed DEF_)",
+                value=st.session_state.rb_data_dir or "rb_data", key="rb_data_dir_top")
+            rb_player_dir_top = rb_def_dir_top = None
+
+        if st.button("Load RB run-concept dataset", type="primary", key="rb_load_top_btn"):
+            with st.spinner("Loading all 6 run concepts, both sides..."):
+                try:
+                    if rb_folder_mode_top.startswith("Two"):
+                        st.session_state.rb_bundle = load_full_rb_dataset(
+                            player_dir=rb_player_dir_top, def_dir=rb_def_dir_top)
+                        st.session_state.rb_player_dir = rb_player_dir_top
+                        st.session_state.rb_def_dir = rb_def_dir_top
+                    else:
+                        st.session_state.rb_bundle = load_full_rb_dataset(data_dir=rb_data_dir_top)
+                        st.session_state.rb_data_dir = rb_data_dir_top
+                    n_missing = len(st.session_state.rb_bundle.missing)
+                    if n_missing:
+                        st.warning(f"Loaded with {n_missing} file(s) missing.")
+                    else:
+                        st.success("Loaded all 12 files (6 concepts x 2 sides) - dataset complete.")
+                except Exception as e:
+                    st.error(f"Failed to load RB dataset: {e}")
+                    st.session_state.rb_bundle = None
+        if st.session_state.get("rb_bundle") is not None:
+            st.caption("✅ RB run-concept dataset currently loaded and available to every tool below.")
+
+        st.divider()
         team_names_sorted = sorted(bundle.def_coverage.keys()) or sorted(set(TEAM_ABBREV_TO_FULL.values()))
 
         mcol1, mcol2, mcol3 = st.columns(3)
@@ -2027,6 +2082,179 @@ elif mode == "Coverage Matchup (premium data)":
             ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
             return best, ties
 
+        def _predict_best_qb_prop_v2(bundle, qb_name, opponent_team_full, top_n):
+            """Real two-sided QB version, built fresh - the older
+            _predict_best_qb_prop above only ever used the QB's OWN side,
+            same exact bug _predict_best_prop had before its fix, just
+            never carried over to QB. This one requires own AND
+            defense-allowed to BOTH independently confirm, thin samples
+            excluded, same real standard as receiving/rushing now use."""
+            opp_profile = bundle.def_coverage.get(opponent_team_full)
+            if opp_profile is None:
+                return None
+            included = _top_n_coverage_fields(bundle, opp_profile, top_n)
+            already_fields = {f for f, _, _ in included}
+            included = included + _find_extreme_low_usage_fields(
+                bundle, opp_profile, "QB", None, None, already_fields,
+            )
+            if not included:
+                return None
+            scores = {}
+            consistency = {}
+            qualifying_coverages = {}
+            for prop, stat_col in QB_BT_PREDICT_MAP.items():
+                per_coverage = {}
+                for field, z, rank in included:
+                    row = bundle.qb_vs_coverage.get(field, {}).get(qb_name)
+                    def_row = bundle.def_allowed_to_qb.get(field, {}).get(opponent_team_full)
+                    own_tier = (row.get("_tiers", {}).get(stat_col)
+                                if row is not None and not row.get("_thin_sample") else None)
+                    def_tier = (def_row.get("_tiers", {}).get(stat_col)
+                                if def_row is not None and not def_row.get("_thin_sample") else None)
+                    own_w = TIER_WEIGHTS.get(own_tier)
+                    def_w = TIER_WEIGHTS.get(def_tier)
+                    if own_w is None and def_w is None:
+                        continue
+                    blended = (0.5 * own_w + 0.5 * def_w) if (own_w is not None and def_w is not None) \
+                        else (own_w if own_w is not None else def_w)
+                    per_coverage[field] = {"blended": blended, "own": own_w, "def": def_w, "weight": 1.0}
+                if not per_coverage:
+                    scores[prop] = None
+                    consistency[prop] = None
+                    qualifying_coverages[prop] = []
+                    continue
+                total_w = sum(d["weight"] for d in per_coverage.values())
+                scores[prop] = round(sum(d["blended"] * d["weight"] for d in per_coverage.values()) / total_w, 1)
+                qualifying_coverages[prop] = list(per_coverage.keys())
+                directions = []
+                for d in per_coverage.values():
+                    if d["own"] is not None and d["def"] is not None and d["own"] >= 75 and d["def"] <= 25:
+                        directions.append("favorable")
+                    elif d["own"] is not None and d["def"] is not None and d["own"] <= 25 and d["def"] >= 75:
+                        directions.append("unfavorable")
+                    else:
+                        directions.append("mixed")
+                real_match_dirs = [d for d in directions if d != "mixed"]
+                if len(per_coverage) < 2:
+                    consistency[prop] = "Single Coverage"
+                elif len(real_match_dirs) == 0:
+                    consistency[prop] = "Split"
+                elif len(real_match_dirs) == 1:
+                    consistency[prop] = "Single Real Match"
+                elif all(dr == real_match_dirs[0] for dr in real_match_dirs):
+                    consistency[prop] = "Consistent"
+                else:
+                    consistency[prop] = "Split"
+            valid = {p: s for p, s in scores.items() if s is not None}
+            if not valid:
+                return {"scores": scores, "best": None, "ties": [], "consistency": consistency,
+                        "qualifying_coverages": qualifying_coverages}
+            best = max(valid, key=valid.get)
+            ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
+            return {"scores": scores, "best": best, "ties": ties, "consistency": consistency,
+                    "qualifying_coverages": qualifying_coverages}
+
+        def _run_qb_mu_source_comparison_backtest(bundle, qb_name, game_log_season, top_n, prop, line):
+            """QB mirror of _run_mu_source_comparison_backtest - real
+            walk-forward, no look-ahead, own-baseline directional test
+            (no external line needed for the Consistent/Single Real Match
+            check), real CrossRef confirmation from other similarly-graded
+            opponents."""
+            pstats = pull_player_stats([int(game_log_season)])
+            sched = pull_schedules([int(game_log_season)])
+            matches_df = pstats[pstats["position"].astype(str).str.upper() == "QB"]
+            name_col = "player_display_name" if "player_display_name" in pstats.columns else (
+                "player_name" if "player_name" in pstats.columns else None)
+            gsis = None
+            if name_col:
+                hit = matches_df[matches_df[name_col].astype(str).str.lower() == qb_name.lower()]
+                if not hit.empty:
+                    gsis = hit.iloc[0]["gsis_id"]
+            if gsis is None:
+                return {"error": f"Couldn't match '{qb_name}' to a real nflreadpy record for {game_log_season}."}
+
+            stat_col = QB_BT_ACTUAL_MAP.get(prop)
+            if stat_col is None:
+                return {"error": f"'{prop}' isn't a real QB prop this tool tracks."}
+
+            all_abbrevs = set(TEAM_ABBREV_TO_FULL.keys())
+            full_log = build_coverage_crossref_game_log(
+                gsis, "QB", all_abbrevs, pstats, sched, seasons=[int(game_log_season)], max_games=25,
+            )
+            full_to_abbrevs = {}
+            for abbr, full in TEAM_ABBREV_TO_FULL.items():
+                full_to_abbrevs.setdefault(full, set()).add(abbr)
+
+            rows = []
+            for i, g in enumerate(full_log):
+                prior_games = full_log[i + 1:]
+                prior_vals = [pg["stats"].get(stat_col) for pg in prior_games if stat_col in pg.get("stats", {})]
+                prior_vals = [v for v in prior_vals if v is not None]
+                if len(prior_vals) < 3:
+                    continue
+                raw_mu = sum(prior_vals) / len(prior_vals)
+
+                opp_full = TEAM_ABBREV_TO_FULL.get(g["opponent"])
+                q_score = None
+                q_consistency = None
+                q_coverages = []
+                if opp_full and prop in QB_BT_PREDICT_MAP:
+                    pred = _predict_best_qb_prop_v2(bundle, qb_name, opp_full, top_n)
+                    q_score = pred["scores"].get(prop) if pred else None
+                    q_consistency = pred.get("consistency", {}).get(prop) if pred else None
+                    q_coverages = pred.get("qualifying_coverages", {}).get(prop, []) if pred else []
+
+                crossref_mu = None
+                cr_sample_size = 0
+                if opp_full:
+                    opp_profile = bundle.def_coverage.get(opp_full)
+                    if opp_profile:
+                        included = _top_n_coverage_fields(bundle, opp_profile, top_n)
+                        cross_teams_full = _find_cross_reference_teams(bundle, included, opp_full, top_n, min_match=2)
+                        cross_abbrevs = set()
+                        for full_name in cross_teams_full:
+                            cross_abbrevs |= full_to_abbrevs.get(full_name, set())
+                        cr_vals = [pg["stats"].get(stat_col) for pg in prior_games
+                                   if stat_col in pg.get("stats", {}) and pg["opponent"] in cross_abbrevs]
+                        cr_vals = [v for v in cr_vals if v is not None]
+                        cr_sample_size = len(cr_vals)
+                        if cr_sample_size >= 3:
+                            crossref_mu = sum(cr_vals) / cr_sample_size
+
+                actual_value = g["stats"].get(stat_col)
+                if actual_value is None:
+                    continue
+
+                row = {"Week": g["week"], "Opponent": g["opponent"], "Actual": actual_value,
+                       "Quality Score": round(q_score, 1) if q_score is not None else "no data",
+                       "Coverage Agreement": q_consistency or "no data",
+                       "Qualifying Coverages": ", ".join(q_coverages) if q_coverages else "-",
+                       "Raw mu": round(raw_mu, 2)}
+                predicted_over = raw_mu > line
+                actual_over = actual_value > line
+                row["Raw Hit"] = predicted_over == actual_over
+                row["Raw Error"] = round(abs(actual_value - raw_mu), 2)
+
+                if q_consistency in ("Consistent", "Single Real Match") and q_score is not None:
+                    predicted_direction = "OVER" if q_score > 50 else "UNDER"
+                    actual_direction = "OVER" if actual_value > raw_mu else "UNDER"
+                    row["Own-Baseline Direction"] = predicted_direction
+                    row["Own-Baseline Hit"] = (predicted_direction == actual_direction)
+                    row["Deviation from Own Baseline"] = round(actual_value - raw_mu, 2)
+                    if crossref_mu is not None:
+                        cr_direction = "OVER" if crossref_mu > raw_mu else "UNDER"
+                        row["CrossRef Confirms"] = (cr_direction == predicted_direction)
+                    else:
+                        row["CrossRef Confirms"] = None
+                else:
+                    row["Own-Baseline Direction"] = None
+                    row["Own-Baseline Hit"] = None
+                    row["Deviation from Own Baseline"] = None
+                    row["CrossRef Confirms"] = None
+                rows.append(row)
+
+            return {"rows": rows}
+
         def _run_qb_season_backtest(bundle, qb_name, game_log_season, top_n):
             """QB version of _run_season_backtest - same real per-week
             grading logic, QB's own prop set and no alignment concept."""
@@ -2608,6 +2836,147 @@ elif mode == "Coverage Matchup (premium data)":
                 if bt_league["errors"]:
                     with st.expander(f"{len(bt_league['errors'])} skipped"):
                         st.write(bt_league["errors"])
+
+        st.divider()
+        st.markdown("#### 🌐 Scan Everything — every position, every prop, one combined table")
+        st.caption(
+            "The real 'one table, one thing' version: QB (all 4 passing props), WR/TE (all 4 "
+            "receiving props), RB (4 receiving + 2 rushing) - all scanned automatically, all "
+            "dumped into ONE color-coded table with Position and Prop columns so you can tell "
+            "everything apart. Uses reasonable default lines per prop (shown below) since there's "
+            "no way to pick a custom line for 18 different prop types at once. This is genuinely "
+            "slow - up to 18 separate league-wide scans in one click - keep Max Players modest."
+        )
+        ev_col1, ev_col2, ev_col3 = st.columns(3)
+        with ev_col1:
+            ev_season = st.number_input("Season", min_value=2020, max_value=2030, value=2025, step=1, key="ev_season")
+        with ev_col2:
+            ev_max_players = st.number_input("Max players PER position", min_value=5, max_value=60,
+                                              value=20, step=5, key="ev_max_players")
+        with ev_col3:
+            ev_min_games = st.number_input("Min real games", min_value=1, max_value=18, value=8, step=1, key="ev_min_games")
+        ev_top_n = st.number_input("Top-N coverage threshold", min_value=1, max_value=32, value=10, step=1, key="ev_top_n")
+
+        EVERYTHING_CONFIG = [
+            ("QB", "pass_attempts", 28.5, "Pass Attempts"), ("QB", "pass_completions", 18.5, "Pass Completions"),
+            ("QB", "pass_yards", 225.5, "Pass Yards"), ("QB", "pass_td", 1.5, "Pass TD"),
+            ("WR", "targets", 5.5, "Targets"), ("WR", "receptions", 4.5, "Receptions"),
+            ("WR", "rec_yards", 55.5, "Rec Yards"), ("WR", "receiving_td", 0.5, "Receiving TD"),
+            ("TE", "targets", 4.5, "Targets"), ("TE", "receptions", 3.5, "Receptions"),
+            ("TE", "rec_yards", 35.5, "Rec Yards"), ("TE", "receiving_td", 0.5, "Receiving TD"),
+            ("RB", "targets", 2.5, "Targets"), ("RB", "receptions", 2.5, "Receptions"),
+            ("RB", "rec_yards", 20.5, "Rec Yards"), ("RB", "receiving_td", 0.5, "Receiving TD"),
+            ("RB", "rush_attempts", 12.5, "Rush Attempts"), ("RB", "rush_yards", 55.5, "Rush Yards"),
+        ]
+        with st.expander("Default lines being used (fixed, can't be customized in this mode)"):
+            st.dataframe(pd.DataFrame([{"Position": p, "Prop": lbl, "Line": ln}
+                                        for p, _, ln, lbl in EVERYTHING_CONFIG]),
+                        width='stretch', hide_index=True)
+
+        if st.button("Scan Everything", type="primary", key="ev_run_btn"):
+            with st.spinner("Scanning every position and prop - this is genuinely slow, real work happening..."):
+                try:
+                    pstats_cache = pull_player_stats([int(ev_season)])
+                    name_col = "player_display_name" if "player_display_name" in pstats_cache.columns else (
+                        "player_name" if "player_name" in pstats_cache.columns else None)
+                    players_by_pos = {}
+                    if name_col:
+                        for pos in ["QB", "WR", "TE", "RB"]:
+                            pos_matches = pstats_cache[pstats_cache["position"].astype(str).str.upper() == pos]
+                            games_per_player = pos_matches.groupby(name_col)["week"].nunique()
+                            eligible = games_per_player[games_per_player >= int(ev_min_games)].sort_values(ascending=False)
+                            players_by_pos[pos] = list(eligible.index[:int(ev_max_players)])
+
+                    ev_matchup_rows, ev_diag_rows, ev_errors = [], [], []
+                    ev_agg = {"Raw": [0, 0]}
+                    ev_consistent = [0, 0]
+                    ev_diag = [0, 0]
+                    ev_rb_bundle = st.session_state.get("rb_bundle")
+
+                    for pos, prop, ln, prop_lbl in EVERYTHING_CONFIG:
+                        is_rush = prop in ("rush_attempts", "rush_yards")
+                        if is_rush and ev_rb_bundle is None:
+                            ev_errors.append(f"{pos} {prop_lbl}: skipped - RB Run Concept dataset not loaded.")
+                            continue
+                        for nm in players_by_pos.get(pos, []):
+                            try:
+                                if pos == "QB":
+                                    r = _run_qb_mu_source_comparison_backtest(bundle, nm, int(ev_season), int(ev_top_n), prop, ln)
+                                elif is_rush:
+                                    r = _run_rb_mu_source_comparison_backtest(ev_rb_bundle, nm, int(ev_season), prop, ln)
+                                else:
+                                    real_nm = _resolve_real_player_name(bundle, pos, nm)
+                                    if real_nm is None:
+                                        continue
+                                    nm_weights = _get_real_alignment_weights(bundle, real_nm)
+                                    r = _run_mu_source_comparison_backtest(
+                                        bundle, real_nm, pos, None, nm_weights, int(ev_season), int(ev_top_n), prop, ln)
+                            except Exception as e:
+                                ev_errors.append(f"{pos} {nm} {prop_lbl}: {e}")
+                                continue
+                            if r.get("error") or not r.get("rows"):
+                                continue
+                            for wk in r["rows"]:
+                                raw_hit = wk.get("Raw Hit")
+                                if raw_hit is not None:
+                                    ev_agg["Raw"][1] += 1
+                                    if raw_hit:
+                                        ev_agg["Raw"][0] += 1
+                                quality = wk.get("Coverage Agreement") or wk.get("Concept Agreement")
+                                ob_hit = wk.get("Own-Baseline Hit")
+                                cr = wk.get("CrossRef Confirms")
+                                row_out = {
+                                    "Position": pos, "Prop": prop_lbl, "Player": nm,
+                                    "Week": wk.get("Week"), "Opponent": wk.get("Opponent"),
+                                    "Quality Score": wk.get("Quality Score"),
+                                    "Direction": wk.get("Own-Baseline Direction"),
+                                    "Raw mu": wk.get("Raw mu"), "Actual": wk.get("Actual"),
+                                    "Deviation": wk.get("Deviation from Own Baseline"),
+                                    "Games Similar": ("Yes" if cr is True else "No" if cr is False else "no data"),
+                                    "Result": "✅ Hit" if ob_hit else ("❌ Miss" if ob_hit is False else "-"),
+                                }
+                                if quality == "Consistent" and ob_hit is not None:
+                                    ev_consistent[1] += 1
+                                    if ob_hit:
+                                        ev_consistent[0] += 1
+                                    ev_matchup_rows.append(row_out)
+                                elif quality == "Single Real Match" and ob_hit is not None:
+                                    ev_diag[1] += 1
+                                    if ob_hit:
+                                        ev_diag[0] += 1
+                                    ev_diag_rows.append(row_out)
+                    st.session_state["_ev_result"] = {
+                        "agg": ev_agg, "consistent": ev_consistent, "diag": ev_diag,
+                        "matchup_rows": ev_matchup_rows, "diag_rows": ev_diag_rows, "errors": ev_errors,
+                    }
+                except Exception as e:
+                    st.error(f"Scan Everything failed: {e}")
+
+        ev_result = st.session_state.get("_ev_result")
+        if ev_result:
+            raw_hits, raw_graded = ev_result["agg"]["Raw"]
+            if raw_graded:
+                st.markdown(f"**Raw baseline, everything combined: {raw_hits}/{raw_graded} "
+                            f"({raw_hits/raw_graded*100:.0f}%)**")
+            c_hits, c_graded = ev_result["consistent"]
+            st.markdown("**Consistent (strict, all positions/props combined):**")
+            if c_graded:
+                st.markdown(f"{c_hits}/{c_graded} ({c_hits/c_graded*100:.0f}%)")
+                st.dataframe(_bt_style(pd.DataFrame(ev_result["matchup_rows"])
+                             .sort_values(["Position", "Prop", "Player", "Week"])), width='stretch')
+            else:
+                st.info("Never fired anywhere, across all positions and props.")
+            d_hits, d_graded = ev_result["diag"]
+            st.markdown("**Single Real Match (diagnostic, all combined):**")
+            if d_graded:
+                st.markdown(f"{d_hits}/{d_graded} ({d_hits/d_graded*100:.0f}%)")
+                st.dataframe(_bt_style(pd.DataFrame(ev_result["diag_rows"])
+                             .sort_values(["Position", "Prop", "Player", "Week"])), width='stretch')
+            else:
+                st.info("Never fired anywhere, across all positions and props.")
+            if ev_result["errors"]:
+                with st.expander(f"{len(ev_result['errors'])} skipped/errors"):
+                    st.write(ev_result["errors"])
 
         st.divider()
         st.info("⬇️ Everything below this line is the older, separate tools (single-player Mu "
