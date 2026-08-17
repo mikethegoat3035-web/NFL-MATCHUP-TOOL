@@ -1571,9 +1571,22 @@ elif mode == "Coverage Matchup (premium data)":
                         directions.append("unfavorable")
                     else:
                         directions.append("mixed")
+                # Diagnostic tier added here: separates "genuinely zero
+                # real two-sided matches anywhere" from "found exactly
+                # one real match, just not the two the strict bar
+                # requires." Same real thresholds as Consistent - this
+                # doesn't loosen what Consistent means, it just reveals
+                # WHERE the drop-off happens when Consistent never fires,
+                # so that's checkable against real data instead of
+                # guessed at.
+                real_match_dirs = [d for d in directions if d != "mixed"]
                 if len(per_coverage) < 2:
                     consistency[prop] = "Single Coverage"
-                elif all(dr == "favorable" for dr in directions) or all(dr == "unfavorable" for dr in directions):
+                elif len(real_match_dirs) == 0:
+                    consistency[prop] = "Split"
+                elif len(real_match_dirs) == 1:
+                    consistency[prop] = "Single Real Match"
+                elif all(dr == real_match_dirs[0] for dr in real_match_dirs):
                     consistency[prop] = "Consistent"
                 else:
                     consistency[prop] = "Split"
@@ -1762,12 +1775,16 @@ elif mode == "Coverage Matchup (premium data)":
                     # signal - "great vs one coverage, bad vs another"
                     # averaging to 65 shouldn't earn the same conviction as
                     # "bad vs every qualifying coverage" also averaging to
-                    # 65. Only Consistent (or a genuine single qualifying
-                    # coverage) is treated as trustworthy enough to adjust -
-                    # a Split reading is treated the same as thin/unreliable,
-                    # NOT adjusted, matching the "minimal, high-conviction
-                    # plays only" goal instead of averaging away real signal.
-                    is_unreliable = (q_consistency == "Split")
+                    # 65. Only Consistent is treated as trustworthy enough
+                    # to adjust - anything else (Split, Single Real Match,
+                    # or missing data) is treated as unreliable, NOT
+                    # adjusted, matching the "minimal, high-conviction plays
+                    # only" goal instead of averaging away real signal. The
+                    # new Single Real Match diagnostic tier is deliberately
+                    # excluded here too - it's tracked separately for
+                    # visibility into where the strict bar drops off, not
+                    # meant to quietly count as reliable enough to move mu.
+                    is_unreliable = (q_consistency != "Consistent")
                     adjusted_mu, _, _ = _apply_best_signal_adjustment(raw_mu, q_score, is_thin=is_unreliable)
 
                 crossref_mu = None
@@ -1821,12 +1838,13 @@ elif mode == "Coverage Matchup (premium data)":
                 # session), test "did his ACTUAL production deviate from
                 # HIS OWN raw baseline, in the direction the two-sided
                 # signal predicted." Every player judged against himself,
-                # never an arbitrary population-wide number. Only
-                # meaningful on genuinely Consistent weeks - that's when
-                # the signal is actually making a real directional claim
-                # (favorable = expect him to beat his own normal level,
-                # unfavorable = expect him to fall short of it).
-                if q_consistency == "Consistent" and q_score is not None:
+                # never an arbitrary population-wide number. This test
+                # fires for BOTH "Consistent" (the real, strict bar) AND
+                # "Single Real Match" (the diagnostic tier) - kept
+                # completely separate downstream by Coverage Agreement, so
+                # the diagnostic can show real color-coded results without
+                # ever contaminating the strict Consistent-triggered number.
+                if q_consistency in ("Consistent", "Single Real Match") and q_score is not None:
                     predicted_direction = "OVER" if q_score > 50 else "UNDER"
                     actual_direction = "OVER" if actual_value > raw_mu else "UNDER"
                     row["Own-Baseline Direction"] = predicted_direction
@@ -2143,9 +2161,17 @@ elif mode == "Coverage Matchup (premium data)":
                         directions.append("unfavorable")
                     else:
                         directions.append("mixed")
+                # Same diagnostic tier as the receiving side - reveals
+                # whether the underlying idea ever finds a real match at
+                # all, separate from the strict "2+ agreeing" bar.
+                real_match_dirs = [d for d in directions if d != "mixed"]
                 if len(per_concept) < 2:
                     consistency[prop] = "Single Concept"
-                elif all(dr == "favorable" for dr in directions) or all(dr == "unfavorable" for dr in directions):
+                elif len(real_match_dirs) == 0:
+                    consistency[prop] = "Split"
+                elif len(real_match_dirs) == 1:
+                    consistency[prop] = "Single Real Match"
+                elif all(dr == real_match_dirs[0] for dr in real_match_dirs):
                     consistency[prop] = "Consistent"
                 else:
                     consistency[prop] = "Split"
@@ -2282,7 +2308,10 @@ elif mode == "Coverage Matchup (premium data)":
                     q_score = pred["scores"].get(prop) if pred else None
                     q_consistency = pred.get("consistency", {}).get(prop) if pred else None
                     q_concepts = pred.get("qualifying_concepts", {}).get(prop, []) if pred else []
-                    is_unreliable = (q_consistency == "Split")
+                    # Only Consistent adjusts mu - Single Real Match tracked
+                    # separately as a diagnostic, not treated as reliable
+                    # enough to move the real number.
+                    is_unreliable = (q_consistency != "Consistent")
                     adjusted_mu, _, _ = _apply_best_signal_adjustment(raw_mu, q_score, is_thin=is_unreliable)
 
                 crossref_mu = None
@@ -2336,8 +2365,10 @@ elif mode == "Coverage Matchup (premium data)":
                 # Same no-line, own-baseline directional test as the
                 # receiving version - judged against his OWN raw carries/
                 # yards average, not an external line, plus the real
-                # cross-referenced-game confirmation.
-                if q_consistency == "Consistent" and q_score is not None:
+                # cross-referenced-game confirmation. Fires for both
+                # Consistent (strict) and Single Real Match (diagnostic),
+                # kept separate downstream.
+                if q_consistency in ("Consistent", "Single Real Match") and q_score is not None:
                     predicted_direction = "OVER" if q_score > 50 else "UNDER"
                     actual_direction = "OVER" if actual_value > raw_mu else "UNDER"
                     row["Own-Baseline Direction"] = predicted_direction
@@ -2416,6 +2447,68 @@ elif mode == "Coverage Matchup (premium data)":
             elif not mc.get("rows"):
                 st.info("No graded games came back - try a lower minimum or a different player.")
             else:
+                st.markdown("#### Perfect Fit Verdict — best-quality mu, color-coded")
+                st.caption(
+                    "One row per real week, three signals color-coded together: **Signal Quality** "
+                    "(green = Consistent, a genuine two-sided player-strong/defense-weak match across "
+                    "2+ real coverages; yellow = Single Real Match, one real match found but not the "
+                    "full bar; gray = no real signal that week), **Actual** (green = his real result "
+                    "beat his own baseline in the predicted direction, red = it didn't), and **Games "
+                    "Similar** (green = OTHER real games vs similarly-graded defenses backed the same "
+                    "call; gray = not enough of those games to say either way - not needed to trust the "
+                    "row, just an extra confirmation when it exists). All three green together is "
+                    "exactly what you're looking for - a real, confirmed, high-quality matchup."
+                )
+
+                def _verdict_row(r):
+                    quality = r.get("Coverage Agreement") or r.get("Concept Agreement") or "no data"
+                    if quality == "Consistent":
+                        quality_disp = "🟢 Consistent"
+                    elif quality == "Single Real Match":
+                        quality_disp = "🟡 Single Match"
+                    else:
+                        quality_disp = "⚪ No Signal"
+
+                    ob_hit = r.get("Own-Baseline Hit")
+                    if ob_hit is True:
+                        actual_disp = "🟢 Beat Baseline"
+                    elif ob_hit is False:
+                        actual_disp = "🔴 Missed Baseline"
+                    else:
+                        actual_disp = "⚪ No Call"
+
+                    cr = r.get("CrossRef Confirms")
+                    if cr is True:
+                        cr_disp = "🟢 Confirms"
+                    elif cr is False:
+                        cr_disp = "🔴 Contradicts"
+                    else:
+                        cr_disp = "⚪ Not enough games"
+
+                    lean = r.get("Own-Baseline Direction") or "-"
+                    return {
+                        "Week": r.get("Week"), "Opponent": r.get("Opponent"),
+                        "Matchup Lean": lean, "Signal Quality": quality_disp,
+                        "Actual": actual_disp, "Games Similar": cr_disp,
+                        "Real Deviation": r.get("Deviation from Own Baseline"),
+                    }
+
+                verdict_rows = [_verdict_row(r) for r in mc["rows"]]
+                verdict_df = pd.DataFrame(verdict_rows)
+                # Perfect-fit rows first - every real week where all three
+                # signals genuinely lined up, exactly what to look at first.
+                perfect_mask = (verdict_df["Signal Quality"] == "🟢 Consistent") & \
+                               (verdict_df["Actual"] == "🟢 Beat Baseline") & \
+                               (verdict_df["Games Similar"].isin(["🟢 Confirms", "⚪ Not enough games"]))
+                n_perfect = int(perfect_mask.sum())
+                if n_perfect:
+                    st.success(f"{n_perfect} real week(s) where Signal Quality and Actual were both "
+                              f"green (Games Similar either confirmed or wasn't available to check) - "
+                              f"shown first below.")
+                verdict_df = pd.concat([verdict_df[perfect_mask], verdict_df[~perfect_mask]])
+                st.dataframe(verdict_df, width='stretch', hide_index=True)
+
+                st.divider()
                 mc_df = pd.DataFrame(mc["rows"])
                 st.markdown("**Line-based hit rate (needs the fixed line above):**")
                 for label in ["Raw", "Adjusted", "CrossRef"]:
@@ -2541,7 +2634,13 @@ elif mode == "Coverage Matchup (premium data)":
                     # genuinely agreed (Coverage Agreement == "Consistent") - the real, isolated
                     # answer to "when this fires at all, is it actually good" instead of being
                     # buried inside the overall Adjusted average alongside every week it never fired.
+                    lwmc_diagnostic_triggered = [0, 0]  # SEPARATE diagnostic - Single Real Match
+                    # weeks only (exactly one qualifying coverage was a genuine two-sided match,
+                    # not the 2+ the strict bar requires). Never mixed into the strict number
+                    # above - exists purely to show whether the underlying idea finds ANY real
+                    # match at all when Consistent stays silent.
                     lwmc_matchup_rows = []
+                    lwmc_diagnostic_rows = []
                     if lwmc_name_col:
                         pos_matches = lwmc_pstats[lwmc_pstats["position"].astype(str).str.upper() == lwmc_pos]
                         games_per_player = pos_matches.groupby(lwmc_name_col)["week"].nunique()
@@ -2619,6 +2718,23 @@ elif mode == "Coverage Matchup (premium data)":
                                                                "No" if cr_confirms is False else "no data"),
                                         "Result": "✅ Hit" if ob_hit_val else "❌ Miss",
                                     })
+                                elif wk_row.get("Coverage Agreement") == "Single Real Match" and ob_hit_val is not None:
+                                    # SEPARATE diagnostic tally - never added to
+                                    # lwmc_consistent_triggered above.
+                                    lwmc_diagnostic_triggered[1] += 1
+                                    if ob_hit_val:
+                                        lwmc_diagnostic_triggered[0] += 1
+                                    lwmc_diagnostic_rows.append({
+                                        "Player": nm, "Week": wk_row.get("Week"), "Opponent": wk_row.get("Opponent"),
+                                        "Qualifying Coverages": wk_row.get("Qualifying Coverages", "-"),
+                                        "Quality Score": wk_row.get("Quality Score"),
+                                        "Own-Baseline Direction": wk_row.get("Own-Baseline Direction"),
+                                        "Raw mu": raw_mu_val, "Actual": wk_row.get("Actual"),
+                                        "Deviation": wk_row.get("Deviation from Own Baseline"),
+                                        "CrossRef Confirms": ("Yes" if cr_confirms is True else
+                                                               "No" if cr_confirms is False else "no data"),
+                                        "Result": "✅ Hit" if ob_hit_val else "❌ Miss",
+                                    })
                             if p_graded["Raw"]:
                                 lwmc_rows.append({
                                     "Player": nm, "Graded Games": p_graded["Raw"],
@@ -2629,7 +2745,8 @@ elif mode == "Coverage Matchup (premium data)":
                     st.session_state["_lwmc_result"] = {
                         "agg": lwmc_agg, "mae": lwmc_mae, "agree": lwmc_agree, "conflict": lwmc_conflict,
                         "consistent_triggered": lwmc_consistent_triggered,
-                        "matchup_rows": lwmc_matchup_rows,
+                        "diagnostic_triggered": lwmc_diagnostic_triggered,
+                        "matchup_rows": lwmc_matchup_rows, "diagnostic_rows": lwmc_diagnostic_rows,
                         "rows": lwmc_rows, "errors": lwmc_errors, "players_scanned": len(lwmc_rows),
                     }
             except Exception as e:
@@ -2694,6 +2811,17 @@ elif mode == "Coverage Matchup (premium data)":
                             "genuinely rare for this prop/position, or worth checking with a larger "
                             "player pool (raise 'Max players to scan' above).")
 
+                def _color_deviation(val):
+                    if not isinstance(val, (int, float)):
+                        return ""
+                    intensity = min(abs(val) / 3.0, 1.0)
+                    color = "0, 200, 0" if val > 0 else "200, 0, 0"
+                    return f"background-color: rgba({color}, {intensity * 0.5})"
+
+                def _color_result(val):
+                    return "background-color: rgba(0, 200, 0, 0.3)" if "Hit" in str(val) \
+                        else "background-color: rgba(200, 0, 0, 0.3)"
+
                 matchup_rows = lwmc.get("matchup_rows", [])
                 if matchup_rows:
                     st.markdown(f"**Every real Consistent-triggered matchup found ({len(matchup_rows)}) — "
@@ -2707,17 +2835,6 @@ elif mode == "Coverage Matchup (premium data)":
                     )
                     matchup_df = pd.DataFrame(matchup_rows).sort_values(["Player", "Week"])
 
-                    def _color_deviation(val):
-                        if not isinstance(val, (int, float)):
-                            return ""
-                        intensity = min(abs(val) / 3.0, 1.0)
-                        color = "0, 200, 0" if val > 0 else "200, 0, 0"
-                        return f"background-color: rgba({color}, {intensity * 0.5})"
-
-                    def _color_result(val):
-                        return "background-color: rgba(0, 200, 0, 0.3)" if "Hit" in str(val) \
-                            else "background-color: rgba(200, 0, 0, 0.3)"
-
                     # .style.map() needs pandas 2.1+ ; .applymap() is the same
                     # thing on older pandas. Try the current name first, fall
                     # back rather than risk a hard crash on an older deployed
@@ -2729,6 +2846,37 @@ elif mode == "Coverage Matchup (premium data)":
                         styled_matchup = matchup_df.style.applymap(_color_deviation, subset=["Deviation"]) \
                             .applymap(_color_result, subset=["Result"])
                     st.dataframe(styled_matchup, width='stretch')
+
+                st.divider()
+                st.markdown("#### Diagnostic: Single Real Match (NOT the strict bar — see if the idea works at all)")
+                st.caption(
+                    "Separate from everything above, and never counted toward the real Consistent "
+                    "number. This fires when exactly ONE qualifying coverage was a genuine two-sided "
+                    "match (own strong AND defense weak, both real) - one real match found, just not "
+                    "the two the strict standard requires. If the strict number above came back empty, "
+                    "this tells you whether that's because the underlying idea finds real matches but "
+                    "not enough of them at once (worth knowing), or because it finds essentially "
+                    "nothing at all (a different, bigger problem)."
+                )
+                dg_hits, dg_graded = lwmc.get("diagnostic_triggered", [0, 0])
+                if dg_graded:
+                    dg_pct = dg_hits / dg_graded * 100
+                    st.markdown(f"- {dg_hits}/{dg_graded} ({dg_pct:.0f}%) real weeks with exactly one "
+                                f"genuine two-sided match — 50% is the coinflip baseline here too")
+                    dg_rows = lwmc.get("diagnostic_rows", [])
+                    if dg_rows:
+                        dg_df = pd.DataFrame(dg_rows).sort_values(["Player", "Week"])
+                        try:
+                            dg_styled = dg_df.style.map(_color_deviation, subset=["Deviation"]) \
+                                .map(_color_result, subset=["Result"])
+                        except AttributeError:
+                            dg_styled = dg_df.style.applymap(_color_deviation, subset=["Deviation"]) \
+                                .applymap(_color_result, subset=["Result"])
+                        st.dataframe(dg_styled, width='stretch')
+                else:
+                    st.warning("Zero real matches found even at this looser diagnostic level - the "
+                              "underlying two-sided matchup idea isn't finding evidence in this real "
+                              "data at all for this prop/position, not just the strict bar being tight.")
 
                 st.dataframe(pd.DataFrame(lwmc["rows"]).sort_values("Graded Games", ascending=False),
                              width='stretch')
@@ -2776,7 +2924,9 @@ elif mode == "Coverage Matchup (premium data)":
                         rblw_mae_sum = {"Raw": 0.0, "Adjusted": 0.0, "CrossRef": 0.0}
                         rblw_mae_n = {"Raw": 0, "Adjusted": 0, "CrossRef": 0}
                         rblw_consistent_triggered = [0, 0]
+                        rblw_diagnostic_triggered = [0, 0]
                         rblw_matchup_rows = []
+                        rblw_diagnostic_rows = []
                         if rblw_name_col:
                             pos_matches = rblw_pstats[rblw_pstats["position"].astype(str).str.upper() == "RB"]
                             games_per_player = pos_matches.groupby(rblw_name_col)["week"].nunique()
@@ -2829,6 +2979,21 @@ elif mode == "Coverage Matchup (premium data)":
                                                                    "No" if cr_confirms is False else "no data"),
                                             "Result": "✅ Hit" if ob_hit_val else "❌ Miss",
                                         })
+                                    elif wk_row.get("Concept Agreement") == "Single Real Match" and ob_hit_val is not None:
+                                        rblw_diagnostic_triggered[1] += 1
+                                        if ob_hit_val:
+                                            rblw_diagnostic_triggered[0] += 1
+                                        rblw_diagnostic_rows.append({
+                                            "Player": nm, "Week": wk_row.get("Week"), "Opponent": wk_row.get("Opponent"),
+                                            "Qualifying Concepts": wk_row.get("Qualifying Concepts", "-"),
+                                            "Quality Score": wk_row.get("Quality Score"),
+                                            "Own-Baseline Direction": wk_row.get("Own-Baseline Direction"),
+                                            "Raw mu": raw_mu_val, "Actual": wk_row.get("Actual"),
+                                            "Deviation": wk_row.get("Deviation from Own Baseline"),
+                                            "CrossRef Confirms": ("Yes" if cr_confirms is True else
+                                                                   "No" if cr_confirms is False else "no data"),
+                                            "Result": "✅ Hit" if ob_hit_val else "❌ Miss",
+                                        })
                                 if p_graded["Raw"]:
                                     rblw_rows.append({
                                         "Player": nm, "Graded Games": p_graded["Raw"],
@@ -2838,7 +3003,8 @@ elif mode == "Coverage Matchup (premium data)":
                                     for label in ["Raw", "Adjusted", "CrossRef"]}
                         st.session_state["_rblw_result"] = {
                             "agg": rblw_agg, "mae": rblw_mae, "consistent_triggered": rblw_consistent_triggered,
-                            "matchup_rows": rblw_matchup_rows,
+                            "diagnostic_triggered": rblw_diagnostic_triggered,
+                            "matchup_rows": rblw_matchup_rows, "diagnostic_rows": rblw_diagnostic_rows,
                             "rows": rblw_rows, "errors": rblw_errors, "players_scanned": len(rblw_rows),
                         }
                 except Exception as e:
@@ -2883,6 +3049,17 @@ elif mode == "Coverage Matchup (premium data)":
                         st.info("The signal never fired Consistent across this scan - try more "
                                 "players, or this may genuinely be rare for RB rushing.")
 
+                    def _rb_color_deviation(val):
+                        if not isinstance(val, (int, float)):
+                            return ""
+                        intensity = min(abs(val) / 5.0, 1.0)
+                        color = "0, 200, 0" if val > 0 else "200, 0, 0"
+                        return f"background-color: rgba({color}, {intensity * 0.5})"
+
+                    def _rb_color_result(val):
+                        return "background-color: rgba(0, 200, 0, 0.3)" if "Hit" in str(val) \
+                            else "background-color: rgba(200, 0, 0, 0.3)"
+
                     matchup_rows = rblw.get("matchup_rows", [])
                     if matchup_rows:
                         st.markdown(f"**Every real Consistent-triggered matchup found ({len(matchup_rows)}) — "
@@ -2894,17 +3071,6 @@ elif mode == "Coverage Matchup (premium data)":
                         )
                         rb_matchup_df = pd.DataFrame(matchup_rows).sort_values(["Player", "Week"])
 
-                        def _rb_color_deviation(val):
-                            if not isinstance(val, (int, float)):
-                                return ""
-                            intensity = min(abs(val) / 5.0, 1.0)
-                            color = "0, 200, 0" if val > 0 else "200, 0, 0"
-                            return f"background-color: rgba({color}, {intensity * 0.5})"
-
-                        def _rb_color_result(val):
-                            return "background-color: rgba(0, 200, 0, 0.3)" if "Hit" in str(val) \
-                                else "background-color: rgba(200, 0, 0, 0.3)"
-
                         try:
                             rb_styled = rb_matchup_df.style.map(_rb_color_deviation, subset=["Deviation"]) \
                                 .map(_rb_color_result, subset=["Result"])
@@ -2912,6 +3078,32 @@ elif mode == "Coverage Matchup (premium data)":
                             rb_styled = rb_matchup_df.style.applymap(_rb_color_deviation, subset=["Deviation"]) \
                                 .applymap(_rb_color_result, subset=["Result"])
                         st.dataframe(rb_styled, width='stretch')
+
+                    st.divider()
+                    st.markdown("#### Diagnostic: Single Real Match (NOT the strict bar)")
+                    st.caption(
+                        "Same idea as the receiving diagnostic - fires when exactly ONE qualifying "
+                        "concept was a genuine two-sided match, not the 2+ the strict bar requires. "
+                        "Never counted toward the real Consistent number above."
+                    )
+                    rb_dg_hits, rb_dg_graded = rblw.get("diagnostic_triggered", [0, 0])
+                    if rb_dg_graded:
+                        rb_dg_pct = rb_dg_hits / rb_dg_graded * 100
+                        st.markdown(f"- {rb_dg_hits}/{rb_dg_graded} ({rb_dg_pct:.0f}%) real weeks with "
+                                    f"exactly one genuine two-sided match")
+                        rb_dg_rows = rblw.get("diagnostic_rows", [])
+                        if rb_dg_rows:
+                            rb_dg_df = pd.DataFrame(rb_dg_rows).sort_values(["Player", "Week"])
+                            try:
+                                rb_dg_styled = rb_dg_df.style.map(_rb_color_deviation, subset=["Deviation"]) \
+                                    .map(_rb_color_result, subset=["Result"])
+                            except AttributeError:
+                                rb_dg_styled = rb_dg_df.style.applymap(_rb_color_deviation, subset=["Deviation"]) \
+                                    .applymap(_rb_color_result, subset=["Result"])
+                            st.dataframe(rb_dg_styled, width='stretch')
+                    else:
+                        st.warning("Zero real matches found even at this looser diagnostic level for "
+                                  "RB rushing.")
 
                     st.dataframe(pd.DataFrame(rblw["rows"]).sort_values("Graded Games", ascending=False),
                                  width='stretch')
