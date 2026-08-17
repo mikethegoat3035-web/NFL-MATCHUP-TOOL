@@ -2716,7 +2716,23 @@ elif mode == "Coverage Matchup (premium data)":
                         for pos in ["QB", "WR", "TE", "RB"]:
                             pos_matches = pstats_cache[pstats_cache["position"].astype(str).str.upper() == pos]
                             games_per_player = pos_matches.groupby(name_col)["week"].nunique()
-                            eligible = games_per_player[games_per_player >= int(ev_min_games)].sort_values(ascending=False)
+                            eligible = games_per_player[games_per_player >= int(ev_min_games)]
+                            if pos == "QB" and "attempts" in pos_matches.columns:
+                                # Real fix for a real, confirmed pattern: "8+ games
+                                # played" alone lets a backup/emergency QB through
+                                # if he appeared in enough box scores, even with
+                                # only a handful of real attempts most weeks - his
+                                # actual results are driven by snap-count/role
+                                # volatility, not matchup quality, and no coverage
+                                # signal can predict that. Confirmed directly from
+                                # real backtest output: Dillon Gabriel predicted 23
+                                # attempts, actually threw 1 - a role collapse, not
+                                # a bad matchup read. Requiring a real, meaningful
+                                # average attempts/game filters out exactly this.
+                                avg_att = pos_matches.groupby(name_col)["attempts"].mean()
+                                stable_qbs = avg_att[avg_att >= 15].index
+                                eligible = eligible[eligible.index.isin(stable_qbs)]
+                            eligible = eligible.sort_values(ascending=False)
                             players_by_pos[pos] = list(eligible.index[:int(ev_max_players)])
 
                     ev_matchup_rows, ev_diag_rows, ev_errors = [], [], []
