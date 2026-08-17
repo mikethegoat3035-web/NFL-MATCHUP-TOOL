@@ -1540,6 +1540,7 @@ elif mode == "Coverage Matchup (premium data)":
             scores = {}
             consistency = {}
             qualifying_coverages = {}
+            own_data_fraction = {}
             for prop, stat_col in PROP_STAT_MAP.items():
                 # Real fix, this turn: previously stored only the BLENDED
                 # (own+def averaged) value per coverage, and checked whether
@@ -1611,10 +1612,23 @@ elif mode == "Coverage Matchup (premium data)":
                     scores[prop] = None
                     consistency[prop] = None
                     qualifying_coverages[prop] = []
+                    own_data_fraction[prop] = None
                     continue
                 total_w = sum(d["weight"] for d in per_coverage.values())
                 scores[prop] = round(sum(d["blended"] * d["weight"] for d in per_coverage.values()) / total_w, 1) if total_w else None
                 qualifying_coverages[prop] = list(per_coverage.keys())
+                # Real diagnostic, added after finding identical Quality
+                # Scores across genuinely different players facing the same
+                # opponent - a coverage where the player's own side is
+                # missing/thin silently falls back to JUST the defense's
+                # grade (opponent-specific, same for everyone), which can
+                # make different players' scores collapse to the same
+                # number if it happens often enough. This exposes exactly
+                # how many of the qualifying coverages actually had real
+                # own-side data vs fell back to defense-only, so that's
+                # checkable instead of inferred.
+                own_data_fraction[prop] = round(
+                    sum(1 for d in per_coverage.values() if d["own"] is not None) / len(per_coverage), 2)
 
                 # Classify each coverage as a genuine two-sided match, not
                 # just a favorable-looking average.
@@ -1649,11 +1663,11 @@ elif mode == "Coverage Matchup (premium data)":
             valid = {p: s for p, s in scores.items() if s is not None}
             if not valid:
                 return {"scores": scores, "best": None, "ties": [], "consistency": consistency,
-                        "qualifying_coverages": qualifying_coverages}
+                        "qualifying_coverages": qualifying_coverages, "own_data_fraction": own_data_fraction}
             best = max(valid, key=valid.get)
             ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
             return {"scores": scores, "best": best, "ties": ties, "consistency": consistency,
-                    "qualifying_coverages": qualifying_coverages}
+                    "qualifying_coverages": qualifying_coverages, "own_data_fraction": own_data_fraction}
 
         def _score_badge_class(score):
             if score is None:
@@ -1819,12 +1833,14 @@ elif mode == "Coverage Matchup (premium data)":
                 q_score = None
                 q_consistency = None
                 q_coverages = []
+                q_own_data_frac = None
                 if opp_full and prop in PROP_STAT_MAP:
                     pred = _predict_best_prop(bundle, p_name, p_pos, opp_full,
                                                 alignment=alignment, weights=weights, top_n=top_n)
                     q_score = pred["scores"].get(prop) if pred else None
                     q_consistency = pred.get("consistency", {}).get(prop) if pred else None
                     q_coverages = pred.get("qualifying_coverages", {}).get(prop, []) if pred else []
+                    q_own_data_frac = pred.get("own_data_fraction", {}).get(prop) if pred else None
                     # Real fix, same session: a Split score landing on the
                     # same number as a Consistent one isn't the same real
                     # signal - "great vs one coverage, bad vs another"
@@ -1867,6 +1883,7 @@ elif mode == "Coverage Matchup (premium data)":
                        "Quality Score": round(q_score, 1) if q_score is not None else "no data",
                        "Coverage Agreement": q_consistency or "no data",
                        "Qualifying Coverages": ", ".join(q_coverages) if q_coverages else "-",
+                       "Own-Data Coverage %": (f"{q_own_data_frac*100:.0f}%" if q_own_data_frac is not None else "-"),
                        "CrossRef Sample": cr_sample_size}
                 for label, mu_val in [("Raw", raw_mu), ("Adjusted", adjusted_mu), ("CrossRef", crossref_mu)]:
                     if mu_val is None:
@@ -2102,6 +2119,7 @@ elif mode == "Coverage Matchup (premium data)":
             scores = {}
             consistency = {}
             qualifying_coverages = {}
+            own_data_fraction = {}
             for prop, stat_col in QB_BT_PREDICT_MAP.items():
                 per_coverage = {}
                 for field, z, rank in included:
@@ -2122,10 +2140,13 @@ elif mode == "Coverage Matchup (premium data)":
                     scores[prop] = None
                     consistency[prop] = None
                     qualifying_coverages[prop] = []
+                    own_data_fraction[prop] = None
                     continue
                 total_w = sum(d["weight"] for d in per_coverage.values())
                 scores[prop] = round(sum(d["blended"] * d["weight"] for d in per_coverage.values()) / total_w, 1)
                 qualifying_coverages[prop] = list(per_coverage.keys())
+                own_data_fraction[prop] = round(
+                    sum(1 for d in per_coverage.values() if d["own"] is not None) / len(per_coverage), 2)
                 directions = []
                 for d in per_coverage.values():
                     if d["own"] is not None and d["def"] is not None and d["own"] >= 75 and d["def"] <= 25:
@@ -2148,11 +2169,11 @@ elif mode == "Coverage Matchup (premium data)":
             valid = {p: s for p, s in scores.items() if s is not None}
             if not valid:
                 return {"scores": scores, "best": None, "ties": [], "consistency": consistency,
-                        "qualifying_coverages": qualifying_coverages}
+                        "qualifying_coverages": qualifying_coverages, "own_data_fraction": own_data_fraction}
             best = max(valid, key=valid.get)
             ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
             return {"scores": scores, "best": best, "ties": ties, "consistency": consistency,
-                    "qualifying_coverages": qualifying_coverages}
+                    "qualifying_coverages": qualifying_coverages, "own_data_fraction": own_data_fraction}
 
         def _run_qb_mu_source_comparison_backtest(bundle, qb_name, game_log_season, top_n, prop, line):
             """QB mirror of _run_mu_source_comparison_backtest - real
@@ -2198,11 +2219,13 @@ elif mode == "Coverage Matchup (premium data)":
                 q_score = None
                 q_consistency = None
                 q_coverages = []
+                q_own_data_frac = None
                 if opp_full and prop in QB_BT_PREDICT_MAP:
                     pred = _predict_best_qb_prop_v2(bundle, qb_name, opp_full, top_n)
                     q_score = pred["scores"].get(prop) if pred else None
                     q_consistency = pred.get("consistency", {}).get(prop) if pred else None
                     q_coverages = pred.get("qualifying_coverages", {}).get(prop, []) if pred else []
+                    q_own_data_frac = pred.get("own_data_fraction", {}).get(prop) if pred else None
 
                 crossref_mu = None
                 cr_sample_size = 0
@@ -2229,6 +2252,7 @@ elif mode == "Coverage Matchup (premium data)":
                        "Quality Score": round(q_score, 1) if q_score is not None else "no data",
                        "Coverage Agreement": q_consistency or "no data",
                        "Qualifying Coverages": ", ".join(q_coverages) if q_coverages else "-",
+                       "Own-Data Coverage %": (f"{q_own_data_frac*100:.0f}%" if q_own_data_frac is not None else "-"),
                        "Raw mu": round(raw_mu, 2)}
                 predicted_over = raw_mu > line
                 actual_over = actual_value > line
@@ -2351,6 +2375,7 @@ elif mode == "Coverage Matchup (premium data)":
             scores = {}
             consistency = {}
             qualifying_concepts = {}
+            own_data_fraction = {}
             for prop, stat_col in RB_PROP_STAT_MAP.items():
                 per_concept = {}  # concept -> {"blended", "own", "def", "weight"}
                 for concept, w in weights.items():
@@ -2376,10 +2401,13 @@ elif mode == "Coverage Matchup (premium data)":
                     scores[prop] = None
                     consistency[prop] = None
                     qualifying_concepts[prop] = []
+                    own_data_fraction[prop] = None
                     continue
                 total_w = sum(d["weight"] for d in per_concept.values())
                 scores[prop] = round(sum(d["blended"] * d["weight"] for d in per_concept.values()) / total_w, 1)
                 qualifying_concepts[prop] = list(per_concept.keys())
+                own_data_fraction[prop] = round(
+                    sum(1 for d in per_concept.values() if d["own"] is not None) / len(per_concept), 2)
 
                 directions = []
                 for d in per_concept.values():
@@ -2406,11 +2434,11 @@ elif mode == "Coverage Matchup (premium data)":
             valid = {p: s for p, s in scores.items() if s is not None}
             if not valid:
                 return {"scores": scores, "best": None, "ties": [], "consistency": consistency,
-                        "qualifying_concepts": qualifying_concepts}
+                        "qualifying_concepts": qualifying_concepts, "own_data_fraction": own_data_fraction}
             best = max(valid, key=valid.get)
             ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
             return {"scores": scores, "best": best, "ties": ties, "consistency": consistency,
-                    "qualifying_concepts": qualifying_concepts}
+                    "qualifying_concepts": qualifying_concepts, "own_data_fraction": own_data_fraction}
 
         def _actual_best_rb_prop(tiers):
             valid = {p: TIER_WEIGHTS[tiers[c]] for p, c in RB_GAME_LOG_PROP_MAP.items()
@@ -2531,11 +2559,13 @@ elif mode == "Coverage Matchup (premium data)":
                 q_score = None
                 q_consistency = None
                 q_concepts = []
+                q_own_data_frac = None
                 if opp_full and prop in RB_PROP_STAT_MAP:
                     pred = _predict_best_rb_prop(rb_bundle, rb_name, opp_full)
                     q_score = pred["scores"].get(prop) if pred else None
                     q_consistency = pred.get("consistency", {}).get(prop) if pred else None
                     q_concepts = pred.get("qualifying_concepts", {}).get(prop, []) if pred else []
+                    q_own_data_frac = pred.get("own_data_fraction", {}).get(prop) if pred else None
                     # Only Consistent adjusts mu - Single Real Match tracked
                     # separately as a diagnostic, not treated as reliable
                     # enough to move the real number.
@@ -2577,6 +2607,7 @@ elif mode == "Coverage Matchup (premium data)":
                        "Quality Score": round(q_score, 1) if q_score is not None else "no data",
                        "Concept Agreement": q_consistency or "no data",
                        "Qualifying Concepts": ", ".join(q_concepts) if q_concepts else "-",
+                       "Own-Data Coverage %": (f"{q_own_data_frac*100:.0f}%" if q_own_data_frac is not None else "-"),
                        "CrossRef Sample": cr_sample_size}
                 for label, mu_val in [("Raw", raw_mu), ("Adjusted", adjusted_mu), ("CrossRef", crossref_mu)]:
                     if mu_val is None:
@@ -2724,6 +2755,7 @@ elif mode == "Coverage Matchup (premium data)":
                                     "Position": pos, "Prop": prop_lbl, "Player": nm,
                                     "Week": wk.get("Week"), "Opponent": wk.get("Opponent"),
                                     "Quality Score": wk.get("Quality Score"),
+                                    "Own-Data Coverage %": wk.get("Own-Data Coverage %", "-"),
                                     "Direction": wk.get("Own-Baseline Direction"),
                                     "Raw mu": wk.get("Raw mu"), "Actual": wk.get("Actual"),
                                     "Deviation": wk.get("Deviation from Own Baseline"),
