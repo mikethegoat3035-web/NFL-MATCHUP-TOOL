@@ -1989,7 +1989,17 @@ elif mode == "Coverage Matchup (premium data)":
             """Blends BOTH the RB's own tier AND the opponent's
             defense-allowed tier per concept (50/50 when both exist),
             weighted by his real attempt share per concept - identical
-            logic to the single-matchup version, just callable standalone."""
+            logic to the single-matchup version, just callable standalone.
+
+            Same real fix as _predict_best_prop, same turn: tracks each
+            qualifying CONCEPT's own blended score before merging, so
+            "bad vs Inside Zone AND bad vs Outside Zone" (real, consistent
+            signal) isn't mathematically indistinguishable from "great vs
+            Inside Zone, bad vs Outside Zone" (genuine split) landing on
+            the same averaged number. consistency[prop]: 'Consistent' when
+            every qualifying concept agrees (all >=60 or all <=40), 'Split'
+            when they disagree, 'Single Concept' when only one concept had
+            real attempt share."""
             rb_own_atts = {
                 c: (rb_bundle.rb_vs_concept.get(c, {}).get(rb_name, {}) or {}).get("_att", 0)
                 for c in RB_CONCEPT_FILES
@@ -1999,8 +2009,9 @@ elif mode == "Coverage Matchup (premium data)":
             if not weights:
                 return None
             scores = {}
+            consistency = {}
             for prop, stat_col in RB_PROP_STAT_MAP.items():
-                weighted_vals = []
+                per_concept = {}  # concept -> (blended_score, weight)
                 for concept, w in weights.items():
                     own_row = rb_bundle.rb_vs_concept.get(concept, {}).get(rb_name)
                     own_tier = own_row.get("_tiers", {}).get(stat_col) if own_row else None
@@ -2013,15 +2024,26 @@ elif mode == "Coverage Matchup (premium data)":
                         continue
                     blended = (0.5 * own_w + 0.5 * def_w) if (own_w is not None and def_w is not None) \
                         else (own_w if own_w is not None else def_w)
-                    weighted_vals.append((w, blended))
-                total_w = sum(w for w, _ in weighted_vals)
-                scores[prop] = round(sum(w * s for w, s in weighted_vals) / total_w, 1) if total_w else None
+                    per_concept[concept] = (blended, w)
+                if not per_concept:
+                    scores[prop] = None
+                    consistency[prop] = None
+                    continue
+                total_w = sum(w for _, w in per_concept.values())
+                scores[prop] = round(sum(sc * w for sc, w in per_concept.values()) / total_w, 1)
+                vals = [sc for sc, _ in per_concept.values()]
+                if len(vals) < 2:
+                    consistency[prop] = "Single Concept"
+                elif all(v >= 60 for v in vals) or all(v <= 40 for v in vals):
+                    consistency[prop] = "Consistent"
+                else:
+                    consistency[prop] = "Split"
             valid = {p: s for p, s in scores.items() if s is not None}
             if not valid:
-                return {"scores": scores, "best": None, "ties": []}
+                return {"scores": scores, "best": None, "ties": [], "consistency": consistency}
             best = max(valid, key=valid.get)
             ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
-            return {"scores": scores, "best": best, "ties": ties}
+            return {"scores": scores, "best": best, "ties": ties, "consistency": consistency}
 
         def _actual_best_rb_prop(tiers):
             valid = {p: TIER_WEIGHTS[tiers[c]] for p, c in RB_GAME_LOG_PROP_MAP.items()
@@ -2082,7 +2104,122 @@ elif mode == "Coverage Matchup (premium data)":
                 })
             return {"rows": rows, "strict_hits": strict_hits, "generous_hits": generous_hits, "graded": graded}
 
-        st.divider()
+        def _run_rb_mu_source_comparison_backtest(rb_bundle, rb_name, game_log_season, prop, line):
+            """RB rushing mirror of _run_mu_source_comparison_backtest -
+            same real walk-forward, real fixed line, no look-ahead, three
+            mu sources compared head to head:
+              Raw: flat trailing average of his own real games.
+              Adjusted: nudged by _predict_best_rb_prop's real matchup
+              grade (own+defense blend per concept, weighted by real
+              attempt share) - only when the read is Consistent across
+              qualifying concepts, same gating as the receiving version.
+              CrossRef: trailing average from real games only against
+              teams whose defense-allowed grade matched the current real
+              opponent's direction (Elite/Poor) on the SAME concepts this
+              RB actually runs - same real matching already used in the
+              RB game log cross-reference section, reused here directly."""
+            pstats = pull_player_stats([int(game_log_season)])
+            sched = pull_schedules([int(game_log_season)])
+            matches_df = pstats[pstats["position"].astype(str).str.upper() == "RB"]
+            name_col = "player_display_name" if "player_display_name" in pstats.columns else (
+                "player_name" if "player_name" in pstats.columns else None)
+            gsis = None
+            if name_col:
+                hit = matches_df[matches_df[name_col].astype(str).str.lower() == rb_name.lower()]
+                if not hit.empty:
+                    gsis = hit.iloc[0]["gsis_id"]
+            if gsis is None:
+                return {"error": f"Couldn't match '{rb_name}' to a real nflreadpy record for {game_log_season}."}
+
+            stat_col = RB_GAME_LOG_PROP_MAP.get(prop)
+            if stat_col is None:
+                return {"error": f"'{prop}' isn't a real rushing prop this tool tracks."}
+
+            all_abbrevs = set(TEAM_ABBREV_TO_FULL.keys())
+            full_log = build_coverage_crossref_game_log(
+                gsis, "RB", all_abbrevs, pstats, sched, seasons=[int(game_log_season)], max_games=25,
+            )
+            full_to_abbrevs = {}
+            for abbr, full in TEAM_ABBREV_TO_FULL.items():
+                full_to_abbrevs.setdefault(full, set()).add(abbr)
+
+            rb_own_atts = {
+                c: (rb_bundle.rb_vs_concept.get(c, {}).get(rb_name, {}) or {}).get("_att", 0)
+                for c in RB_CONCEPT_FILES
+            }
+            total_att = sum(rb_own_atts.values())
+            rb_own_weights = {c: (a / total_att) for c, a in rb_own_atts.items() if total_att and a > 0}
+
+            rows = []
+            for i, g in enumerate(full_log):
+                prior_games = full_log[i + 1:]
+                prior_vals = [pg["stats"].get(stat_col) for pg in prior_games if stat_col in pg.get("stats", {})]
+                prior_vals = [v for v in prior_vals if v is not None]
+                if len(prior_vals) < 3:
+                    continue
+                raw_mu = sum(prior_vals) / len(prior_vals)
+
+                opp_full = TEAM_ABBREV_TO_FULL.get(g["opponent"])
+                adjusted_mu = raw_mu
+                q_score = None
+                q_consistency = None
+                if opp_full and prop in RB_PROP_STAT_MAP:
+                    pred = _predict_best_rb_prop(rb_bundle, rb_name, opp_full)
+                    q_score = pred["scores"].get(prop) if pred else None
+                    q_consistency = pred.get("consistency", {}).get(prop) if pred else None
+                    is_unreliable = (q_consistency == "Split")
+                    adjusted_mu, _, _ = _apply_best_signal_adjustment(raw_mu, q_score, is_thin=is_unreliable)
+
+                crossref_mu = None
+                cr_sample_size = 0
+                if opp_full and rb_own_weights:
+                    cr_matches = {}
+                    for concept, w in rb_own_weights.items():
+                        opp_row = rb_bundle.def_allowed.get(concept, {}).get(opp_full)
+                        if opp_row is None or opp_row.get("_thin_sample"):
+                            continue
+                        opp_tier = opp_row.get("_tiers", {}).get("YDS")
+                        if opp_tier not in ("Elite", "Poor"):
+                            continue
+                        for team, row in rb_bundle.def_allowed.get(concept, {}).items():
+                            if team == opp_full or row.get("_thin_sample"):
+                                continue
+                            if row.get("_tiers", {}).get("YDS") == opp_tier:
+                                cr_matches[team] = cr_matches.get(team, 0) + 1
+                    cross_teams_full = [t for t, c in cr_matches.items() if c >= 1]
+                    cross_abbrevs = set()
+                    for full_name in cross_teams_full:
+                        cross_abbrevs |= full_to_abbrevs.get(full_name, set())
+                    cr_vals = [pg["stats"].get(stat_col) for pg in prior_games
+                               if stat_col in pg.get("stats", {}) and pg["opponent"] in cross_abbrevs]
+                    cr_vals = [v for v in cr_vals if v is not None]
+                    cr_sample_size = len(cr_vals)
+                    if cr_sample_size >= 3:
+                        crossref_mu = sum(cr_vals) / cr_sample_size
+
+                actual_value = g["stats"].get(stat_col)
+                if actual_value is None:
+                    continue
+
+                row = {"Week": g["week"], "Opponent": g["opponent"], "Actual": actual_value,
+                       "Quality Score": round(q_score, 1) if q_score is not None else "no data",
+                       "Concept Agreement": q_consistency or "no data",
+                       "CrossRef Sample": cr_sample_size}
+                for label, mu_val in [("Raw", raw_mu), ("Adjusted", adjusted_mu), ("CrossRef", crossref_mu)]:
+                    if mu_val is None:
+                        row[f"{label} mu"] = "no data"
+                        row[f"{label} Hit"] = None
+                        row[f"{label} Error"] = None
+                        continue
+                    predicted_over = mu_val > line
+                    actual_over = actual_value > line
+                    row[f"{label} mu"] = round(mu_val, 2)
+                    row[f"{label} Hit"] = predicted_over == actual_over
+                    row[f"{label} Error"] = round(abs(actual_value - mu_val), 2)
+                rows.append(row)
+
+            return {"rows": rows}
+
         st.divider()
         st.markdown("### Mu Comparison Backtest — Raw vs Adjusted vs Cross-Reference")
         st.caption(
@@ -2262,6 +2399,11 @@ elif mode == "Coverage Matchup (premium data)":
                     lwmc_mae_n = {"Raw": 0, "Adjusted": 0, "CrossRef": 0}
                     lwmc_agree = [0, 0]
                     lwmc_conflict = [0, 0]
+                    lwmc_consistent_triggered = [0, 0]  # hits, graded - ONLY weeks where the
+                    # adjustment actually fired (Adjusted != Raw) AND the qualifying coverages
+                    # genuinely agreed (Coverage Agreement == "Consistent") - the real, isolated
+                    # answer to "when this fires at all, is it actually good" instead of being
+                    # buried inside the overall Adjusted average alongside every week it never fired.
                     if lwmc_name_col:
                         pos_matches = lwmc_pstats[lwmc_pstats["position"].astype(str).str.upper() == lwmc_pos]
                         games_per_player = pos_matches.groupby(lwmc_name_col)["week"].nunique()
@@ -2306,6 +2448,15 @@ elif mode == "Coverage Matchup (premium data)":
                                     lwmc_conflict[1] += 1
                                     if wk_row["Raw Hit"]:
                                         lwmc_conflict[0] += 1
+                                raw_mu_val = wk_row.get("Raw mu")
+                                adj_mu_val = wk_row.get("Adjusted mu")
+                                adj_hit_val = wk_row.get("Adjusted Hit")
+                                actually_fired = (isinstance(raw_mu_val, (int, float)) and isinstance(adj_mu_val, (int, float))
+                                                   and raw_mu_val != adj_mu_val)
+                                if actually_fired and wk_row.get("Coverage Agreement") == "Consistent" and adj_hit_val is not None:
+                                    lwmc_consistent_triggered[1] += 1
+                                    if adj_hit_val:
+                                        lwmc_consistent_triggered[0] += 1
                             if p_graded["Raw"]:
                                 lwmc_rows.append({
                                     "Player": nm, "Graded Games": p_graded["Raw"],
@@ -2315,6 +2466,7 @@ elif mode == "Coverage Matchup (premium data)":
                                 for label in ["Raw", "Adjusted", "CrossRef"]}
                     st.session_state["_lwmc_result"] = {
                         "agg": lwmc_agg, "mae": lwmc_mae, "agree": lwmc_agree, "conflict": lwmc_conflict,
+                        "consistent_triggered": lwmc_consistent_triggered,
                         "rows": lwmc_rows, "errors": lwmc_errors, "players_scanned": len(lwmc_rows),
                     }
             except Exception as e:
@@ -2359,11 +2511,168 @@ elif mode == "Coverage Matchup (premium data)":
                         "This is the real, league-wide answer to whether the matchup grade adds "
                         "trustworthy value beyond the raw trend - not just one player's noisy sample."
                     )
+
+                ct_hits, ct_graded = lwmc.get("consistent_triggered", [0, 0])
+                st.markdown("**Consistent-triggered weeks only (the real test - not blended with weeks it never fired):**")
+                if ct_graded:
+                    ct_pct = ct_hits / ct_graded * 100
+                    st.markdown(f"- {ct_hits}/{ct_graded} ({ct_pct:.0f}%) across {ct_graded} real weeks "
+                                f"where the adjustment actually fired on a genuinely Consistent read")
+                    st.caption(
+                        "This should be rare by design - real, high-conviction matchups aren't common. "
+                        "If this hit rate is meaningfully above the overall Raw baseline above, that's "
+                        "real proof the strict bar is earning its strictness. If it's close to Raw (or "
+                        "worse) even on this small, hand-picked subset, the Consistent threshold itself "
+                        "needs a second look, not just more volume."
+                    )
+                else:
+                    st.info("The adjustment never fired on a Consistent read across this whole scan - "
+                            "either genuinely rare for this prop/position, or worth checking with a "
+                            "larger player pool (raise 'Max players to scan' above).")
+
                 st.dataframe(pd.DataFrame(lwmc["rows"]).sort_values("Graded Games", ascending=False),
                              width='stretch')
                 if lwmc["errors"]:
                     with st.expander(f"{len(lwmc['errors'])} skipped (name-match or data issues)"):
                         st.write(lwmc["errors"])
+
+        st.divider()
+        st.markdown("### League-Wide RB Rush Mu Comparison Backtest — Raw vs Adjusted vs Cross-Reference")
+        st.caption(
+            "Same real test as the receiving version above, but for RUSH ATTEMPTS/RUSH YARDS "
+            "using the separate RB Run Concept data (rb_bundle) - no names to type, scans every "
+            "real RB automatically. Needs the RB Run Concept dataset loaded in the RB Run "
+            "Concept Matchup section first."
+        )
+        rblw_rb_bundle = st.session_state.get("rb_bundle")
+        if rblw_rb_bundle is None:
+            st.info("Load the RB Run Concept dataset above (in the RB Run Concept Matchup "
+                    "section) before running this.")
+        else:
+            rblw_col1, rblw_col2, rblw_col3 = st.columns(3)
+            with rblw_col1:
+                rblw_prop = st.selectbox("Prop to test", ["rush_attempts", "rush_yards"], key="rblw_prop")
+            with rblw_col2:
+                rblw_line = st.number_input("Real fixed line", min_value=0.0, value=12.5, step=0.5, key="rblw_line")
+            with rblw_col3:
+                rblw_season = st.number_input("Season", min_value=2020, max_value=2030, value=2025, step=1, key="rblw_season")
+            rblw_col4, rblw_col5 = st.columns(2)
+            with rblw_col4:
+                rblw_min_games = st.number_input("Min real games per player", min_value=1, max_value=18,
+                                                  value=8, step=1, key="rblw_min_games")
+            with rblw_col5:
+                rblw_max_players = st.number_input("Max players to scan", min_value=5, max_value=100,
+                                                    value=30, step=5, key="rblw_max_players")
+
+            if st.button("Run league-wide RB rush mu comparison", type="primary", key="rblw_run_btn"):
+                try:
+                    with st.spinner(f"Testing up to {int(rblw_max_players)} real RBs on "
+                                     f"{rblw_prop} vs {rblw_line} - real network calls per player..."):
+                        rblw_pstats = pull_player_stats([int(rblw_season)])
+                        rblw_name_col = "player_display_name" if "player_display_name" in rblw_pstats.columns else (
+                            "player_name" if "player_name" in rblw_pstats.columns else None)
+                        rblw_rows, rblw_errors = [], []
+                        rblw_agg = {"Raw": [0, 0], "Adjusted": [0, 0], "CrossRef": [0, 0]}
+                        rblw_mae_sum = {"Raw": 0.0, "Adjusted": 0.0, "CrossRef": 0.0}
+                        rblw_mae_n = {"Raw": 0, "Adjusted": 0, "CrossRef": 0}
+                        rblw_consistent_triggered = [0, 0]
+                        if rblw_name_col:
+                            pos_matches = rblw_pstats[rblw_pstats["position"].astype(str).str.upper() == "RB"]
+                            games_per_player = pos_matches.groupby(rblw_name_col)["week"].nunique()
+                            eligible = games_per_player[games_per_player >= int(rblw_min_games)].sort_values(ascending=False)
+                            names_to_scan = list(eligible.index[:int(rblw_max_players)])
+                            for nm in names_to_scan:
+                                try:
+                                    result = _run_rb_mu_source_comparison_backtest(
+                                        rblw_rb_bundle, nm, int(rblw_season), rblw_prop, float(rblw_line),
+                                    )
+                                except Exception as e:
+                                    rblw_errors.append(f"{nm}: {e}")
+                                    continue
+                                if result.get("error") or not result.get("rows"):
+                                    continue
+                                p_strict = {"Raw": 0, "Adjusted": 0, "CrossRef": 0}
+                                p_graded = {"Raw": 0, "Adjusted": 0, "CrossRef": 0}
+                                for wk_row in result["rows"]:
+                                    for label in ["Raw", "Adjusted", "CrossRef"]:
+                                        hit = wk_row.get(f"{label} Hit")
+                                        if hit is not None:
+                                            p_graded[label] += 1
+                                            if hit:
+                                                p_strict[label] += 1
+                                            rblw_agg[label][1] += 1
+                                            if hit:
+                                                rblw_agg[label][0] += 1
+                                        err = wk_row.get(f"{label} Error")
+                                        if err is not None:
+                                            rblw_mae_sum[label] += err
+                                            rblw_mae_n[label] += 1
+                                    raw_mu_val = wk_row.get("Raw mu")
+                                    adj_mu_val = wk_row.get("Adjusted mu")
+                                    adj_hit_val = wk_row.get("Adjusted Hit")
+                                    actually_fired = (isinstance(raw_mu_val, (int, float)) and isinstance(adj_mu_val, (int, float))
+                                                       and raw_mu_val != adj_mu_val)
+                                    if actually_fired and wk_row.get("Concept Agreement") == "Consistent" and adj_hit_val is not None:
+                                        rblw_consistent_triggered[1] += 1
+                                        if adj_hit_val:
+                                            rblw_consistent_triggered[0] += 1
+                                if p_graded["Raw"]:
+                                    rblw_rows.append({
+                                        "Player": nm, "Graded Games": p_graded["Raw"],
+                                        "Raw Hit Rate": f"{p_strict['Raw']}/{p_graded['Raw']} ({p_strict['Raw']/p_graded['Raw']*100:.0f}%)",
+                                    })
+                        rblw_mae = {label: (rblw_mae_sum[label] / rblw_mae_n[label] if rblw_mae_n[label] else None)
+                                    for label in ["Raw", "Adjusted", "CrossRef"]}
+                        st.session_state["_rblw_result"] = {
+                            "agg": rblw_agg, "mae": rblw_mae, "consistent_triggered": rblw_consistent_triggered,
+                            "rows": rblw_rows, "errors": rblw_errors, "players_scanned": len(rblw_rows),
+                        }
+                except Exception as e:
+                    st.session_state["_rblw_result"] = {"error": f"League-wide RB scan failed: {e}"}
+
+            rblw = st.session_state.get("_rblw_result")
+            if rblw:
+                if rblw.get("error"):
+                    st.warning(rblw["error"])
+                elif not rblw.get("rows"):
+                    st.info("No graded games came back across any scanned RB - try lowering "
+                            "the minimum games filter, or check the line is realistic.")
+                else:
+                    st.success(f"Tested {rblw['players_scanned']} real RBs with graded games.")
+                    st.markdown("**Line-based hit rate:**")
+                    for label in ["Raw", "Adjusted", "CrossRef"]:
+                        hits, graded = rblw["agg"][label]
+                        if graded:
+                            st.markdown(f"- {label}: {hits}/{graded} ({hits/graded*100:.0f}%)")
+
+                    mae_dict = rblw.get("mae", {})
+                    if any(v is not None for v in mae_dict.values()):
+                        st.markdown("**Line-free accuracy (real average error - no line involved):**")
+                        valid_mae = {k: v for k, v in mae_dict.items() if v is not None}
+                        for label, mae in valid_mae.items():
+                            st.markdown(f"- {label}: avg error {mae:.2f}")
+                        best_label = min(valid_mae, key=valid_mae.get)
+                        st.caption(f"Lowest league-wide average error: **{best_label}**.")
+
+                    ct_hits, ct_graded = rblw.get("consistent_triggered", [0, 0])
+                    st.markdown("**Consistent-triggered weeks only (the real test):**")
+                    if ct_graded:
+                        ct_pct = ct_hits / ct_graded * 100
+                        st.markdown(f"- {ct_hits}/{ct_graded} ({ct_pct:.0f}%) across {ct_graded} real "
+                                    f"weeks where the adjustment fired on a genuinely Consistent read")
+                        st.caption(
+                            "Compare this to the Raw baseline above - if it's meaningfully higher on "
+                            "this small, hand-picked subset, that's real proof the strict bar works."
+                        )
+                    else:
+                        st.info("The adjustment never fired on a Consistent read across this scan - "
+                                "try more players, or this may genuinely be rare for RB rushing.")
+
+                    st.dataframe(pd.DataFrame(rblw["rows"]).sort_values("Graded Games", ascending=False),
+                                 width='stretch')
+                    if rblw["errors"]:
+                        with st.expander(f"{len(rblw['errors'])} skipped"):
+                            st.write(rblw["errors"])
 
         st.divider()
         st.markdown("### League-Wide Scan — All Positions, Best Matchups Only")
