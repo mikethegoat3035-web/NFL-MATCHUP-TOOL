@@ -1439,7 +1439,20 @@ elif mode == "Coverage Matchup (premium data)":
             included top-N coverage (and across alignments if weights is
             given - same real-usage blending as the quality score). Returns
             {prop: score or None} plus the argmax and any close ties (within
-            10 points - shown as genuine toss-ups, not a false single pick)."""
+            10 points - shown as genuine toss-ups, not a false single pick).
+
+            Real bug fixed here: this used to score ONLY the player's own
+            history against each coverage, never checking whether THIS
+            SPECIFIC opponent's defense is actually good at stopping it -
+            confirmed directly from real data (Justin Jefferson's Quality
+            Score sat at 75-100 across 9+ genuinely different real
+            opponents in the Mu Comparison Backtest, never once dipping
+            below "Favorable" - a score that never varies by opponent
+            isn't measuring the matchup, it's just measuring the player).
+            Now blends 50/50 with the opponent's real defense-allowed
+            tier when both exist, same proven pattern _predict_best_rb_prop
+            already used - falls back to whichever side exists if only one
+            does, same as the RB version."""
             opp_profile = bundle.def_coverage.get(opponent_team_full)
             if opp_profile is None:
                 return None
@@ -1451,6 +1464,11 @@ elif mode == "Coverage Matchup (premium data)":
             if not included:
                 return None
 
+            if position.upper() == "QB":
+                def_source = bundle.def_allowed_to_qb
+            else:
+                def_source = None  # resolved per-alignment below when weights/alignment known
+
             scores = {}
             for prop, stat_col in PROP_STAT_MAP.items():
                 weighted_vals = []
@@ -1458,17 +1476,32 @@ elif mode == "Coverage Matchup (premium data)":
                     if weights:  # auto-weight across real alignments
                         for align, w in weights.items():
                             row = bundle.receiver_by_alignment.get(align, {}).get(field, {}).get(player_name)
-                            if row is not None:
-                                tier = row.get("_tiers", {}).get(stat_col)
-                                if tier in TIER_WEIGHTS:
-                                    weighted_vals.append((w, TIER_WEIGHTS[tier]))
+                            def_row = bundle.def_allowed_by_alignment.get(align, {}).get(field, {}).get(opponent_team_full)
+                            own_tier = row.get("_tiers", {}).get(stat_col) if row is not None else None
+                            def_tier = def_row.get("_tiers", {}).get(stat_col) if def_row is not None else None
+                            own_w = TIER_WEIGHTS.get(own_tier)
+                            def_w = TIER_WEIGHTS.get(def_tier)
+                            if own_w is None and def_w is None:
+                                continue
+                            blended = (0.5 * own_w + 0.5 * def_w) if (own_w is not None and def_w is not None) \
+                                else (own_w if own_w is not None else def_w)
+                            weighted_vals.append((w, blended))
                     else:
                         source = bundle.qb_vs_coverage if position.upper() == "QB" else bundle.receiver_by_alignment.get(alignment, {})
                         row = source.get(field, {}).get(player_name)
-                        if row is not None:
-                            tier = row.get("_tiers", {}).get(stat_col)
-                            if tier in TIER_WEIGHTS:
-                                weighted_vals.append((1.0, TIER_WEIGHTS[tier]))
+                        if position.upper() == "QB":
+                            def_row = def_source.get(field, {}).get(opponent_team_full)
+                        else:
+                            def_row = bundle.def_allowed_by_alignment.get(alignment, {}).get(field, {}).get(opponent_team_full)
+                        own_tier = row.get("_tiers", {}).get(stat_col) if row is not None else None
+                        def_tier = def_row.get("_tiers", {}).get(stat_col) if def_row is not None else None
+                        own_w = TIER_WEIGHTS.get(own_tier)
+                        def_w = TIER_WEIGHTS.get(def_tier)
+                        if own_w is None and def_w is None:
+                            continue
+                        blended = (0.5 * own_w + 0.5 * def_w) if (own_w is not None and def_w is not None) \
+                            else (own_w if own_w is not None else def_w)
+                        weighted_vals.append((1.0, blended))
                 total_w = sum(w for w, _ in weighted_vals)
                 scores[prop] = round(sum(w * s for w, s in weighted_vals) / total_w, 1) if total_w else None
 
