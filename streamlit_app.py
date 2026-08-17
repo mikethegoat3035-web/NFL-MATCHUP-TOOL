@@ -1484,23 +1484,45 @@ elif mode == "Coverage Matchup (premium data)":
 
             scores = {}
             consistency = {}
+            qualifying_coverages = {}
             for prop, stat_col in PROP_STAT_MAP.items():
-                per_coverage = {}  # field -> (blended_score, total_weight_within_that_coverage)
+                # Real fix, this turn: previously stored only the BLENDED
+                # (own+def averaged) value per coverage, and checked whether
+                # THAT crossed 60/40. That let a merely-average defense sneak
+                # into "Consistent" if the player's own number alone was
+                # extreme enough to carry the average - not a genuine two-
+                # sided mismatch. Now tracks own and defense-allowed
+                # SEPARATELY per coverage, and only counts a coverage as a
+                # real match when BOTH sides independently cross the real
+                # tier threshold (Above Avg/Elite for the player AND Below
+                # Avg/Poor for the defense, or the exact reverse) - "player
+                # great vs this coverage AND defense specifically weak vs
+                # this alignment in this coverage," not an average that
+                # happens to land favorably.
+                per_coverage = {}  # field -> {"blended", "own", "def", "weight"}
                 for field, z, rank in included:
-                    field_vals = []
+                    own_vals, def_vals = [], []
                     if weights:  # auto-weight across real alignments
                         for align, w in weights.items():
                             row = bundle.receiver_by_alignment.get(align, {}).get(field, {}).get(player_name)
                             def_row = bundle.def_allowed_by_alignment.get(align, {}).get(field, {}).get(opponent_team_full)
-                            own_tier = row.get("_tiers", {}).get(stat_col) if row is not None else None
-                            def_tier = def_row.get("_tiers", {}).get(stat_col) if def_row is not None else None
+                            # Thin-sample readings excluded here, not just
+                            # downweighted - an "Elite" or "Poor" label built
+                            # on a handful of real snaps isn't trustworthy
+                            # enough to help decide a genuinely elite-quality
+                            # matchup call, same standard as everywhere else
+                            # in this tool that won't call something elite off
+                            # thin data.
+                            own_tier = (row.get("_tiers", {}).get(stat_col)
+                                        if row is not None and not row.get("_thin_sample") else None)
+                            def_tier = (def_row.get("_tiers", {}).get(stat_col)
+                                        if def_row is not None and not def_row.get("_thin_sample") else None)
                             own_w = TIER_WEIGHTS.get(own_tier)
                             def_w = TIER_WEIGHTS.get(def_tier)
-                            if own_w is None and def_w is None:
-                                continue
-                            blended = (0.5 * own_w + 0.5 * def_w) if (own_w is not None and def_w is not None) \
-                                else (own_w if own_w is not None else def_w)
-                            field_vals.append((w, blended))
+                            if own_w is not None:
+                                own_vals.append((w, own_w))
+                            if def_w is not None:
+                                def_vals.append((w, def_w))
                     else:
                         source = bundle.qb_vs_coverage if position.upper() == "QB" else bundle.receiver_by_alignment.get(alignment, {})
                         row = source.get(field, {}).get(player_name)
@@ -1508,39 +1530,62 @@ elif mode == "Coverage Matchup (premium data)":
                             def_row = bundle.def_allowed_to_qb.get(field, {}).get(opponent_team_full)
                         else:
                             def_row = bundle.def_allowed_by_alignment.get(alignment, {}).get(field, {}).get(opponent_team_full)
-                        own_tier = row.get("_tiers", {}).get(stat_col) if row is not None else None
-                        def_tier = def_row.get("_tiers", {}).get(stat_col) if def_row is not None else None
+                        own_tier = (row.get("_tiers", {}).get(stat_col)
+                                    if row is not None and not row.get("_thin_sample") else None)
+                        def_tier = (def_row.get("_tiers", {}).get(stat_col)
+                                    if def_row is not None and not def_row.get("_thin_sample") else None)
                         own_w = TIER_WEIGHTS.get(own_tier)
                         def_w = TIER_WEIGHTS.get(def_tier)
-                        if own_w is None and def_w is None:
-                            continue
-                        blended = (0.5 * own_w + 0.5 * def_w) if (own_w is not None and def_w is not None) \
-                            else (own_w if own_w is not None else def_w)
-                        field_vals.append((1.0, blended))
-                    fw = sum(w for w, _ in field_vals)
-                    if fw:
-                        per_coverage[field] = (sum(w * s for w, s in field_vals) / fw, fw)
+                        if own_w is not None:
+                            own_vals.append((1.0, own_w))
+                        if def_w is not None:
+                            def_vals.append((1.0, def_w))
+
+                    own_total_w = sum(w for w, _ in own_vals)
+                    def_total_w = sum(w for w, _ in def_vals)
+                    agg_own = sum(w * v for w, v in own_vals) / own_total_w if own_total_w else None
+                    agg_def = sum(w * v for w, v in def_vals) / def_total_w if def_total_w else None
+                    if agg_own is None and agg_def is None:
+                        continue
+                    blended = (0.5 * agg_own + 0.5 * agg_def) if (agg_own is not None and agg_def is not None) \
+                        else (agg_own if agg_own is not None else agg_def)
+                    per_coverage[field] = {"blended": blended, "own": agg_own, "def": agg_def,
+                                            "weight": own_total_w or def_total_w}
 
                 if not per_coverage:
                     scores[prop] = None
                     consistency[prop] = None
+                    qualifying_coverages[prop] = []
                     continue
-                total_w = sum(fw for _, fw in per_coverage.values())
-                scores[prop] = round(sum(sc * fw for sc, fw in per_coverage.values()) / total_w, 1)
-                vals = [sc for sc, _ in per_coverage.values()]
-                if len(vals) < 2:
+                total_w = sum(d["weight"] for d in per_coverage.values())
+                scores[prop] = round(sum(d["blended"] * d["weight"] for d in per_coverage.values()) / total_w, 1) if total_w else None
+                qualifying_coverages[prop] = list(per_coverage.keys())
+
+                # Classify each coverage as a genuine two-sided match, not
+                # just a favorable-looking average.
+                directions = []
+                for d in per_coverage.values():
+                    if d["own"] is not None and d["def"] is not None and d["own"] >= 75 and d["def"] <= 25:
+                        directions.append("favorable")
+                    elif d["own"] is not None and d["def"] is not None and d["own"] <= 25 and d["def"] >= 75:
+                        directions.append("unfavorable")
+                    else:
+                        directions.append("mixed")
+                if len(per_coverage) < 2:
                     consistency[prop] = "Single Coverage"
-                elif all(v >= 60 for v in vals) or all(v <= 40 for v in vals):
+                elif all(dr == "favorable" for dr in directions) or all(dr == "unfavorable" for dr in directions):
                     consistency[prop] = "Consistent"
                 else:
                     consistency[prop] = "Split"
 
             valid = {p: s for p, s in scores.items() if s is not None}
             if not valid:
-                return {"scores": scores, "best": None, "ties": [], "consistency": consistency}
+                return {"scores": scores, "best": None, "ties": [], "consistency": consistency,
+                        "qualifying_coverages": qualifying_coverages}
             best = max(valid, key=valid.get)
             ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
-            return {"scores": scores, "best": best, "ties": ties, "consistency": consistency}
+            return {"scores": scores, "best": best, "ties": ties, "consistency": consistency,
+                    "qualifying_coverages": qualifying_coverages}
 
         def _score_badge_class(score):
             if score is None:
@@ -1705,11 +1750,13 @@ elif mode == "Coverage Matchup (premium data)":
                 adjusted_mu = raw_mu
                 q_score = None
                 q_consistency = None
+                q_coverages = []
                 if opp_full and prop in PROP_STAT_MAP:
                     pred = _predict_best_prop(bundle, p_name, p_pos, opp_full,
                                                 alignment=alignment, weights=weights, top_n=top_n)
                     q_score = pred["scores"].get(prop) if pred else None
                     q_consistency = pred.get("consistency", {}).get(prop) if pred else None
+                    q_coverages = pred.get("qualifying_coverages", {}).get(prop, []) if pred else []
                     # Real fix, same session: a Split score landing on the
                     # same number as a Consistent one isn't the same real
                     # signal - "great vs one coverage, bad vs another"
@@ -1747,6 +1794,7 @@ elif mode == "Coverage Matchup (premium data)":
                 row = {"Week": g["week"], "Opponent": g["opponent"], "Actual": actual_value,
                        "Quality Score": round(q_score, 1) if q_score is not None else "no data",
                        "Coverage Agreement": q_consistency or "no data",
+                       "Qualifying Coverages": ", ".join(q_coverages) if q_coverages else "-",
                        "CrossRef Sample": cr_sample_size}
                 for label, mu_val in [("Raw", raw_mu), ("Adjusted", adjusted_mu), ("CrossRef", crossref_mu)]:
                     if mu_val is None:
@@ -1991,15 +2039,19 @@ elif mode == "Coverage Matchup (premium data)":
             weighted by his real attempt share per concept - identical
             logic to the single-matchup version, just callable standalone.
 
-            Same real fix as _predict_best_prop, same turn: tracks each
-            qualifying CONCEPT's own blended score before merging, so
-            "bad vs Inside Zone AND bad vs Outside Zone" (real, consistent
-            signal) isn't mathematically indistinguishable from "great vs
-            Inside Zone, bad vs Outside Zone" (genuine split) landing on
-            the same averaged number. consistency[prop]: 'Consistent' when
-            every qualifying concept agrees (all >=60 or all <=40), 'Split'
-            when they disagree, 'Single Concept' when only one concept had
-            real attempt share."""
+            Same real fix as _predict_best_prop, same turn: tracks own and
+            defense-allowed SEPARATELY per concept (not just their blended
+            average), and only counts a concept as a genuine match when
+            BOTH sides independently cross the real tier threshold (Above
+            Avg/Elite for the RB AND Below Avg/Poor for the defense, or
+            the exact reverse) - "RB genuinely strong on this concept AND
+            defense specifically weak defending it," not an average that
+            happens to land favorably because the RB alone is just good.
+            consistency[prop]: 'Consistent' only when every qualifying
+            concept is a real two-sided match in the same direction,
+            'Split' when they disagree or aren't genuinely two-sided,
+            'Single Concept' when only one concept had real attempt
+            share."""
             rb_own_atts = {
                 c: (rb_bundle.rb_vs_concept.get(c, {}).get(rb_name, {}) or {}).get("_att", 0)
                 for c in RB_CONCEPT_FILES
@@ -2010,40 +2062,59 @@ elif mode == "Coverage Matchup (premium data)":
                 return None
             scores = {}
             consistency = {}
+            qualifying_concepts = {}
             for prop, stat_col in RB_PROP_STAT_MAP.items():
-                per_concept = {}  # concept -> (blended_score, weight)
+                per_concept = {}  # concept -> {"blended", "own", "def", "weight"}
                 for concept, w in weights.items():
                     own_row = rb_bundle.rb_vs_concept.get(concept, {}).get(rb_name)
-                    own_tier = own_row.get("_tiers", {}).get(stat_col) if own_row else None
+                    # Same thin-sample exclusion as the receiving side - an
+                    # "Elite"/"Poor" tier built on a handful of real carries
+                    # doesn't earn the right to help decide a genuinely
+                    # elite-quality matchup call.
+                    own_tier = (own_row.get("_tiers", {}).get(stat_col)
+                                if own_row and not own_row.get("_thin_sample") else None)
                     def_row = (rb_bundle.def_allowed.get(concept, {}).get(opponent_team_full)
                                if opponent_team_full else None)
-                    def_tier = def_row.get("_tiers", {}).get(stat_col) if def_row else None
+                    def_tier = (def_row.get("_tiers", {}).get(stat_col)
+                                if def_row and not def_row.get("_thin_sample") else None)
                     own_w = TIER_WEIGHTS.get(own_tier)
                     def_w = TIER_WEIGHTS.get(def_tier)
                     if own_w is None and def_w is None:
                         continue
                     blended = (0.5 * own_w + 0.5 * def_w) if (own_w is not None and def_w is not None) \
                         else (own_w if own_w is not None else def_w)
-                    per_concept[concept] = (blended, w)
+                    per_concept[concept] = {"blended": blended, "own": own_w, "def": def_w, "weight": w}
                 if not per_concept:
                     scores[prop] = None
                     consistency[prop] = None
+                    qualifying_concepts[prop] = []
                     continue
-                total_w = sum(w for _, w in per_concept.values())
-                scores[prop] = round(sum(sc * w for sc, w in per_concept.values()) / total_w, 1)
-                vals = [sc for sc, _ in per_concept.values()]
-                if len(vals) < 2:
+                total_w = sum(d["weight"] for d in per_concept.values())
+                scores[prop] = round(sum(d["blended"] * d["weight"] for d in per_concept.values()) / total_w, 1)
+                qualifying_concepts[prop] = list(per_concept.keys())
+
+                directions = []
+                for d in per_concept.values():
+                    if d["own"] is not None and d["def"] is not None and d["own"] >= 75 and d["def"] <= 25:
+                        directions.append("favorable")
+                    elif d["own"] is not None and d["def"] is not None and d["own"] <= 25 and d["def"] >= 75:
+                        directions.append("unfavorable")
+                    else:
+                        directions.append("mixed")
+                if len(per_concept) < 2:
                     consistency[prop] = "Single Concept"
-                elif all(v >= 60 for v in vals) or all(v <= 40 for v in vals):
+                elif all(dr == "favorable" for dr in directions) or all(dr == "unfavorable" for dr in directions):
                     consistency[prop] = "Consistent"
                 else:
                     consistency[prop] = "Split"
             valid = {p: s for p, s in scores.items() if s is not None}
             if not valid:
-                return {"scores": scores, "best": None, "ties": [], "consistency": consistency}
+                return {"scores": scores, "best": None, "ties": [], "consistency": consistency,
+                        "qualifying_concepts": qualifying_concepts}
             best = max(valid, key=valid.get)
             ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
-            return {"scores": scores, "best": best, "ties": ties, "consistency": consistency}
+            return {"scores": scores, "best": best, "ties": ties, "consistency": consistency,
+                    "qualifying_concepts": qualifying_concepts}
 
         def _actual_best_rb_prop(tiers):
             valid = {p: TIER_WEIGHTS[tiers[c]] for p, c in RB_GAME_LOG_PROP_MAP.items()
@@ -2404,6 +2475,7 @@ elif mode == "Coverage Matchup (premium data)":
                     # genuinely agreed (Coverage Agreement == "Consistent") - the real, isolated
                     # answer to "when this fires at all, is it actually good" instead of being
                     # buried inside the overall Adjusted average alongside every week it never fired.
+                    lwmc_matchup_rows = []
                     if lwmc_name_col:
                         pos_matches = lwmc_pstats[lwmc_pstats["position"].astype(str).str.upper() == lwmc_pos]
                         games_per_player = pos_matches.groupby(lwmc_name_col)["week"].nunique()
@@ -2457,6 +2529,19 @@ elif mode == "Coverage Matchup (premium data)":
                                     lwmc_consistent_triggered[1] += 1
                                     if adj_hit_val:
                                         lwmc_consistent_triggered[0] += 1
+                                    # The real, inspectable list - exactly what to look at to
+                                    # verify the mechanism is picking the right players: which
+                                    # real player, which real week/opponent, which SPECIFIC
+                                    # coverages qualified (proof it required 2+ - a real
+                                    # multi-heavy-coverage defense, not a single lucky reading),
+                                    # and whether the real result actually backed the call.
+                                    lwmc_matchup_rows.append({
+                                        "Player": nm, "Week": wk_row.get("Week"), "Opponent": wk_row.get("Opponent"),
+                                        "Qualifying Coverages": wk_row.get("Qualifying Coverages", "-"),
+                                        "Quality Score": wk_row.get("Quality Score"),
+                                        "Raw mu": raw_mu_val, "Adjusted mu": adj_mu_val,
+                                        "Actual": wk_row.get("Actual"), "Result": "✅ Hit" if adj_hit_val else "❌ Miss",
+                                    })
                             if p_graded["Raw"]:
                                 lwmc_rows.append({
                                     "Player": nm, "Graded Games": p_graded["Raw"],
@@ -2467,6 +2552,7 @@ elif mode == "Coverage Matchup (premium data)":
                     st.session_state["_lwmc_result"] = {
                         "agg": lwmc_agg, "mae": lwmc_mae, "agree": lwmc_agree, "conflict": lwmc_conflict,
                         "consistent_triggered": lwmc_consistent_triggered,
+                        "matchup_rows": lwmc_matchup_rows,
                         "rows": lwmc_rows, "errors": lwmc_errors, "players_scanned": len(lwmc_rows),
                     }
             except Exception as e:
@@ -2529,6 +2615,20 @@ elif mode == "Coverage Matchup (premium data)":
                     st.info("The adjustment never fired on a Consistent read across this whole scan - "
                             "either genuinely rare for this prop/position, or worth checking with a "
                             "larger player pool (raise 'Max players to scan' above).")
+
+                matchup_rows = lwmc.get("matchup_rows", [])
+                if matchup_rows:
+                    st.markdown(f"**Every real Consistent-triggered matchup found ({len(matchup_rows)}) — "
+                                f"the actual list, not just a percentage:**")
+                    st.caption(
+                        "This is what to actually inspect: real player, real week/opponent, and the "
+                        "SPECIFIC coverages that qualified (2+ listed here is direct proof it required "
+                        "a genuine multi-heavy-coverage defense, not one lucky reading). Check a few of "
+                        "these by hand against what you know about the matchup - does the flagged "
+                        "coverage list actually match a defense that leans on multiple things, and does "
+                        "the player's real strength plausibly line up against it?"
+                    )
+                    st.dataframe(pd.DataFrame(matchup_rows).sort_values(["Player", "Week"]), width='stretch')
 
                 st.dataframe(pd.DataFrame(lwmc["rows"]).sort_values("Graded Games", ascending=False),
                              width='stretch')
@@ -4010,49 +4110,12 @@ elif mode == "Coverage Matchup (premium data)":
                             RB_PROP_LABELS = {"rush_attempts": "Rush Attempts", "rush_yards": "Rush Yards"}
                             RB_PROP_STAT_MAP = {"rush_attempts": "ATT", "rush_yards": "YDS"}
 
-                            def _predict_best_rb_prop(rb_bundle, rb_name, opponent_team_full):
-                                """Blends BOTH the RB's own tier AND the opponent's
-                                defense-allowed tier per concept (50/50 when both
-                                exist) - NOT just the RB's own tendency. An
-                                earlier version of this only used his own side,
-                                which meant the verdict never actually changed
-                                based on who he was facing - the exact flaw
-                                already caught in the WR backtest (Jefferson
-                                predicting "Targets" every single week). Weighted
-                                by his real attempt share per concept either way."""
-                                rb_own_atts = {
-                                    c: (rb_bundle.rb_vs_concept.get(c, {}).get(rb_name, {}) or {}).get("_att", 0)
-                                    for c in RB_CONCEPT_FILES
-                                }
-                                total_att = sum(rb_own_atts.values())
-                                weights = {c: (a / total_att) for c, a in rb_own_atts.items() if total_att and a > 0}
-                                if not weights:
-                                    return None
-                                scores = {}
-                                for prop, stat_col in RB_PROP_STAT_MAP.items():
-                                    weighted_vals = []
-                                    for concept, w in weights.items():
-                                        own_row = rb_bundle.rb_vs_concept.get(concept, {}).get(rb_name)
-                                        own_tier = own_row.get("_tiers", {}).get(stat_col) if own_row else None
-                                        def_row = (rb_bundle.def_allowed.get(concept, {}).get(opponent_team_full)
-                                                   if opponent_team_full else None)
-                                        def_tier = def_row.get("_tiers", {}).get(stat_col) if def_row else None
-                                        own_w = TIER_WEIGHTS.get(own_tier)
-                                        def_w = TIER_WEIGHTS.get(def_tier)
-                                        if own_w is None and def_w is None:
-                                            continue
-                                        blended = (0.5 * own_w + 0.5 * def_w) if (own_w is not None and def_w is not None) \
-                                            else (own_w if own_w is not None else def_w)
-                                        weighted_vals.append((w, blended))
-                                    total_w = sum(w for w, _ in weighted_vals)
-                                    scores[prop] = round(sum(w * s for w, s in weighted_vals) / total_w, 1) if total_w else None
-                                valid = {p: s for p, s in scores.items() if s is not None}
-                                if not valid:
-                                    return {"scores": scores, "best": None, "ties": []}
-                                best = max(valid, key=valid.get)
-                                ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
-                                return {"scores": scores, "best": best, "ties": ties}
-
+                            # _predict_best_rb_prop is defined once, at the shared
+                            # outer scope (see above) - a duplicate used to live
+                            # here, predating the two-sided consistency fix, and
+                            # would have silently shadowed the correct version
+                            # for every single-matchup RB report. Removed; this
+                            # call now always uses the real, fixed function.
                             rb_verdict = _predict_best_rb_prop(rb_bundle, p_name, opp)
                             if rb_verdict is None or rb_verdict["best"] is None:
                                 st.info("Not enough real attempt volume across these concepts to determine a best prop.")
