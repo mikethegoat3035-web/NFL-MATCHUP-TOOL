@@ -1452,7 +1452,25 @@ elif mode == "Coverage Matchup (premium data)":
             Now blends 50/50 with the opponent's real defense-allowed
             tier when both exist, same proven pattern _predict_best_rb_prop
             already used - falls back to whichever side exists if only one
-            does, same as the RB version."""
+            does, same as the RB version.
+
+            Second real fix, same turn: the blended score used to average
+            straight across every qualifying coverage in one pass, which
+            makes "bad vs Cover 2, bad vs Cover 3" (real, consistent signal)
+            mathematically indistinguishable from "great vs Cover 2, bad vs
+            Cover 3" (a genuine split, correctly moderate) - both could land
+            on the same final number by coincidence, even though only one
+            of them is a real high-conviction signal. Now computes each
+            qualifying coverage's OWN blended score first (still weighted
+            across real alignment usage within that coverage), THEN averages
+            those per-coverage scores together for the final number AND
+            checks whether they actually agree - "consistency" in the
+            returned dict: 'Consistent' when every qualifying coverage
+            points the same direction (all >=60 or all <=40), 'Split' when
+            they disagree, 'Single Coverage' when only one coverage
+            qualified at all. Consistent should be trusted more than a
+            Split score landing on the same number - real signal vs
+            coincidental averaging."""
             opp_profile = bundle.def_coverage.get(opponent_team_full)
             if opp_profile is None:
                 return None
@@ -1464,15 +1482,12 @@ elif mode == "Coverage Matchup (premium data)":
             if not included:
                 return None
 
-            if position.upper() == "QB":
-                def_source = bundle.def_allowed_to_qb
-            else:
-                def_source = None  # resolved per-alignment below when weights/alignment known
-
             scores = {}
+            consistency = {}
             for prop, stat_col in PROP_STAT_MAP.items():
-                weighted_vals = []
+                per_coverage = {}  # field -> (blended_score, total_weight_within_that_coverage)
                 for field, z, rank in included:
+                    field_vals = []
                     if weights:  # auto-weight across real alignments
                         for align, w in weights.items():
                             row = bundle.receiver_by_alignment.get(align, {}).get(field, {}).get(player_name)
@@ -1485,12 +1500,12 @@ elif mode == "Coverage Matchup (premium data)":
                                 continue
                             blended = (0.5 * own_w + 0.5 * def_w) if (own_w is not None and def_w is not None) \
                                 else (own_w if own_w is not None else def_w)
-                            weighted_vals.append((w, blended))
+                            field_vals.append((w, blended))
                     else:
                         source = bundle.qb_vs_coverage if position.upper() == "QB" else bundle.receiver_by_alignment.get(alignment, {})
                         row = source.get(field, {}).get(player_name)
                         if position.upper() == "QB":
-                            def_row = def_source.get(field, {}).get(opponent_team_full)
+                            def_row = bundle.def_allowed_to_qb.get(field, {}).get(opponent_team_full)
                         else:
                             def_row = bundle.def_allowed_by_alignment.get(alignment, {}).get(field, {}).get(opponent_team_full)
                         own_tier = row.get("_tiers", {}).get(stat_col) if row is not None else None
@@ -1501,16 +1516,31 @@ elif mode == "Coverage Matchup (premium data)":
                             continue
                         blended = (0.5 * own_w + 0.5 * def_w) if (own_w is not None and def_w is not None) \
                             else (own_w if own_w is not None else def_w)
-                        weighted_vals.append((1.0, blended))
-                total_w = sum(w for w, _ in weighted_vals)
-                scores[prop] = round(sum(w * s for w, s in weighted_vals) / total_w, 1) if total_w else None
+                        field_vals.append((1.0, blended))
+                    fw = sum(w for w, _ in field_vals)
+                    if fw:
+                        per_coverage[field] = (sum(w * s for w, s in field_vals) / fw, fw)
+
+                if not per_coverage:
+                    scores[prop] = None
+                    consistency[prop] = None
+                    continue
+                total_w = sum(fw for _, fw in per_coverage.values())
+                scores[prop] = round(sum(sc * fw for sc, fw in per_coverage.values()) / total_w, 1)
+                vals = [sc for sc, _ in per_coverage.values()]
+                if len(vals) < 2:
+                    consistency[prop] = "Single Coverage"
+                elif all(v >= 60 for v in vals) or all(v <= 40 for v in vals):
+                    consistency[prop] = "Consistent"
+                else:
+                    consistency[prop] = "Split"
 
             valid = {p: s for p, s in scores.items() if s is not None}
             if not valid:
-                return {"scores": scores, "best": None, "ties": []}
+                return {"scores": scores, "best": None, "ties": [], "consistency": consistency}
             best = max(valid, key=valid.get)
             ties = [p for p, s in valid.items() if p != best and (valid[best] - s) <= 10]
-            return {"scores": scores, "best": best, "ties": ties}
+            return {"scores": scores, "best": best, "ties": ties, "consistency": consistency}
 
         def _score_badge_class(score):
             if score is None:
@@ -1674,11 +1704,24 @@ elif mode == "Coverage Matchup (premium data)":
                 opp_full = TEAM_ABBREV_TO_FULL.get(g["opponent"])
                 adjusted_mu = raw_mu
                 q_score = None
+                q_consistency = None
                 if opp_full and prop in PROP_STAT_MAP:
                     pred = _predict_best_prop(bundle, p_name, p_pos, opp_full,
                                                 alignment=alignment, weights=weights, top_n=top_n)
                     q_score = pred["scores"].get(prop) if pred else None
-                    adjusted_mu, _, _ = _apply_best_signal_adjustment(raw_mu, q_score, is_thin=False)
+                    q_consistency = pred.get("consistency", {}).get(prop) if pred else None
+                    # Real fix, same session: a Split score landing on the
+                    # same number as a Consistent one isn't the same real
+                    # signal - "great vs one coverage, bad vs another"
+                    # averaging to 65 shouldn't earn the same conviction as
+                    # "bad vs every qualifying coverage" also averaging to
+                    # 65. Only Consistent (or a genuine single qualifying
+                    # coverage) is treated as trustworthy enough to adjust -
+                    # a Split reading is treated the same as thin/unreliable,
+                    # NOT adjusted, matching the "minimal, high-conviction
+                    # plays only" goal instead of averaging away real signal.
+                    is_unreliable = (q_consistency == "Split")
+                    adjusted_mu, _, _ = _apply_best_signal_adjustment(raw_mu, q_score, is_thin=is_unreliable)
 
                 crossref_mu = None
                 cr_sample_size = 0
@@ -1703,6 +1746,7 @@ elif mode == "Coverage Matchup (premium data)":
 
                 row = {"Week": g["week"], "Opponent": g["opponent"], "Actual": actual_value,
                        "Quality Score": round(q_score, 1) if q_score is not None else "no data",
+                       "Coverage Agreement": q_consistency or "no data",
                        "CrossRef Sample": cr_sample_size}
                 for label, mu_val in [("Raw", raw_mu), ("Adjusted", adjusted_mu), ("CrossRef", crossref_mu)]:
                     if mu_val is None:
@@ -2890,14 +2934,18 @@ elif mode == "Coverage Matchup (premium data)":
                 else:
                     best = verdict["best"]
                     ties = verdict["ties"]
+                    consist = verdict.get("consistency", {})
                     rows_html = "".join(
-                        f'<div class="stat-row"><span class="stat-label">{PROP_LABELS[p]}</span>'
+                        f'<div class="stat-row"><span class="stat-label">{PROP_LABELS[p]}'
+                        f'{" (" + consist.get(p) + ")" if consist.get(p) else ""}</span>'
                         f'<span class="stat-value">{verdict["scores"][p] if verdict["scores"][p] is not None else "no data"}'
                         f'<span class="tier-badge {_score_badge_class(verdict["scores"][p])}">'
                         f'{"BEST" if p == best else ("TIE" if p in ties else "")}</span></span></div>'
                         for p in PROP_LABELS
                     )
                     tie_note = f" (essentially tied with {', '.join(PROP_LABELS[t] for t in ties)})" if ties else ""
+                    if consist.get(best) == "Split":
+                        tie_note += " — heads up: this pick is a Split verdict (qualifying coverages disagree), not a Consistent one"
                     verdict_html = (
                         '<div class="cov-card">'
                         f'<div class="cov-card-header">Best Prop: {PROP_LABELS[best]}{tie_note}</div>'
@@ -2911,7 +2959,10 @@ elif mode == "Coverage Matchup (premium data)":
                     "Longest catch isn't included in this verdict - no season-aggregate CSV "
                     "column to predict it from, only real per-game data (see the line "
                     "comparison below, where it IS available). Targets/receptions/rec yards/"
-                    "receiving TD are all real on both the predicted and actual side."
+                    "receiving TD are all real on both the predicted and actual side. "
+                    "'Consistent' means every qualifying coverage points the same direction - "
+                    "trust that more than a 'Split' score that only landed on this number by "
+                    "averaging a good coverage against a bad one."
                 )
 
                 st.markdown("### Line Value + Backtest Reliability")
@@ -3113,13 +3164,20 @@ elif mode == "Coverage Matchup (premium data)":
                                     elif e.get(own_key) and not e[own_key].get("_thin_sample"):
                                         has_solid_entry = True
                                         break
-                                is_thin_signal = not has_solid_entry
+                                # Same real fix as the Mu Comparison Backtest: a Split
+                                # verdict (qualifying coverages disagree) shouldn't earn
+                                # the same conviction as a Consistent one, even landing
+                                # on the same score - treated the same as an unreliable/
+                                # thin signal, not adjusted.
+                                is_split = verdict.get("consistency", {}).get(prop) == "Split" if verdict else False
+                                is_thin_signal = (not has_solid_entry) or is_split
                                 adj_mu, adj_pct, applied = _apply_best_signal_adjustment(mu, q_score, is_thin_signal)
                                 scored = rescore_quality_mu_row_nfl(adj_mu, line_val, sigma)
                                 rows.append({
                                     "Prop": LINE_COMPARE_PROP_LABELS[prop], "Line": line_val,
                                     "mu": round(mu, 1),
                                     "Premium Adj": f"{adj_pct:+.1f}%" if applied else "none (not extreme enough)",
+                                    "Coverage Agreement": verdict.get("consistency", {}).get(prop, "no data") if verdict else "no data",
                                     "sigma": round(sigma, 1), "Games": n_games,
                                     "p(Over)": scored["p_over"], "Edge": scored["edge"],
                                     "Backtest Reliability": reliability,
