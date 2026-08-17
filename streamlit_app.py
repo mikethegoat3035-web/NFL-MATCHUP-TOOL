@@ -1821,16 +1821,27 @@ elif mode == "Coverage Matchup (premium data)":
                 # this a favorable or unfavorable coverage/scheme fit for
                 # him specifically) - two genuinely different signals that
                 # were being blended into one "Adjusted mu" number without
-                # ever showing whether they actually agree. Quality Lean:
-                # >50 means the matchup grade itself leans favorable (more
-                # OVER-supportive conditions), <50 leans unfavorable.
-                # Mu Lean uses RAW mu specifically (the pure statistical
-                # trend, unadjusted) so the comparison isn't circular -
-                # comparing Quality against a mu that Quality already
-                # nudged would trivially "agree" by construction.
+                # ever showing whether they actually agree.
+                #
+                # Real bug fixed here, same turn: Quality Lean used to be
+                # based on the raw blended average crossing 50, completely
+                # independent of the tightened two-sided Consistent/Split
+                # classification the adjustment itself now requires - which
+                # meant this column could say "Favorable" every single week
+                # even in a real run where Adjusted never once differed
+                # from Raw, directly contradicting what was actually
+                # happening. Quality Lean now uses the SAME standard the
+                # adjustment uses: only "Favorable"/"Unfavorable" when the
+                # read is genuinely Consistent (both sides independently
+                # confirmed); anything else is honestly labeled "Not
+                # Consistent" instead of implying a real lean that isn't
+                # actually driving anything.
                 mu_lean = "OVER" if raw_mu > line else "UNDER"
                 if q_score is None:
                     quality_lean = "no data"
+                    agreement = "N/A"
+                elif q_consistency != "Consistent":
+                    quality_lean = "Not Consistent"
                     agreement = "N/A"
                 else:
                     quality_lean = "Favorable" if q_score > 50 else "Unfavorable"
