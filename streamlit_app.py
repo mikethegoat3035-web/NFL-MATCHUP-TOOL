@@ -1815,6 +1815,37 @@ elif mode == "Coverage Matchup (premium data)":
                     # predictor, independent of any betting line.
                     row[f"{label} Error"] = round(abs(actual_value - mu_val), 2)
 
+                # No-line-at-all directional test: instead of "did mu beat
+                # some external number" (which needs a line that fits every
+                # different player, the exact recurring problem all
+                # session), test "did his ACTUAL production deviate from
+                # HIS OWN raw baseline, in the direction the two-sided
+                # signal predicted." Every player judged against himself,
+                # never an arbitrary population-wide number. Only
+                # meaningful on genuinely Consistent weeks - that's when
+                # the signal is actually making a real directional claim
+                # (favorable = expect him to beat his own normal level,
+                # unfavorable = expect him to fall short of it).
+                if q_consistency == "Consistent" and q_score is not None:
+                    predicted_direction = "OVER" if q_score > 50 else "UNDER"
+                    actual_direction = "OVER" if actual_value > raw_mu else "UNDER"
+                    row["Own-Baseline Direction"] = predicted_direction
+                    row["Own-Baseline Hit"] = (predicted_direction == actual_direction)
+                    row["Deviation from Own Baseline"] = round(actual_value - raw_mu, 2)
+                    # Second confirming source, using OTHER real games vs
+                    # OTHER defenses that graded similarly - the real
+                    # backtested cross-reference, not a guess.
+                    if crossref_mu is not None:
+                        cr_direction = "OVER" if crossref_mu > raw_mu else "UNDER"
+                        row["CrossRef Confirms"] = (cr_direction == predicted_direction)
+                    else:
+                        row["CrossRef Confirms"] = None
+                else:
+                    row["Own-Baseline Direction"] = None
+                    row["Own-Baseline Hit"] = None
+                    row["Deviation from Own Baseline"] = None
+                    row["CrossRef Confirms"] = None
+
                 # The real distinction the user is drawing: mu-vs-line is a
                 # STATISTICAL trend (does his trailing average sit above or
                 # below this number), Quality Score is a MATCHUP GRADE (is
@@ -2531,27 +2562,38 @@ elif mode == "Coverage Matchup (premium data)":
                                     lwmc_conflict[1] += 1
                                     if wk_row["Raw Hit"]:
                                         lwmc_conflict[0] += 1
+                                # No-line-at-all test now: was this real week's
+                                # actual production above/below HIS OWN raw
+                                # baseline, in the direction the two-sided
+                                # signal predicted - not "did it beat an
+                                # external number." Every player judged
+                                # against himself, removing the whole
+                                # line-choice problem entirely for this
+                                # specific metric.
+                                ob_hit_val = wk_row.get("Own-Baseline Hit")
+                                cr_confirms = wk_row.get("CrossRef Confirms")
                                 raw_mu_val = wk_row.get("Raw mu")
-                                adj_mu_val = wk_row.get("Adjusted mu")
-                                adj_hit_val = wk_row.get("Adjusted Hit")
-                                actually_fired = (isinstance(raw_mu_val, (int, float)) and isinstance(adj_mu_val, (int, float))
-                                                   and raw_mu_val != adj_mu_val)
-                                if actually_fired and wk_row.get("Coverage Agreement") == "Consistent" and adj_hit_val is not None:
+                                if wk_row.get("Coverage Agreement") == "Consistent" and ob_hit_val is not None:
                                     lwmc_consistent_triggered[1] += 1
-                                    if adj_hit_val:
+                                    if ob_hit_val:
                                         lwmc_consistent_triggered[0] += 1
                                     # The real, inspectable list - exactly what to look at to
                                     # verify the mechanism is picking the right players: which
                                     # real player, which real week/opponent, which SPECIFIC
                                     # coverages qualified (proof it required 2+ - a real
                                     # multi-heavy-coverage defense, not a single lucky reading),
-                                    # and whether the real result actually backed the call.
+                                    # and whether his real result actually deviated from his own
+                                    # normal level the direction predicted - no line involved.
                                     lwmc_matchup_rows.append({
                                         "Player": nm, "Week": wk_row.get("Week"), "Opponent": wk_row.get("Opponent"),
                                         "Qualifying Coverages": wk_row.get("Qualifying Coverages", "-"),
                                         "Quality Score": wk_row.get("Quality Score"),
-                                        "Raw mu": raw_mu_val, "Adjusted mu": adj_mu_val,
-                                        "Actual": wk_row.get("Actual"), "Result": "✅ Hit" if adj_hit_val else "❌ Miss",
+                                        "Own-Baseline Direction": wk_row.get("Own-Baseline Direction"),
+                                        "Raw mu": raw_mu_val, "Actual": wk_row.get("Actual"),
+                                        "Deviation": wk_row.get("Deviation from Own Baseline"),
+                                        "CrossRef Confirms": ("Yes" if cr_confirms is True else
+                                                               "No" if cr_confirms is False else "no data"),
+                                        "Result": "✅ Hit" if ob_hit_val else "❌ Miss",
                                     })
                             if p_graded["Raw"]:
                                 lwmc_rows.append({
@@ -2610,36 +2652,59 @@ elif mode == "Coverage Matchup (premium data)":
                     )
 
                 ct_hits, ct_graded = lwmc.get("consistent_triggered", [0, 0])
-                st.markdown("**Consistent-triggered weeks only (the real test - not blended with weeks it never fired):**")
+                st.markdown("**Consistent-triggered weeks only — no external line involved at all:**")
                 if ct_graded:
                     ct_pct = ct_hits / ct_graded * 100
-                    st.markdown(f"- {ct_hits}/{ct_graded} ({ct_pct:.0f}%) across {ct_graded} real weeks "
-                                f"where the adjustment actually fired on a genuinely Consistent read")
+                    st.markdown(f"- {ct_hits}/{ct_graded} ({ct_pct:.0f}%) real weeks where his actual "
+                                f"production deviated from HIS OWN raw baseline in the direction the "
+                                f"two-sided signal predicted")
                     st.caption(
-                        "This should be rare by design - real, high-conviction matchups aren't common. "
-                        "If this hit rate is meaningfully above the overall Raw baseline above, that's "
-                        "real proof the strict bar is earning its strictness. If it's close to Raw (or "
-                        "worse) even on this small, hand-picked subset, the Consistent threshold itself "
-                        "needs a second look, not just more volume."
+                        "This is judged against each player's own normal level, not an external number "
+                        "picked for the whole population - removes the line-choice problem entirely for "
+                        "this specific test. Should be rare by design - real, high-conviction matchups "
+                        "aren't common. 50% here is a coinflip (pure chance of landing above/below his "
+                        "own baseline); meaningfully above 50% is real signal."
                     )
                 else:
-                    st.info("The adjustment never fired on a Consistent read across this whole scan - "
-                            "either genuinely rare for this prop/position, or worth checking with a "
-                            "larger player pool (raise 'Max players to scan' above).")
+                    st.info("The signal never fired Consistent across this whole scan - either "
+                            "genuinely rare for this prop/position, or worth checking with a larger "
+                            "player pool (raise 'Max players to scan' above).")
 
                 matchup_rows = lwmc.get("matchup_rows", [])
                 if matchup_rows:
                     st.markdown(f"**Every real Consistent-triggered matchup found ({len(matchup_rows)}) — "
-                                f"the actual list, not just a percentage:**")
+                                f"the actual list, color-coded, not just a percentage:**")
                     st.caption(
-                        "This is what to actually inspect: real player, real week/opponent, and the "
-                        "SPECIFIC coverages that qualified (2+ listed here is direct proof it required "
-                        "a genuine multi-heavy-coverage defense, not one lucky reading). Check a few of "
-                        "these by hand against what you know about the matchup - does the flagged "
-                        "coverage list actually match a defense that leans on multiple things, and does "
-                        "the player's real strength plausibly line up against it?"
+                        "Green Actual = beat his own Raw mu (real overperformance); red = fell short of "
+                        "it. 'CrossRef Confirms' uses OTHER real games against OTHER defenses that "
+                        "graded similarly to this one - Yes means that independent evidence agreed with "
+                        "the call too, not just this one matchup. Check 'Qualifying Coverages' for 2+ "
+                        "real names - proof it required a genuine multi-heavy-coverage defense."
                     )
-                    st.dataframe(pd.DataFrame(matchup_rows).sort_values(["Player", "Week"]), width='stretch')
+                    matchup_df = pd.DataFrame(matchup_rows).sort_values(["Player", "Week"])
+
+                    def _color_deviation(val):
+                        if not isinstance(val, (int, float)):
+                            return ""
+                        intensity = min(abs(val) / 3.0, 1.0)
+                        color = "0, 200, 0" if val > 0 else "200, 0, 0"
+                        return f"background-color: rgba({color}, {intensity * 0.5})"
+
+                    def _color_result(val):
+                        return "background-color: rgba(0, 200, 0, 0.3)" if "Hit" in str(val) \
+                            else "background-color: rgba(200, 0, 0, 0.3)"
+
+                    # .style.map() needs pandas 2.1+ ; .applymap() is the same
+                    # thing on older pandas. Try the current name first, fall
+                    # back rather than risk a hard crash on an older deployed
+                    # pandas version this session has no visibility into.
+                    try:
+                        styled_matchup = matchup_df.style.map(_color_deviation, subset=["Deviation"]) \
+                            .map(_color_result, subset=["Result"])
+                    except AttributeError:
+                        styled_matchup = matchup_df.style.applymap(_color_deviation, subset=["Deviation"]) \
+                            .applymap(_color_result, subset=["Result"])
+                    st.dataframe(styled_matchup, width='stretch')
 
                 st.dataframe(pd.DataFrame(lwmc["rows"]).sort_values("Graded Games", ascending=False),
                              width='stretch')
