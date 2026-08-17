@@ -2276,10 +2276,12 @@ elif mode == "Coverage Matchup (premium data)":
                 adjusted_mu = raw_mu
                 q_score = None
                 q_consistency = None
+                q_concepts = []
                 if opp_full and prop in RB_PROP_STAT_MAP:
                     pred = _predict_best_rb_prop(rb_bundle, rb_name, opp_full)
                     q_score = pred["scores"].get(prop) if pred else None
                     q_consistency = pred.get("consistency", {}).get(prop) if pred else None
+                    q_concepts = pred.get("qualifying_concepts", {}).get(prop, []) if pred else []
                     is_unreliable = (q_consistency == "Split")
                     adjusted_mu, _, _ = _apply_best_signal_adjustment(raw_mu, q_score, is_thin=is_unreliable)
 
@@ -2317,6 +2319,7 @@ elif mode == "Coverage Matchup (premium data)":
                 row = {"Week": g["week"], "Opponent": g["opponent"], "Actual": actual_value,
                        "Quality Score": round(q_score, 1) if q_score is not None else "no data",
                        "Concept Agreement": q_consistency or "no data",
+                       "Qualifying Concepts": ", ".join(q_concepts) if q_concepts else "-",
                        "CrossRef Sample": cr_sample_size}
                 for label, mu_val in [("Raw", raw_mu), ("Adjusted", adjusted_mu), ("CrossRef", crossref_mu)]:
                     if mu_val is None:
@@ -2329,6 +2332,27 @@ elif mode == "Coverage Matchup (premium data)":
                     row[f"{label} mu"] = round(mu_val, 2)
                     row[f"{label} Hit"] = predicted_over == actual_over
                     row[f"{label} Error"] = round(abs(actual_value - mu_val), 2)
+
+                # Same no-line, own-baseline directional test as the
+                # receiving version - judged against his OWN raw carries/
+                # yards average, not an external line, plus the real
+                # cross-referenced-game confirmation.
+                if q_consistency == "Consistent" and q_score is not None:
+                    predicted_direction = "OVER" if q_score > 50 else "UNDER"
+                    actual_direction = "OVER" if actual_value > raw_mu else "UNDER"
+                    row["Own-Baseline Direction"] = predicted_direction
+                    row["Own-Baseline Hit"] = (predicted_direction == actual_direction)
+                    row["Deviation from Own Baseline"] = round(actual_value - raw_mu, 2)
+                    if crossref_mu is not None:
+                        cr_direction = "OVER" if crossref_mu > raw_mu else "UNDER"
+                        row["CrossRef Confirms"] = (cr_direction == predicted_direction)
+                    else:
+                        row["CrossRef Confirms"] = None
+                else:
+                    row["Own-Baseline Direction"] = None
+                    row["Own-Baseline Hit"] = None
+                    row["Deviation from Own Baseline"] = None
+                    row["CrossRef Confirms"] = None
                 rows.append(row)
 
             return {"rows": rows}
@@ -2752,6 +2776,7 @@ elif mode == "Coverage Matchup (premium data)":
                         rblw_mae_sum = {"Raw": 0.0, "Adjusted": 0.0, "CrossRef": 0.0}
                         rblw_mae_n = {"Raw": 0, "Adjusted": 0, "CrossRef": 0}
                         rblw_consistent_triggered = [0, 0]
+                        rblw_matchup_rows = []
                         if rblw_name_col:
                             pos_matches = rblw_pstats[rblw_pstats["position"].astype(str).str.upper() == "RB"]
                             games_per_player = pos_matches.groupby(rblw_name_col)["week"].nunique()
@@ -2784,14 +2809,26 @@ elif mode == "Coverage Matchup (premium data)":
                                             rblw_mae_sum[label] += err
                                             rblw_mae_n[label] += 1
                                     raw_mu_val = wk_row.get("Raw mu")
-                                    adj_mu_val = wk_row.get("Adjusted mu")
-                                    adj_hit_val = wk_row.get("Adjusted Hit")
-                                    actually_fired = (isinstance(raw_mu_val, (int, float)) and isinstance(adj_mu_val, (int, float))
-                                                       and raw_mu_val != adj_mu_val)
-                                    if actually_fired and wk_row.get("Concept Agreement") == "Consistent" and adj_hit_val is not None:
+                                    # Same no-line, own-baseline test as receiving -
+                                    # judged against his own real carries/yards
+                                    # average, not an external line.
+                                    ob_hit_val = wk_row.get("Own-Baseline Hit")
+                                    cr_confirms = wk_row.get("CrossRef Confirms")
+                                    if wk_row.get("Concept Agreement") == "Consistent" and ob_hit_val is not None:
                                         rblw_consistent_triggered[1] += 1
-                                        if adj_hit_val:
+                                        if ob_hit_val:
                                             rblw_consistent_triggered[0] += 1
+                                        rblw_matchup_rows.append({
+                                            "Player": nm, "Week": wk_row.get("Week"), "Opponent": wk_row.get("Opponent"),
+                                            "Qualifying Concepts": wk_row.get("Qualifying Concepts", "-"),
+                                            "Quality Score": wk_row.get("Quality Score"),
+                                            "Own-Baseline Direction": wk_row.get("Own-Baseline Direction"),
+                                            "Raw mu": raw_mu_val, "Actual": wk_row.get("Actual"),
+                                            "Deviation": wk_row.get("Deviation from Own Baseline"),
+                                            "CrossRef Confirms": ("Yes" if cr_confirms is True else
+                                                                   "No" if cr_confirms is False else "no data"),
+                                            "Result": "✅ Hit" if ob_hit_val else "❌ Miss",
+                                        })
                                 if p_graded["Raw"]:
                                     rblw_rows.append({
                                         "Player": nm, "Graded Games": p_graded["Raw"],
@@ -2801,6 +2838,7 @@ elif mode == "Coverage Matchup (premium data)":
                                     for label in ["Raw", "Adjusted", "CrossRef"]}
                         st.session_state["_rblw_result"] = {
                             "agg": rblw_agg, "mae": rblw_mae, "consistent_triggered": rblw_consistent_triggered,
+                            "matchup_rows": rblw_matchup_rows,
                             "rows": rblw_rows, "errors": rblw_errors, "players_scanned": len(rblw_rows),
                         }
                 except Exception as e:
@@ -2831,18 +2869,49 @@ elif mode == "Coverage Matchup (premium data)":
                         st.caption(f"Lowest league-wide average error: **{best_label}**.")
 
                     ct_hits, ct_graded = rblw.get("consistent_triggered", [0, 0])
-                    st.markdown("**Consistent-triggered weeks only (the real test):**")
+                    st.markdown("**Consistent-triggered weeks only — no external line involved:**")
                     if ct_graded:
                         ct_pct = ct_hits / ct_graded * 100
-                        st.markdown(f"- {ct_hits}/{ct_graded} ({ct_pct:.0f}%) across {ct_graded} real "
-                                    f"weeks where the adjustment fired on a genuinely Consistent read")
+                        st.markdown(f"- {ct_hits}/{ct_graded} ({ct_pct:.0f}%) real weeks where his actual "
+                                    f"carries/yards deviated from HIS OWN raw baseline in the direction "
+                                    f"the two-sided signal predicted")
                         st.caption(
-                            "Compare this to the Raw baseline above - if it's meaningfully higher on "
-                            "this small, hand-picked subset, that's real proof the strict bar works."
+                            "Judged against his own normal level, not an external line - 50% is the "
+                            "real coinflip baseline here; meaningfully above that is genuine signal."
                         )
                     else:
-                        st.info("The adjustment never fired on a Consistent read across this scan - "
-                                "try more players, or this may genuinely be rare for RB rushing.")
+                        st.info("The signal never fired Consistent across this scan - try more "
+                                "players, or this may genuinely be rare for RB rushing.")
+
+                    matchup_rows = rblw.get("matchup_rows", [])
+                    if matchup_rows:
+                        st.markdown(f"**Every real Consistent-triggered matchup found ({len(matchup_rows)}) — "
+                                    f"color-coded:**")
+                        st.caption(
+                            "Green Actual = beat his own Raw mu; red = fell short. 'CrossRef Confirms' "
+                            "uses OTHER real games against OTHER defenses that graded similarly - Yes "
+                            "means that independent evidence backed the call too."
+                        )
+                        rb_matchup_df = pd.DataFrame(matchup_rows).sort_values(["Player", "Week"])
+
+                        def _rb_color_deviation(val):
+                            if not isinstance(val, (int, float)):
+                                return ""
+                            intensity = min(abs(val) / 5.0, 1.0)
+                            color = "0, 200, 0" if val > 0 else "200, 0, 0"
+                            return f"background-color: rgba({color}, {intensity * 0.5})"
+
+                        def _rb_color_result(val):
+                            return "background-color: rgba(0, 200, 0, 0.3)" if "Hit" in str(val) \
+                                else "background-color: rgba(200, 0, 0, 0.3)"
+
+                        try:
+                            rb_styled = rb_matchup_df.style.map(_rb_color_deviation, subset=["Deviation"]) \
+                                .map(_rb_color_result, subset=["Result"])
+                        except AttributeError:
+                            rb_styled = rb_matchup_df.style.applymap(_rb_color_deviation, subset=["Deviation"]) \
+                                .applymap(_rb_color_result, subset=["Result"])
+                        st.dataframe(rb_styled, width='stretch')
 
                     st.dataframe(pd.DataFrame(rblw["rows"]).sort_values("Graded Games", ascending=False),
                                  width='stretch')
