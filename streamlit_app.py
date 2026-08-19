@@ -261,7 +261,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v33-quality-validation-section-restored-2026-08-18"
+DEPLOY_VERSION = "v34-per-prop-quality-tier-2026-08-18"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -2912,6 +2912,25 @@ elif mode == "Coverage Matchup (premium data)":
             if not qs_report["by_prop_type"].empty:
                 st.markdown("**By prop type**")
                 st.dataframe(qs_report["by_prop_type"], width='stretch')
+            btqbp = qs_report.get("by_quality_tier_by_prop")
+            if btqbp is not None and not btqbp.empty:
+                st.markdown("**By quality tier, split per prop type** — the real test for a "
+                            "prop-specific signal (e.g. alignment only touches rec_yards/"
+                            "receptions/targets/rec_tds; QB coverage only touches pass_yards-"
+                            "family props; run-concept only touches rush_yards-family props). "
+                            "The pooled table above blends every prop together, which dilutes "
+                            "exactly this.")
+                qtbp_prop = st.selectbox(
+                    "Prop type", sorted(btqbp["prop_type"].unique().tolist()),
+                    index=(sorted(btqbp["prop_type"].unique().tolist()).index("rec_yards")
+                           if "rec_yards" in btqbp["prop_type"].values else 0),
+                    key="qtbp_prop_select",
+                )
+                st.dataframe(
+                    btqbp[btqbp["prop_type"] == qtbp_prop].drop(columns=["prop_type"])
+                    .style.background_gradient(subset=["mean_abs_miss"], cmap="RdYlGn_r"),
+                    width='stretch',
+                )
             adj_acc = qs_report.get("adjustment_direction_accuracy")
             if adj_acc is not None:
                 st.metric("Adjustment direction accuracy", f"{adj_acc:.1%}" if isinstance(adj_acc, (int, float)) else adj_acc)
