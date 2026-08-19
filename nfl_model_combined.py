@@ -31,6 +31,27 @@ try:
 except ImportError:
     nfl = None  # allows this file to be imported/tested without the package present
 
+try:
+    from coverage_matchup import (
+        calc_alignment_exploit_strength, calc_qb_coverage_exploit_strength,
+        TEAM_ABBREV_TO_FULL as ALIGNMENT_TEAM_MAP,
+    )
+except ImportError:
+    # Premium alignment module not present in this deploy - both signals
+    # degrade to fully absent (their flags are also off by default, so
+    # this only matters if someone flips a flag on without the file
+    # actually being deployed alongside this one).
+    calc_alignment_exploit_strength = None
+    calc_qb_coverage_exploit_strength = None
+    ALIGNMENT_TEAM_MAP = {}
+
+try:
+    from rb_matchup import calc_run_concept_exploit_strength
+except ImportError:
+    # Same graceful-absence treatment as the alignment import above -
+    # ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE is off by default.
+    calc_run_concept_exploit_strength = None
+
 
 # ---------------------------------------------------------------------------
 # 0. IN-PROCESS PULL CACHE
@@ -2307,6 +2328,35 @@ def calc_box_adjusted_mu(base_mu: float, box_efficiency: dict, opp_stacked_pct: 
 # ---------------------------------------------------------------------------
 ENABLE_PLAYACTION_IN_QUALITY_SCORE = True  # RE-ENABLED for isolated testing - see note below
 ENABLE_PERSONNEL_IN_QUALITY_SCORE = True  # RE-ENABLED - PA confirmed clean alone (weeks 4-18, quality tiers stable, no inversion), this round's ONE change
+
+# ALIGNMENT (Wide/Slot/Inline/Backfield) x coverage exploit signal,
+# sourced from coverage_matchup.py's premium FantasyPoints dataset
+# (calc_alignment_exploit_strength). FLIPPED ON for its own isolated live
+# test (round 1 of 3: alignment -> QB coverage -> run-concept, one at a
+# time, per the same discipline that already caught the box-adjustment
+# and quality_score sample-size bugs). Only takes effect at all when a
+# CoverageDataBundle is actually passed into build_weekly_slate
+# (coverage_bundle=...) - i.e. the Coverage Matchup tab's "load dataset"
+# step must be run first in the same session, or this silently degrades
+# to NaN same as a missing personnel/PA row (safe, not a crash).
+# DO NOT flip ENABLE_QB_COVERAGE_IN_QUALITY_SCORE or
+# ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE on in the same round as this one -
+# test this alone first (weeks 4-18 season report, check
+# adjustment_direction_accuracy + quality tier monotonicity for an
+# inversion) before touching either of the other two.
+ENABLE_ALIGNMENT_IN_QUALITY_SCORE = True
+
+# QB coverage exploit signal (no alignment axis) - STAYS OFF until
+# alignment above is confirmed clean on its own live test. Round 2.
+ENABLE_QB_COVERAGE_IN_QUALITY_SCORE = False
+
+# RB run-concept exploit signal, sourced from rb_matchup.py's premium
+# FantasyPoints dataset (calc_run_concept_exploit_strength). STAYS OFF
+# until alignment AND QB coverage are each confirmed clean - thinnest
+# real samples of the three (Counter/Power/Pull Lead), tested last on
+# purpose. Round 3.
+ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE = False
+
 # RE-ENABLE TEST (this round's ONE change, everything else held constant):
 # play-action was disabled after landing untested alongside 4 other changes
 # in one round, which caused a severe quality_score tier inversion never
@@ -2528,7 +2578,7 @@ def calc_blended_matchup_strength(structural_exploit: float, grade_exploit: floa
     return round(matchup_signal * matchup_weight + role_verification_score * (1 - matchup_weight), 3)
 
 
-def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
+def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=None) -> pd.DataFrame:
     """
     Pulls and merges every data source needed for one week's slate, returning
     a single player-level DataFrame with mu inputs for every prop type ready
@@ -2537,6 +2587,19 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     Best Edges table (avoids repeating the unreliable Underdog auto-pull
     issue; PrizePicks auto-pull can be tested later once this core scanner
     is proven out).
+
+    coverage_bundle: optional CoverageDataBundle (coverage_matchup.py's
+    load_full_dataset() output) - the premium alignment/coverage dataset.
+    Only used when ENABLE_ALIGNMENT_IN_QUALITY_SCORE is True; when None
+    (default), the alignment signal degrades to NaN for every row and
+    everything else here is unaffected. Passing this in is the caller's
+    job (Streamlit session_state) - this function never loads it itself,
+    same reasoning as why it doesn't load lines: keeps a network/file
+    concern out of the pull pipeline.
+
+    rb_bundle: optional RBDataBundle (rb_matchup.py's load_full_rb_dataset()
+    output) - the premium run-concept dataset. Same on/off/degrade contract
+    as coverage_bundle, gated by ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE.
 
     Returns columns including (not exhaustive):
       gsis_id, player_display_name, team, position, prop_type,
@@ -2563,6 +2626,19 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
     # calc_prop_mu does - using this week's own plays to predict this
     # week's own result would be data leakage, not a real projection.
     pbp_history_df = pbp_df[pbp_df["week"] < week]
+
+    # Per-game longest-play tables for the new longest_completion/
+    # longest_reception/longest_rush props (see build_longest_play_by_game).
+    # Built once here, current season only (weeks before target week) -
+    # NOTE: unlike calc_prop_mu's own_stats path, these are NOT bridged to
+    # a prior-season fallback (that would need prior_pbp_df run through
+    # the same aggregation too) - an intentional scope limit for this
+    # first pass, so Week 1-2 rows for these 3 props will more often come
+    # back NaN (flagged low-confidence, not guessed) than the yardage
+    # props do. Revisit if that proves too big a gap in practice.
+    qb_longest_df = build_longest_play_by_game(pbp_history_df, "QB")
+    rec_longest_df = build_longest_play_by_game(pbp_history_df, "WR")
+    rush_longest_df = build_longest_play_by_game(pbp_history_df, "RB")
 
     # BUGFIX: explosive_rates was previously computed from the full-season
     # pbp_df (including the target week itself and every week after it) -
@@ -2713,7 +2789,21 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
         # still attached to the row below for visibility, just excluded
         # from scoring until validated (see feature-flag note above).
         pa_exploit_for_scoring = playaction_info.get("exploit_strength") if ENABLE_PLAYACTION_IN_QUALITY_SCORE else np.nan
-        structural_parts = [v for v in [coverage_info.get("exploit_strength"), pa_exploit_for_scoring] if pd.notna(v)]
+
+        # QB coverage exploit signal - premium data, real outlier-coverage
+        # gated (see calc_qb_coverage_exploit_strength in
+        # coverage_matchup.py). GATED same as every other premium/isolated
+        # signal here - off by default pending its own live test.
+        qb_coverage_info = {"exploit_strength": np.nan, "outlier_coverages_checked": []}
+        if (ENABLE_QB_COVERAGE_IN_QUALITY_SCORE and coverage_bundle is not None
+                and calc_qb_coverage_exploit_strength is not None and opponent is not None):
+            qb_coverage_info = calc_qb_coverage_exploit_strength(
+                coverage_bundle, qb.get("full_name"), team, opponent,
+            )
+        qb_coverage_exploit_for_scoring = qb_coverage_info.get("exploit_strength") if ENABLE_QB_COVERAGE_IN_QUALITY_SCORE else np.nan
+
+        structural_parts = [v for v in [coverage_info.get("exploit_strength"), pa_exploit_for_scoring,
+                                         qb_coverage_exploit_for_scoring] if pd.notna(v)]
         combined_structural_exploit = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
 
         # ACTUAL mu adjustment (not just a quality_score side signal) using
@@ -2790,6 +2880,8 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             "opp_num_elevated_coverages": coverage_info.get("num_elevated_coverages", 0),
             "playaction_exploit_strength": playaction_info.get("exploit_strength"),
             "playaction_used_coverage_specific_data": playaction_info.get("used_coverage_specific_playaction_data"),
+            "qb_coverage_exploit_strength": qb_coverage_info.get("exploit_strength"),
+            "qb_coverage_outliers_checked": qb_coverage_info.get("outlier_coverages_checked"),
             "full_coverage_weight_used": full_coverage_weight_used,
             "quality_score": quality_score,
             "grade_matchup_strength": grade_exploit,
@@ -2800,6 +2892,54 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             **get_full_coverage_breakdown(opp_coverage_row),
             **own_grades,
             **def_grades,
+        })
+
+        # --- Sibling QB count/longest props (completions, attempts, TDs,
+        # longest completion) - reuse the SAME matchup signals just
+        # computed for pass_yards (structural coverage/PA/QB-coverage
+        # exploit, grade crosswalk, role verification, quality_score)
+        # rather than recomputing a full independent stack per prop. This
+        # is a deliberate simplification: these are all facets of the same
+        # underlying passing matchup, not fundamentally different
+        # matchups - documented here rather than silently assumed. mu/
+        # sigma themselves ARE independently computed per prop (real
+        # per-stat shrinkage, not copied from pass_yards).
+        for sib_prop, sib_col in (("pass_completions", "completions"),
+                                   ("pass_attempts", "attempts"),
+                                   ("pass_tds", "passing_tds")):
+            sib_mu = calc_prop_mu(
+                gsis_id, sib_col, player_stats_df, season, week, current_team=team,
+                league_fallback_mu=fallback_mus.get(("QB", sib_col)),
+            )
+            sib_sigma = calc_player_sigma(
+                gsis_id, sib_col, player_stats_df, season, week, current_team=team,
+                league_fallback_sigma=fallback_sigmas.get(("QB", sib_col)),
+            )
+            rows.append({
+                "gsis_id": gsis_id, "player_display_name": qb.get("full_name"),
+                "team": team, "position": "QB", "prop_type": sib_prop,
+                "matchup": team_to_matchup.get(team),
+                "mu": sib_mu, "sigma": sib_sigma, "opponent": opponent,
+                "quality_score": quality_score,
+                "grade_matchup_strength": grade_exploit,
+                "role_verification_score": role_score,
+                "data_confidence": confidence_info["data_confidence"],
+                "games_sampled_current": confidence_info["games_sampled_current"],
+            })
+
+        # Longest completion - own-history-only (see qb_longest_df note
+        # above: no prior-season bridge yet), so min_games gates it more
+        # often than the other props for thin-sample QBs.
+        longest_mu = calc_prop_mu(gsis_id, "longest_play", qb_longest_df, season, week, current_team=None)
+        longest_sigma = calc_player_sigma(gsis_id, "longest_play", qb_longest_df, season, week, current_team=None)
+        rows.append({
+            "gsis_id": gsis_id, "player_display_name": qb.get("full_name"),
+            "team": team, "position": "QB", "prop_type": "longest_completion",
+            "matchup": team_to_matchup.get(team),
+            "mu": longest_mu, "sigma": longest_sigma, "opponent": opponent,
+            "quality_score": quality_score,
+            "data_confidence": confidence_info["data_confidence"],
+            "games_sampled_current": confidence_info["games_sampled_current"],
         })
 
     # --- Rushing props ---
@@ -2840,6 +2980,22 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
                 )
                 adjusted_rush_mu = calc_box_adjusted_mu(mu, box_eff, box_info.get("box_stack_pct"))
 
+            # Run-concept exploit signal - premium data, only computed when
+            # a bundle was actually passed in AND the flag is on (see
+            # calc_run_concept_exploit_strength in rb_matchup.py for the
+            # real logic). GATED same as every other premium/isolated
+            # signal - off by default pending its own live test. Position
+            # check mirrors rush_pool's own RB/QB filter (QBs rarely have
+            # FantasyPoints run-concept rows, so this will naturally
+            # degrade to NaN for most QB rush_yards rows).
+            run_concept_info = {"exploit_strength": np.nan, "concepts_checked": []}
+            if (ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE and rb_bundle is not None
+                    and calc_run_concept_exploit_strength is not None and rb_opponent is not None):
+                run_concept_info = calc_run_concept_exploit_strength(
+                    rb_bundle, rb.get("full_name"), rb_team, rb_opponent,
+                )
+            run_concept_exploit_for_scoring = run_concept_info.get("exploit_strength") if ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE else np.nan
+
             rb_confidence_info = get_data_confidence(gsis_id, player_stats_df, season, week, current_team=rb_team)
             own_grades = get_player_grades(gsis_id, rb_metrics)
             def_grades = get_defense_grades(rb_opponent, def_metrics)
@@ -2847,8 +3003,11 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             grade_exploit = calc_grade_matchup_strength({**own_grades, **def_grades}, "rush_yards")
             role_trend = build_role_trend(gsis_id, "rush_attempts", ngs_rush_df, "player_gsis_id", season, week)
             role_score = calc_role_verification_score(role_trend)
+            structural_parts = [v for v in [box_info.get("exploit_strength"), run_concept_exploit_for_scoring]
+                                 if pd.notna(v)]
+            combined_rush_structural = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
             blended_exploit = calc_blended_matchup_strength(
-                box_info.get("exploit_strength"), grade_exploit, role_score
+                combined_rush_structural, grade_exploit, role_score
             )
             rush_quality_score = calc_quality_score(
                 matchup_exploit_strength=blended_exploit,
@@ -2864,6 +3023,8 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
                 "mu": adjusted_rush_mu, "mu_before_box_adj": mu, "sigma": sigma, "opponent": rb_opponent,
                 "opp_box_stack_pct": box_info.get("box_stack_pct"),
                 "opp_box_elevated": box_info.get("box_elevated"),
+                "run_concept_exploit_strength": run_concept_info.get("exploit_strength"),
+                "run_concepts_checked": run_concept_info.get("concepts_checked"),
                 "quality_score": rush_quality_score,
                 "grade_matchup_strength": grade_exploit,
                 "role_verification_score": role_score,
@@ -2872,6 +3033,43 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
                 "games_sampled_current": rb_confidence_info["games_sampled_current"],
                 **own_grades,
                 **def_grades,
+            })
+
+            # --- Sibling rushing count/longest props (attempts, TDs,
+            # longest rush) - same reuse-the-matchup-signal design as the
+            # QB sibling props above (see that comment for the full
+            # rationale); mu/sigma independently computed per prop.
+            for sib_prop, sib_col in (("rush_attempts", "carries"), ("rush_tds", "rushing_tds")):
+                sib_mu = calc_prop_mu(
+                    gsis_id, sib_col, player_stats_df, season, week, current_team=rb_team,
+                    league_fallback_mu=fallback_mus.get((position, sib_col)),
+                )
+                sib_sigma = calc_player_sigma(
+                    gsis_id, sib_col, player_stats_df, season, week, current_team=rb_team,
+                    league_fallback_sigma=fallback_sigmas.get((position, sib_col)),
+                )
+                rows.append({
+                    "gsis_id": gsis_id, "player_display_name": rb.get("full_name"),
+                    "team": rb.get("team"), "position": position, "prop_type": sib_prop,
+                    "matchup": team_to_matchup.get(rb_team),
+                    "mu": sib_mu, "sigma": sib_sigma, "opponent": rb_opponent,
+                    "quality_score": rush_quality_score,
+                    "grade_matchup_strength": grade_exploit,
+                    "role_verification_score": role_score,
+                    "data_confidence": rb_confidence_info["data_confidence"],
+                    "games_sampled_current": rb_confidence_info["games_sampled_current"],
+                })
+
+            longest_rush_mu = calc_prop_mu(gsis_id, "longest_play", rush_longest_df, season, week, current_team=None)
+            longest_rush_sigma = calc_player_sigma(gsis_id, "longest_play", rush_longest_df, season, week, current_team=None)
+            rows.append({
+                "gsis_id": gsis_id, "player_display_name": rb.get("full_name"),
+                "team": rb.get("team"), "position": position, "prop_type": "longest_rush",
+                "matchup": team_to_matchup.get(rb_team),
+                "mu": longest_rush_mu, "sigma": longest_rush_sigma, "opponent": rb_opponent,
+                "quality_score": rush_quality_score,
+                "data_confidence": rb_confidence_info["data_confidence"],
+                "games_sampled_current": rb_confidence_info["games_sampled_current"],
             })
 
     # --- Receiving props ---
@@ -2910,7 +3108,23 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
             # GATED per ENABLE_PERSONNEL_IN_QUALITY_SCORE - same isolation
             # treatment as the play-action gate above.
             personnel_exploit_for_scoring = personnel_info.get("exploit_strength") if ENABLE_PERSONNEL_IN_QUALITY_SCORE else np.nan
-            structural_parts = [v for v in [coverage_info.get("exploit_strength"), personnel_exploit_for_scoring] if pd.notna(v)]
+
+            # Alignment (Wide/Slot/Inline/Backfield) x real opponent
+            # outlier-coverage exploit signal - premium data, only computed
+            # when a bundle was actually passed in AND the flag is on
+            # (see calc_alignment_exploit_strength in coverage_matchup.py
+            # for the real logic). GATED same as PA/personnel - isolated,
+            # off by default pending its own live test.
+            alignment_info = {"exploit_strength": np.nan, "dominant_alignment": None, "alignment_fit_pct": None}
+            if (ENABLE_ALIGNMENT_IN_QUALITY_SCORE and coverage_bundle is not None
+                    and calc_alignment_exploit_strength is not None and opponent is not None):
+                alignment_info = calc_alignment_exploit_strength(
+                    coverage_bundle, wr.get("full_name"), position, team, opponent,
+                )
+            alignment_exploit_for_scoring = alignment_info.get("exploit_strength") if ENABLE_ALIGNMENT_IN_QUALITY_SCORE else np.nan
+
+            structural_parts = [v for v in [coverage_info.get("exploit_strength"), personnel_exploit_for_scoring,
+                                             alignment_exploit_for_scoring] if pd.notna(v)]
             combined_structural_exploit = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
 
             # ACTUAL mu adjustment using this receiver's own real man/zone
@@ -2970,6 +3184,10 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
                 "opp_num_elevated_coverages": coverage_info.get("num_elevated_coverages", 0),
                 "personnel_exploit_strength": personnel_info.get("exploit_strength"),
                 "dominant_personnel": personnel_info.get("dominant_personnel"),
+                "alignment_exploit_strength": alignment_info.get("exploit_strength"),
+                "dominant_alignment": alignment_info.get("dominant_alignment"),
+                "alignment_fit_pct": alignment_info.get("alignment_fit_pct"),
+                "alignment_outlier_coverages": alignment_info.get("outlier_coverages_checked"),
                 "full_coverage_weight_used": full_coverage_weight_used,
                 **get_full_coverage_breakdown(opp_coverage_row),
                 "quality_score": quality_score,
@@ -2980,6 +3198,45 @@ def build_weekly_slate(season: int, week: int) -> pd.DataFrame:
                 "games_sampled_current": rec_confidence_info["games_sampled_current"],
                 **own_grades,
                 **def_grades,
+            })
+
+            # --- Sibling receiving count/longest props (receptions,
+            # targets, TDs, longest catch) - same reuse-the-matchup-signal
+            # design as QB/RB siblings above; mu/sigma independently
+            # computed per prop. Applies to WR/TE/RB alike since rec_pool
+            # already includes all three.
+            for sib_prop, sib_col in (("receptions", "receptions"), ("targets", "targets"),
+                                       ("rec_tds", "receiving_tds")):
+                sib_mu = calc_prop_mu(
+                    gsis_id, sib_col, player_stats_df, season, week, current_team=team,
+                    league_fallback_mu=fallback_mus.get((position, sib_col)),
+                )
+                sib_sigma = calc_player_sigma(
+                    gsis_id, sib_col, player_stats_df, season, week, current_team=team,
+                    league_fallback_sigma=fallback_sigmas.get((position, sib_col)),
+                )
+                rows.append({
+                    "gsis_id": gsis_id, "player_display_name": wr.get("full_name"),
+                    "team": team, "position": position, "prop_type": sib_prop,
+                    "matchup": team_to_matchup.get(team),
+                    "mu": sib_mu, "sigma": sib_sigma, "opponent": opponent,
+                    "quality_score": quality_score,
+                    "grade_matchup_strength": grade_exploit,
+                    "role_verification_score": role_score,
+                    "data_confidence": rec_confidence_info["data_confidence"],
+                    "games_sampled_current": rec_confidence_info["games_sampled_current"],
+                })
+
+            longest_rec_mu = calc_prop_mu(gsis_id, "longest_play", rec_longest_df, season, week, current_team=None)
+            longest_rec_sigma = calc_player_sigma(gsis_id, "longest_play", rec_longest_df, season, week, current_team=None)
+            rows.append({
+                "gsis_id": gsis_id, "player_display_name": wr.get("full_name"),
+                "team": team, "position": position, "prop_type": "longest_reception",
+                "matchup": team_to_matchup.get(team),
+                "mu": longest_rec_mu, "sigma": longest_rec_sigma, "opponent": opponent,
+                "quality_score": quality_score,
+                "data_confidence": rec_confidence_info["data_confidence"],
+                "games_sampled_current": rec_confidence_info["games_sampled_current"],
             })
 
     # --- Fantasy points (offense: QB, RB, WR, TE) ---
@@ -3234,10 +3491,11 @@ def build_league_fallback_mus(player_stats_df: pd.DataFrame, season: int,
     build_league_fallback_sigmas().
     """
     prop_by_position = {
-        "QB": ["passing_yards", "rushing_yards"],
-        "RB": ["rushing_yards", "receiving_yards"],
-        "WR": ["receiving_yards", "rushing_yards"],
-        "TE": ["receiving_yards"],
+        "QB": ["passing_yards", "rushing_yards", "completions", "attempts", "passing_tds"],
+        "RB": ["rushing_yards", "receiving_yards", "carries", "rushing_tds",
+               "receptions", "targets", "receiving_tds"],
+        "WR": ["receiving_yards", "rushing_yards", "receptions", "targets", "receiving_tds"],
+        "TE": ["receiving_yards", "receptions", "targets", "receiving_tds"],
     }
     df = player_stats_df[
         (player_stats_df["season"] == season) & (player_stats_df["week"] < through_week)
@@ -3342,10 +3600,11 @@ def build_league_fallback_sigmas(player_stats_df: pd.DataFrame, season: int,
       }
     """
     prop_by_position = {
-        "QB": ["passing_yards", "rushing_yards"],
-        "RB": ["rushing_yards", "receiving_yards"],
-        "WR": ["receiving_yards", "rushing_yards"],
-        "TE": ["receiving_yards"],
+        "QB": ["passing_yards", "rushing_yards", "completions", "attempts", "passing_tds"],
+        "RB": ["rushing_yards", "receiving_yards", "carries", "rushing_tds",
+               "receptions", "targets", "receiving_tds"],
+        "WR": ["receiving_yards", "rushing_yards", "receptions", "targets", "receiving_tds"],
+        "TE": ["receiving_yards", "receptions", "targets", "receiving_tds"],
     }
 
     df = player_stats_df[
@@ -3371,7 +3630,7 @@ def build_league_fallback_sigmas(player_stats_df: pd.DataFrame, season: int,
 # 7. FULL SLATE SCAN (mirrors scan_full_slate_quality_mu from MLB tool)
 # ---------------------------------------------------------------------------
 
-def scan_full_slate_nfl(season: int, week: int) -> pd.DataFrame:
+def scan_full_slate_nfl(season: int, week: int, coverage_bundle=None, rb_bundle=None) -> pd.DataFrame:
     """
     Weekly full-slate scanner. Builds the slate (see build_weekly_slate),
     but does NOT auto-fill lines or compute edge/p_over - those are added
@@ -3379,8 +3638,12 @@ def scan_full_slate_nfl(season: int, week: int) -> pd.DataFrame:
     the MLB tool's adjustable Best Edges table. quality_score and mu
     components are pre-computed here; edge/p_over recompute live in the UI
     whenever the user edits a line.
+
+    coverage_bundle, rb_bundle: passed straight through to
+    build_weekly_slate - see that function's docstring. Optional; omitting
+    either just means that signal stays off even if its flag is on.
     """
-    slate_df = build_weekly_slate(season, week)
+    slate_df = build_weekly_slate(season, week, coverage_bundle=coverage_bundle, rb_bundle=rb_bundle)
     slate_df["line"] = np.nan  # user fills this in per row in the UI
     slate_df["p_over"] = np.nan
     slate_df["edge"] = np.nan
@@ -3439,18 +3702,24 @@ def get_starters_for_week(season: int, week: int, depth_charts_df: pd.DataFrame,
     return set(starters["gsis_id"].dropna().tolist())
 
 
-def score_week_against_actuals(season: int, week: int, starters_only: bool = True) -> pd.DataFrame:
+def score_week_against_actuals(season: int, week: int, starters_only: bool = True, coverage_bundle=None, rb_bundle=None) -> pd.DataFrame:
     """
     Shared core of backtest_week(): builds the week's slate, looks up each
     player's REAL result, and attaches miss/abs_miss/match_ratio - but
     returns EVERY row (no match_ratio filter), so this can feed either
     backtest_week()'s "biggest surprises" view or a season-wide accuracy/
     calibration report that needs the full distribution, not just outliers.
+
+    coverage_bundle, rb_bundle: passed straight through to
+    build_weekly_slate - see that function's docstring. Needed here so
+    both premium signals can eventually get their own isolated backtests,
+    same as every other flag.
     """
-    slate_df = build_weekly_slate(season, week)
+    slate_df = build_weekly_slate(season, week, coverage_bundle=coverage_bundle, rb_bundle=rb_bundle)
     player_stats_df = pull_player_stats([season])
     depth_charts_df = pull_depth_charts([season]) if nfl else pd.DataFrame()
     schedules_df = pull_schedules([season])
+    pbp_df = pull_pbp([season])
 
     actual_week = player_stats_df[
         (player_stats_df["season"] == season) & (player_stats_df["week"] == week)
@@ -3461,11 +3730,35 @@ def score_week_against_actuals(season: int, week: int, starters_only: bool = Tru
         "rush_yards": "rushing_yards",
         "rec_yards": "receiving_yards",
         "fantasy_points": "fantasy_points_ppr",
+        "pass_completions": "completions",
+        "pass_attempts": "attempts",
+        "pass_tds": "passing_tds",
+        "rush_attempts": "carries",
+        "rush_tds": "rushing_tds",
+        "receptions": "receptions",
+        "targets": "targets",
+        "rec_tds": "receiving_tds",
     }
+
+    # Longest-play props aren't in player_stats - built from this SAME
+    # target week's real pbp instead, same aggregation as
+    # build_longest_play_by_game but for one already-played week rather
+    # than a history window. Keyed by (gsis_id, prop_type) for the lookup.
+    longest_actual_week_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] == week)]
+    longest_actuals = {}
+    for prop_type, pos_hint in (("longest_completion", "QB"), ("longest_reception", "WR"), ("longest_rush", "RB")):
+        try:
+            lp = build_longest_play_by_game(longest_actual_week_pbp, pos_hint)
+        except KeyError:
+            lp = pd.DataFrame(columns=["gsis_id", "longest_play"])
+        for _, r in lp.iterrows():
+            longest_actuals[(r["gsis_id"], prop_type)] = r["longest_play"]
 
     def _lookup_actual(row):
         prop_type = row["prop_type"]
         gsis_id = row["gsis_id"]
+        if prop_type in ("longest_completion", "longest_reception", "longest_rush"):
+            return longest_actuals.get((gsis_id, prop_type), np.nan)
         if gsis_id not in actual_week.index:
             return np.nan
         if prop_type == "kicker_fantasy":
@@ -3489,11 +3782,16 @@ def score_week_against_actuals(season: int, week: int, starters_only: bool = Tru
     slate_df["actual"] = slate_df.apply(_lookup_actual, axis=1)
     slate_df["games_sampled"] = slate_df.apply(_games_sampled, axis=1)
 
-    # Drop non-participants: no result at all, OR a literal 0 (backup who
-    # barely got in, inactive, etc. - a real starter essentially never
-    # posts a true 0 in these stat categories).
+    # Drop non-participants: no result at all, OR (for yardage/volume
+    # props only) a literal 0 - a real starter essentially never posts a
+    # true 0 yard/attempt/target total. TD-count props (pass_tds/
+    # rush_tds/rec_tds) are explicitly EXCLUDED from the zero-drop - a
+    # real 0-TD game is extremely common for an active starter and is
+    # not itself a participation signal, unlike 0 yards/attempts/targets.
     slate_df = slate_df.dropna(subset=["actual"])
-    slate_df = slate_df[slate_df["actual"] != 0].copy()
+    zero_drop_exempt = {"pass_tds", "rush_tds", "rec_tds"}
+    zero_mask = (slate_df["actual"] == 0) & (~slate_df["prop_type"].isin(zero_drop_exempt))
+    slate_df = slate_df[~zero_mask].copy()
 
     if starters_only:
         starter_ids = get_starters_for_week(season, week, depth_charts_df, schedules_df)
@@ -3511,7 +3809,7 @@ def score_week_against_actuals(season: int, week: int, starters_only: bool = Tru
     return slate_df.drop(columns=["line", "p_over", "edge"], errors="ignore")
 
 
-def backtest_week(season: int, week: int) -> pd.DataFrame:
+def backtest_week(season: int, week: int, coverage_bundle=None, rb_bundle=None) -> pd.DataFrame:
     """
     Runs the scanner for a week that's already been played, then joins in
     each player's REAL result for that week, so you can compare mu (what
@@ -3530,7 +3828,7 @@ def backtest_week(season: int, week: int) -> pd.DataFrame:
     sigma, actual, miss, abs_miss, match_ratio, games_sampled - sorted by
     biggest surprise (match_ratio) first.
     """
-    result = score_week_against_actuals(season, week, starters_only=True)
+    result = score_week_against_actuals(season, week, starters_only=True, coverage_bundle=coverage_bundle, rb_bundle=rb_bundle)
     result = result[result["match_ratio"] >= 2.0]
     return result.sort_values("match_ratio", ascending=False, na_position="last")
 
@@ -3722,7 +4020,7 @@ def get_completed_weeks_with_data(season: int, through_week: int = 18) -> list:
     return [w for w in weeks_with_data if w >= 2]
 
 
-def build_season_accuracy_report(season: int, weeks: list = None, through_week: int = 18) -> dict:
+def build_season_accuracy_report(season: int, weeks: list = None, through_week: int = 18, coverage_bundle=None, rb_bundle=None) -> dict:
     """
     Runs score_week_against_actuals() across every completed week of a
     season (or an explicit `weeks` list) and returns calibration
@@ -3771,7 +4069,7 @@ def build_season_accuracy_report(season: int, weeks: list = None, through_week: 
     week_results = []
     for wk in weeks:
         try:
-            wk_df = score_week_against_actuals(season, wk, starters_only=True)
+            wk_df = score_week_against_actuals(season, wk, starters_only=True, coverage_bundle=coverage_bundle, rb_bundle=rb_bundle)
             if not wk_df.empty:
                 week_results.append(wk_df)
         except Exception as e:
@@ -3925,23 +4223,28 @@ def diagnose_player_stats_for_game_log(season: int) -> dict:
 
 def build_longest_play_by_game(pbp_df: pd.DataFrame, position: str) -> pd.DataFrame:
     """
-    Real per-game "longest reception" (WR/TE) or "longest rush" (RB),
-    computed from real play-by-play data - genuinely new pbp usage beyond
-    what's elsewhere in this file (previously only play_type/week/ydstogo
-    were confirmed used here). receiver_player_id, rusher_player_id, and
-    yards_gained are extremely standard, stable nflverse pbp columns used
-    across the public nflverse ecosystem for years - a different
-    confidence category than the participation data casing bug (a
-    genuinely obscure, inconsistently-cased field caught earlier this
-    project). Still defensive: raises a clear KeyError naming exactly
-    which expected column is missing rather than silently returning
-    wrong/empty data, so a real schema mismatch surfaces immediately
-    instead of masquerading as "this player has no long plays."
+    Real per-game "longest reception" (WR/TE), "longest rush" (RB), or
+    "longest completion" (QB - added alongside the new completions/
+    attempts/pass_tds/rec_tds/rush_tds/rush_attempts props), computed from
+    real play-by-play data - genuinely new pbp usage beyond what's
+    elsewhere in this file (previously only play_type/week/ydstogo were
+    confirmed used here). receiver_player_id, rusher_player_id,
+    passer_player_id, and yards_gained are extremely standard, stable
+    nflverse pbp columns used across the public nflverse ecosystem for
+    years - a different confidence category than the participation data
+    casing bug (a genuinely obscure, inconsistently-cased field caught
+    earlier this project). Still defensive: raises a clear KeyError naming
+    exactly which expected column is missing rather than silently
+    returning wrong/empty data, so a real schema mismatch surfaces
+    immediately instead of masquerading as "this player has no long plays."
 
     Returns columns: gsis_id, season, week, longest_play.
     """
-    if position.upper() == "RB":
+    position = position.upper()
+    if position == "RB":
         id_col, want_play_type = "rusher_player_id", "run"
+    elif position == "QB":
+        id_col, want_play_type = "passer_player_id", "pass"
     else:
         id_col, want_play_type = "receiver_player_id", "pass"
 
