@@ -4082,7 +4082,8 @@ def build_season_accuracy_report(season: int, weeks: list = None, through_week: 
 
     if not week_results:
         return {"raw": pd.DataFrame(), "by_prop_type": pd.DataFrame(), "by_position": pd.DataFrame(),
-                "by_quality_tier": pd.DataFrame(), "adjustment_direction_accuracy": np.nan,
+                "by_quality_tier": pd.DataFrame(), "by_quality_tier_by_prop": pd.DataFrame(),
+                "adjustment_direction_accuracy": np.nan,
                 "role_verification_check": pd.DataFrame()}
 
     raw = pd.concat(week_results, ignore_index=True)
@@ -4096,6 +4097,7 @@ def build_season_accuracy_report(season: int, weeks: list = None, through_week: 
     ).reset_index().sort_values("mean_abs_miss")
 
     by_quality_tier = pd.DataFrame()
+    by_quality_tier_by_prop = pd.DataFrame()
     if "quality_score" in raw.columns:
         tier_df = raw.dropna(subset=["quality_score"]).copy()
         tier_df["quality_tier"] = pd.cut(
@@ -4103,6 +4105,20 @@ def build_season_accuracy_report(season: int, weeks: list = None, through_week: 
             labels=["<40", "40-60", "60-80", "80-100"],
         )
         by_quality_tier = tier_df.groupby("quality_tier", observed=True).agg(
+            mean_abs_miss=("abs_miss", "mean"), mean_match_ratio=("match_ratio", "mean"),
+            n=("abs_miss", "count"),
+        ).reset_index()
+
+        # Same tier breakdown, but split by prop_type too - the pooled
+        # by_quality_tier above blends every prop together, which dilutes
+        # any prop-specific signal (e.g. the alignment exploit signal only
+        # touches rec_yards/receptions/targets/rec_tds - its effect is
+        # invisible in the pooled table once mixed with pass_yards/
+        # rush_yards rows it never touches). This is the real per-prop
+        # check for whether a given signal is actually helping.
+        by_quality_tier_by_prop = tier_df.groupby(
+            ["prop_type", "quality_tier"], observed=True
+        ).agg(
             mean_abs_miss=("abs_miss", "mean"), mean_match_ratio=("match_ratio", "mean"),
             n=("abs_miss", "count"),
         ).reset_index()
@@ -4144,6 +4160,7 @@ def build_season_accuracy_report(season: int, weeks: list = None, through_week: 
         "by_prop_type": by_prop_type,
         "by_position": by_position,
         "by_quality_tier": by_quality_tier,
+        "by_quality_tier_by_prop": by_quality_tier_by_prop,
         "adjustment_direction_accuracy": adjustment_direction_accuracy,
         "role_verification_check": role_verification_check,
     }
