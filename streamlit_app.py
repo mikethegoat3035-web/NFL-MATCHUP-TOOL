@@ -261,7 +261,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v25-alignment-diagnostic-2026-08-13"
+DEPLOY_VERSION = "v32-alignment-LIVE-TEST-2026-08-18"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -485,11 +485,19 @@ else:
             with st.spinner(f"Pulling and scoring Week {week}, {season}..."):
                 try:
                     if mode.startswith("Backtest"):
-                        st.session_state.slate_df = backtest_week(season, week)
+                        st.session_state.slate_df = backtest_week(
+                            season, week,
+                            coverage_bundle=st.session_state.get("coverage_bundle"),
+                            rb_bundle=st.session_state.get("rb_bundle"),
+                        )
                         st.session_state.backtest_mode = True
                         st.session_state.show_season_report = False
                     else:
-                        st.session_state.slate_df = scan_full_slate_nfl(season, week)
+                        st.session_state.slate_df = scan_full_slate_nfl(
+                            season, week,
+                            coverage_bundle=st.session_state.get("coverage_bundle"),
+                            rb_bundle=st.session_state.get("rb_bundle"),
+                        )
                         st.session_state.backtest_mode = False
                         st.session_state.show_season_report = False
                     st.success(f"Loaded {len(st.session_state.slate_df)} prop rows.")
@@ -521,7 +529,11 @@ else:
                     weeks_to_run = list(range(report_start_week, report_end_week + 1))
                     with st.spinner(f"Scoring weeks {report_start_week}-{report_end_week} of {season} against real results..."):
                         try:
-                            st.session_state.season_report = build_season_accuracy_report(season, weeks=weeks_to_run)
+                            st.session_state.season_report = build_season_accuracy_report(
+                                season, weeks=weeks_to_run,
+                                coverage_bundle=st.session_state.get("coverage_bundle"),
+                                rb_bundle=st.session_state.get("rb_bundle"),
+                            )
                             st.session_state.backtest_mode = True
                             st.session_state.show_season_report = True
                             n_rows = len(st.session_state.season_report["raw"])
@@ -980,7 +992,7 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         st.info(f"Showing {st.session_state.selected_game} only - sorted by quality_score (best matchups first).")
 
     st.subheader("Filters")
-    fcol1, fcol2, fcol3 = st.columns(3)
+    fcol1, fcol2, fcol3, fcol4 = st.columns(4)
     with fcol1:
         prop_types = ["All"] + sorted(df["prop_type"].dropna().unique().tolist())
         prop_filter = st.selectbox("Prop type", prop_types)
@@ -992,12 +1004,26 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
             min_edge_filter = st.slider("Minimum edge (after entering lines)", 0.0, 1.0, 0.0, 0.05)
         else:
             min_edge_filter = 0.0
+    with fcol4:
+        # Combined with min_edge_filter below (both must clear, when set) -
+        # quality_score and edge are otherwise completely independent
+        # numbers (edge comes purely from mu/line/sigma; quality_score
+        # never feeds into that calculation) - this is the actual gate
+        # that makes "only show me the highest quality matchups" real
+        # instead of something you have to eyeball across two separate
+        # columns yourself. Applies across EVERY prop_type, Scan and
+        # Backtest alike (not just the old pass_yards/rec_yards-only
+        # Best Quality Matchups panel below).
+        min_quality_filter = st.slider("Minimum quality_score", 0, 100, 0, 5,
+                                        help="Applies to every prop type. 0 = off.")
 
     filtered = df.copy()
     if prop_filter != "All":
         filtered = filtered[filtered["prop_type"] == prop_filter]
     if position_filter != "All":
         filtered = filtered[filtered["position"] == position_filter]
+    if min_quality_filter > 0 and "quality_score" in filtered.columns:
+        filtered = filtered[filtered["quality_score"].fillna(0) >= min_quality_filter]
 
     if st.session_state.backtest_mode:
         # -----------------------------------------------------------
