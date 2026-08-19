@@ -261,7 +261,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v32-alignment-LIVE-TEST-2026-08-18"
+DEPLOY_VERSION = "v33-quality-validation-section-restored-2026-08-18"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -418,6 +418,8 @@ if "draft_rankings_df" not in st.session_state:
     st.session_state.draft_rankings_df = None
 if "season_report" not in st.session_state:
     st.session_state.season_report = None
+if "qs_report" not in st.session_state:
+    st.session_state.qs_report = None
 if "show_season_report" not in st.session_state:
     st.session_state.show_season_report = False
 if "coverage_bundle" not in st.session_state:
@@ -2843,6 +2845,80 @@ elif mode == "Coverage Matchup (premium data)":
             if ev_result["errors"]:
                 with st.expander(f"{len(ev_result['errors'])} skipped/errors"):
                     st.write(ev_result["errors"])
+
+        st.divider()
+
+        # -----------------------------------------------------------
+        # QUALITY SCORE / FLAG VALIDATION - the actual gap that made the
+        # ENABLE_ALIGNMENT_IN_QUALITY_SCORE (and QB coverage / run-concept)
+        # flags untestable from the UI: build_season_accuracy_report()
+        # used to be reachable via a standalone "Backtest" mode, which was
+        # removed in favor of the mu-source-comparison tools above (those
+        # test something real but different - own-baseline mu accuracy,
+        # not quality_score/adjustment_direction_accuracy). This restores
+        # the actual quality_score validation path, here in Coverage
+        # Matchup mode since that's where the premium bundles this needs
+        # (coverage_bundle, rb_bundle) are already loaded.
+        # -----------------------------------------------------------
+        st.markdown("## 📊 Quality Score / Flag Validation (Season Readiness Report)")
+        st.caption(
+            "Tests whether quality_score actually separates good projections from bad ones - "
+            "by_quality_tier, adjustment_direction_accuracy, by_prop_type - the real bar for "
+            "deciding whether a feature flag (alignment/QB coverage/run-concept/PA/personnel) "
+            "should stay on. Uses whichever coverage_bundle/rb_bundle are currently loaded above, "
+            "so load those first if you haven't."
+        )
+        qs_col1, qs_col2, qs_col3 = st.columns(3)
+        with qs_col1:
+            qs_season = st.number_input("Season", min_value=2020, max_value=2030, value=2025, step=1, key="qs_season")
+        with qs_col2:
+            qs_start_week = st.number_input("Start week", min_value=2, max_value=18, value=4, step=1, key="qs_start_week",
+                                             help="Week 1 is skipped automatically - no prior-week history to project from yet.")
+        with qs_col3:
+            qs_end_week = st.number_input("End week", min_value=2, max_value=18, value=18, step=1, key="qs_end_week")
+        st.caption(
+            "Start small (4-6 weeks) first to confirm it runs within Streamlit Cloud's free-tier "
+            "memory limit before attempting the full 4-18 range in one click."
+        )
+        if st.button("Run Quality Score Validation", type="primary", key="qs_run_btn"):
+            if qs_end_week < qs_start_week:
+                st.error("End week must be >= start week.")
+            else:
+                qs_weeks = list(range(int(qs_start_week), int(qs_end_week) + 1))
+                with st.spinner(f"Scoring weeks {qs_start_week}-{qs_end_week} of {qs_season} against real results..."):
+                    try:
+                        st.session_state.qs_report = build_season_accuracy_report(
+                            int(qs_season), weeks=qs_weeks,
+                            coverage_bundle=st.session_state.get("coverage_bundle"),
+                            rb_bundle=st.session_state.get("rb_bundle"),
+                        )
+                        n_rows = len(st.session_state.qs_report["raw"])
+                        st.success(f"Scored {n_rows} rows across weeks {qs_start_week}-{qs_end_week} of {qs_season}.")
+                    except Exception as e:
+                        st.error(f"Quality score validation failed: {e}")
+                        st.session_state.qs_report = None
+
+        qs_report = st.session_state.get("qs_report")
+        if qs_report:
+            if not qs_report["by_quality_tier"].empty:
+                st.markdown("**By quality tier** (mean abs miss + match_ratio per tier - should get "
+                            "tighter as quality_score rises; an inversion here is the failure mode "
+                            "to watch for)")
+                st.dataframe(
+                    qs_report["by_quality_tier"].style.background_gradient(
+                        subset=[c for c in qs_report["by_quality_tier"].columns if "miss" in c.lower()], cmap="RdYlGn_r"),
+                    width='stretch',
+                )
+            if not qs_report["by_prop_type"].empty:
+                st.markdown("**By prop type**")
+                st.dataframe(qs_report["by_prop_type"], width='stretch')
+            adj_acc = qs_report.get("adjustment_direction_accuracy")
+            if adj_acc is not None:
+                st.metric("Adjustment direction accuracy", f"{adj_acc:.1%}" if isinstance(adj_acc, (int, float)) else adj_acc)
+            rv = qs_report.get("role_verification_check")
+            if rv is not None and not getattr(rv, "empty", True):
+                st.markdown("**Role verification check**")
+                st.dataframe(rv, width='stretch')
 
         st.divider()
         st.caption("⬇️ Below this point is the detailed single-matchup report builder - pick a "
