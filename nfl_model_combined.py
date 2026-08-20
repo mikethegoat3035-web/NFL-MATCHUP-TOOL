@@ -2344,7 +2344,7 @@ ENABLE_PERSONNEL_IN_QUALITY_SCORE = True  # RE-ENABLED - PA confirmed clean alon
 # test this alone first (weeks 4-18 season report, check
 # adjustment_direction_accuracy + quality tier monotonicity for an
 # inversion) before touching either of the other two.
-ENABLE_ALIGNMENT_IN_QUALITY_SCORE = True
+ENABLE_ALIGNMENT_IN_QUALITY_SCORE = False
 
 # QB coverage exploit signal (no alignment axis) - STAYS OFF until
 # alignment above is confirmed clean on its own live test. Round 2.
