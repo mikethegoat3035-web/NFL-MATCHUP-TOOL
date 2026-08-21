@@ -2761,7 +2761,8 @@ def calc_blended_matchup_strength(structural_exploit: float, grade_exploit: floa
     return round(matchup_signal * matchup_weight + role_verification_score * (1 - matchup_weight), 3)
 
 
-def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=None) -> pd.DataFrame:
+def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=None,
+                        team_filter: list = None) -> pd.DataFrame:
     """
     Pulls and merges every data source needed for one week's slate, returning
     a single player-level DataFrame with mu inputs for every prop type ready
@@ -2770,6 +2771,18 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
     Best Edges table (avoids repeating the unreliable Underdog auto-pull
     issue; PrizePicks auto-pull can be tested later once this core scanner
     is proven out).
+
+    team_filter: optional list of team abbreviations (e.g. ["KC", "BAL"]) -
+    REAL per-game scanning, not just a display filter. When provided,
+    every player pool's loop skips scoring for any player whose team
+    isn't in this list, before any of the expensive per-player work
+    (percentile grades, coverage/box adjustments, crosswalk scoring)
+    happens - this is what actually reduces compute for a single-game
+    scan, not just narrowing what gets shown afterward. The underlying
+    weekly data pulls (rosters/player_stats/NGS/participation) still
+    cover the whole week regardless - that part's comparatively cheap;
+    the per-player scoring loop is the expensive part this actually
+    targets. None (default) scans every team, unchanged from before.
 
     coverage_bundle: optional CoverageDataBundle (coverage_matchup.py's
     load_full_dataset() output) - the premium alignment/coverage dataset.
@@ -2936,6 +2949,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
     for _, qb in qb_pool.iterrows():
         gsis_id = qb.get("gsis_id")
         team = qb.get("team")
+        if team_filter and team not in team_filter:
+            continue
         mu = calc_prop_mu(
             gsis_id, "passing_yards", player_stats_df, season, week, current_team=team,
             league_fallback_mu=fallback_mus.get(("QB", "passing_yards")),
@@ -3154,6 +3169,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
         gsis_id = rb.get("gsis_id")
         position = rb.get("position")
         rb_team = rb.get("team")
+        if team_filter and rb_team not in team_filter:
+            continue
         mu = calc_prop_mu(
             gsis_id, "rushing_yards", player_stats_df, season, week, current_team=rb_team,
             league_fallback_mu=fallback_mus.get((position, "rushing_yards")),
@@ -3298,6 +3315,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
         gsis_id = wr.get("gsis_id")
         position = wr.get("position")
         team = wr.get("team")
+        if team_filter and team not in team_filter:
+            continue
         mu = calc_prop_mu(
             gsis_id, "receiving_yards", player_stats_df, season, week, current_team=team,
             league_fallback_mu=fallback_mus.get((position, "receiving_yards")),
@@ -3480,6 +3499,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
     fantasy_pool_roster = week_rosters[week_rosters["position"].isin(offense_positions)]
     for _, pr in fantasy_pool_roster.iterrows():
         gsis_id = pr.get("gsis_id")
+        if team_filter and pr.get("team") not in team_filter:
+            continue
         recent_games = player_stats_df[
             (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season)
             & (player_stats_df["week"] < week)
@@ -3522,6 +3543,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
     kicker_pool = week_rosters[week_rosters["position"] == "K"]
     for _, kr in kicker_pool.iterrows():
         gsis_id = kr.get("gsis_id")
+        if team_filter and kr.get("team") not in team_filter:
+            continue
         recent_games = player_stats_df[
             (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season)
             & (player_stats_df["week"] < week)
@@ -3866,7 +3889,8 @@ def build_league_fallback_sigmas(player_stats_df: pd.DataFrame, season: int,
 # 7. FULL SLATE SCAN (mirrors scan_full_slate_quality_mu from MLB tool)
 # ---------------------------------------------------------------------------
 
-def scan_full_slate_nfl(season: int, week: int, coverage_bundle=None, rb_bundle=None) -> pd.DataFrame:
+def scan_full_slate_nfl(season: int, week: int, coverage_bundle=None, rb_bundle=None,
+                         team_filter: list = None) -> pd.DataFrame:
     """
     Weekly full-slate scanner. Builds the slate (see build_weekly_slate),
     but does NOT auto-fill lines or compute edge/p_over - those are added
@@ -3878,8 +3902,13 @@ def scan_full_slate_nfl(season: int, week: int, coverage_bundle=None, rb_bundle=
     coverage_bundle, rb_bundle: passed straight through to
     build_weekly_slate - see that function's docstring. Optional; omitting
     either just means that signal stays off even if its flag is on.
+
+    team_filter: passed straight through to build_weekly_slate - real
+    per-game scanning (skips the expensive per-player scoring loop for
+    every team not in the list), not just a post-scan display filter.
     """
-    slate_df = build_weekly_slate(season, week, coverage_bundle=coverage_bundle, rb_bundle=rb_bundle)
+    slate_df = build_weekly_slate(season, week, coverage_bundle=coverage_bundle, rb_bundle=rb_bundle,
+                                   team_filter=team_filter)
     slate_df["line"] = np.nan  # user fills this in per row in the UI
     slate_df["p_over"] = np.nan
     slate_df["edge"] = np.nan
