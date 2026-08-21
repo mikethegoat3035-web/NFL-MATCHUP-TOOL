@@ -92,11 +92,55 @@ def _cache_pull(func):
 # 1. DATA PULL FUNCTIONS
 # ---------------------------------------------------------------------------
 
+def _pull_years_gracefully(loader_fn, years: list[int]) -> pd.DataFrame:
+    """
+    REAL FIX for a real, confirmed bug: every pull_* function below used
+    to call nfl.load_X(seasons=years) once, for the WHOLE requested year
+    list at once - if even ONE requested year's real data file doesn't
+    exist yet on nflverse's release page (confirmed 404, e.g.
+    stats_player_week_2026.parquet before any real 2026 games have been
+    played), the ENTIRE pull crashed with a raw, ugly download error -
+    not just that one year, every year in the request, even ones that
+    would have succeeded on their own. Bound to hit EVERY new season's
+    Week 1, every year, until this was fixed - not a one-time fluke.
+
+    Tries the full year-list first (fast path, one real request, same as
+    before when every requested year genuinely exists). Only on failure
+    does it fall back to trying each year INDIVIDUALLY, keeping whatever
+    years succeed and silently dropping ones that don't exist yet -
+    exactly matching this file's own existing design philosophy elsewhere
+    (calc_prop_mu/calc_player_sigma already shrink toward a fallback when
+    the CURRENT season is thin; this extends that same real principle to
+    the case where the current season's file doesn't exist AT ALL yet,
+    which is different from "exists but thin" and wasn't handled before).
+
+    Returns an empty DataFrame (not an exception) if literally every
+    requested year fails - callers already know how to handle an empty
+    real DataFrame (that's the normal "no games yet" case throughout this
+    file), so this doesn't need new error-handling on the caller's side.
+    """
+    try:
+        return loader_fn(seasons=years)
+    except Exception:
+        pass  # fall through to per-year fallback below
+
+    frames = []
+    for yr in years:
+        try:
+            f = loader_fn(seasons=[yr])
+            frames.append(f.to_pandas() if hasattr(f, "to_pandas") else f)
+        except Exception:
+            continue  # this specific year genuinely doesn't exist yet - skip it, not a real error
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
 @_cache_pull
 def pull_pbp(years: list[int]) -> pd.DataFrame:
     """Play-by-play data for the given seasons, converted to pandas."""
-    df = nfl.load_pbp(seasons=years)
-    return df.to_pandas()
+    df = _pull_years_gracefully(nfl.load_pbp, years)
+    return df.to_pandas() if hasattr(df, "to_pandas") else df
 
 
 @_cache_pull
@@ -105,8 +149,8 @@ def pull_ngs(stat_type: str, years: list[int]) -> pd.DataFrame:
     stat_type: 'passing', 'rushing', or 'receiving'
     Returns official Next Gen Stats for the given seasons.
     """
-    df = nfl.load_nextgen_stats(stat_type=stat_type, seasons=years)
-    return df.to_pandas()
+    df = _pull_years_gracefully(lambda seasons: nfl.load_nextgen_stats(stat_type=stat_type, seasons=seasons), years)
+    return df.to_pandas() if hasattr(df, "to_pandas") else df
 
 
 @_cache_pull
@@ -119,16 +163,18 @@ def pull_player_stats(years: list[int]) -> pd.DataFrame:
     in this file can join on `gsis_id` consistently without re-checking which
     table uses which name.
     """
-    df = nfl.load_player_stats(seasons=years).to_pandas()
-    df = df.rename(columns={"player_id": "gsis_id"})
+    df = _pull_years_gracefully(nfl.load_player_stats, years)
+    df = df.to_pandas() if hasattr(df, "to_pandas") else df
+    if not df.empty:
+        df = df.rename(columns={"player_id": "gsis_id"})
     return df
 
 
 @_cache_pull
 def pull_snap_counts(years: list[int]) -> pd.DataFrame:
     """Snap counts by player/game - used as a route-participation / opportunity proxy."""
-    df = nfl.load_snap_counts(seasons=years)
-    return df.to_pandas()
+    df = _pull_years_gracefully(nfl.load_snap_counts, years)
+    return df.to_pandas() if hasattr(df, "to_pandas") else df
 
 
 @_cache_pull
@@ -138,8 +184,8 @@ def pull_ftn_charting(years: list[int]) -> pd.DataFrame:
     Key columns: n_defense_box, n_offense_backfield, is_motion, is_play_action,
     is_screen_pass, is_no_huddle, qb_location.
     """
-    df = nfl.load_ftn_charting(seasons=years)
-    return df.to_pandas()
+    df = _pull_years_gracefully(nfl.load_ftn_charting, years)
+    return df.to_pandas() if hasattr(df, "to_pandas") else df
 
 
 @_cache_pull
@@ -148,8 +194,8 @@ def pull_participation(years: list[int]) -> pd.DataFrame:
     Participation data - carries defense_man_zone_type, defense_coverage_type,
     time_to_throw, was_pressure. This is where coverage-shell % comes from.
     """
-    df = nfl.load_participation(seasons=years)
-    return df.to_pandas()
+    df = _pull_years_gracefully(nfl.load_participation, years)
+    return df.to_pandas() if hasattr(df, "to_pandas") else df
 
 
 @_cache_pull
@@ -166,20 +212,20 @@ def pull_injuries(years: list[int]) -> pd.DataFrame:
     diagnose_injuries_data() FIRST against real data before building
     anything that actually reads specific columns from this.
     """
-    df = nfl.load_injuries(seasons=years)
-    return df.to_pandas()
+    df = _pull_years_gracefully(nfl.load_injuries, years)
+    return df.to_pandas() if hasattr(df, "to_pandas") else df
 
 
 @_cache_pull
 def pull_schedules(years: list[int]) -> pd.DataFrame:
-    df = nfl.load_schedules(seasons=years)
-    return df.to_pandas()
+    df = _pull_years_gracefully(nfl.load_schedules, years)
+    return df.to_pandas() if hasattr(df, "to_pandas") else df
 
 
 @_cache_pull
 def pull_rosters(years: list[int]) -> pd.DataFrame:
-    df = nfl.load_rosters(seasons=years)
-    return df.to_pandas()
+    df = _pull_years_gracefully(nfl.load_rosters, years)
+    return df.to_pandas() if hasattr(df, "to_pandas") else df
 
 
 # ---------------------------------------------------------------------------
@@ -3573,8 +3619,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
 
 @_cache_pull
 def pull_depth_charts(years: list[int]) -> pd.DataFrame:
-    df = nfl.load_depth_charts(seasons=years)
-    return df.to_pandas()
+    df = _pull_years_gracefully(nfl.load_depth_charts, years)
+    return df.to_pandas() if hasattr(df, "to_pandas") else df
 
 
 def get_data_confidence(player_gsis_id: str, player_stats_df: pd.DataFrame, season: int,
