@@ -14,7 +14,7 @@ from nfl_model_combined import (
     diagnose_participation_data, get_player_matchup_explanation, diagnose_injuries_data,
     diagnose_alignment_data, pull_player_stats, pull_schedules, pull_pbp,
     build_coverage_crossref_game_log, diagnose_player_stats_for_game_log,
-    build_longest_play_by_game,
+    build_longest_play_by_game, build_week_games_list,
 )
 from draft_rankings import (
     build_yahoo_style_rankings, detect_risers, build_league_settings,
@@ -492,6 +492,46 @@ else:
     # and the real, working build_season_accuracy_report tool inside it -
     # has been permanently unreachable dead code, not something tonight's
     # changes broke. Always create both columns now.
+    # ---------------------------------------------------------------------
+    # Per-game scan picker - REAL per-game scanning (uses team_filter to
+    # skip the expensive per-player scoring loop for every team not
+    # picked), not just a display filter on an already-fully-scanned week.
+    # Uses the real schedule + build_week_games_list, which already
+    # existed in the backend but was never wired into any UI until now.
+    # ---------------------------------------------------------------------
+    st.subheader("Scan one game at a time")
+    try:
+        _picker_sched = pull_schedules([int(season)])
+        _week_games = build_week_games_list(int(season), int(week), _picker_sched)
+    except Exception:
+        _week_games = pd.DataFrame(columns=["away_team", "home_team", "matchup"])
+
+    if _week_games.empty:
+        st.caption("No games found for this season/week yet - check back once the schedule posts, or use "
+                   "\"Scan full slate\" below for everyone at once.")
+    else:
+        st.caption("Each box scans only that game's two teams - real per-game scanning, not a display "
+                   "filter on an already-scanned week. Use \"Scan full slate\" below instead if you want everyone at once.")
+        game_cols = st.columns(4)
+        for i, g in enumerate(_week_games.itertuples()):
+            with game_cols[i % 4]:
+                if st.button(g.matchup, key=f"game_box_{g.away_team}_{g.home_team}", use_container_width=True):
+                    with st.spinner(f"Scanning just {g.matchup}..."):
+                        try:
+                            st.session_state.slate_df = scan_full_slate_nfl(
+                                int(season), int(week),
+                                coverage_bundle=st.session_state.get("coverage_bundle"),
+                                rb_bundle=st.session_state.get("rb_bundle"),
+                                team_filter=[g.away_team, g.home_team],
+                            )
+                            st.session_state.backtest_mode = False
+                            st.session_state.show_season_report = False
+                            st.success(f"Loaded {len(st.session_state.slate_df)} prop rows for {g.matchup}.")
+                        except Exception as e:
+                            st.error(f"Scan failed: {e}")
+
+    st.divider()
+
     button_label = "Scan full slate"
     btn_col1, btn_col2 = st.columns(2)
 
