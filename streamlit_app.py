@@ -29,95 +29,99 @@ from rb_matchup import (
     CRUCIAL_RB_STATS,
 )
 
-st.set_page_config(page_title="Dallas Cowboys Matchup Tool", layout="wide", page_icon="⭐")
+st.set_page_config(page_title="NFL Matchup Tool", layout="wide", page_icon="🏈")
 
 # -----------------------------------------------------------------------
-# COWBOYS THEME - navy/silver/white color scheme + navy star accents.
+# DARK BLUE THEME - matches the MLB tool's look (dark background, blue
+# accents), replacing the earlier Cowboys navy/silver/WHITE-background
+# theme. Real fix, not just a rename: the old palette had two kinds of
+# color reference mixed together - some through these variables (easy to
+# redirect), but several were hardcoded light-mode assumptions directly
+# in the CSS below (#fafafa card backgrounds, #f0f0f0 borders, #8a8a8a/
+# #5a6b7a/#444 gray text meant to read on a WHITE page) that would have
+# looked genuinely broken - light boxes, low-contrast text - sitting on
+# a dark page if only the named variables were swapped. Every one of
+# those got a real dark-mode equivalent below, not left as-is.
 # This only restyles chrome (header, buttons, tabs, dataframe accents) -
 # the scanner itself still covers every NFL team/matchup; it doesn't
-# change what data is pulled or how anything is scored. No team logos/
-# wordmarks are used (would be copyrighted team IP), just the color
-# palette and a plain unicode star for the visual accent.
+# change what data is pulled or how anything is scored.
 # -----------------------------------------------------------------------
-COWBOYS_NAVY = "#041E42"
-COWBOYS_SILVER = "#869397"
-COWBOYS_WHITE = "#FFFFFF"
-COWBOYS_ACCENT_BLUE = "#7F9695"
+DARK_BG = "#0E1117"
+CARD_BG = "#1A1F2B"
+ACCENT_BLUE = "#3B82F6"
+TEXT_LIGHT = "#FAFAFA"
+MUTED_TEXT = "#9CA3AF"
+BORDER_DARK = "#2D3340"
 
 st.markdown(f"""
 <style>
     .stApp {{
-        background-color: {COWBOYS_WHITE};
+        background-color: {DARK_BG};
     }}
     [data-testid="stHeader"] {{
-        background-color: {COWBOYS_NAVY};
+        background-color: {CARD_BG};
     }}
     h1, h2, h3 {{
-        color: {COWBOYS_NAVY} !important;
+        color: {TEXT_LIGHT} !important;
     }}
     .stRadio > label, .stNumberInput > label, .stSelectbox > label {{
-        color: {COWBOYS_NAVY} !important;
+        color: {TEXT_LIGHT} !important;
         font-weight: 600;
     }}
     div.stButton > button {{
-        background-color: {COWBOYS_NAVY};
-        color: {COWBOYS_WHITE};
-        border: 1px solid {COWBOYS_SILVER};
+        background-color: {ACCENT_BLUE};
+        color: {TEXT_LIGHT};
+        border: 1px solid {BORDER_DARK};
         border-radius: 6px;
         font-weight: 600;
     }}
     div.stButton > button:hover {{
-        background-color: {COWBOYS_SILVER};
-        color: {COWBOYS_NAVY};
-        border: 1px solid {COWBOYS_NAVY};
+        background-color: {CARD_BG};
+        color: {ACCENT_BLUE};
+        border: 1px solid {ACCENT_BLUE};
     }}
-    /* Body text (markdown, write, caption) was defaulting to white in some
-       browser/theme combos, making report content invisible against the
-       forced-white app background - only headers (h1-h3, forced navy above)
-       were visible. This forces readable dark text everywhere EXCEPT
-       buttons, which stay white-on-navy via the more specific button rule
-       above (higher CSS specificity wins regardless of rule order). */
+    /* Body text (markdown, write, caption) reads light against the dark
+       app background - mirrors the same fix the old theme needed, just
+       inverted for a dark base instead of a light one. */
     .stApp, .stApp p, .stApp li, .stApp span,
     .stMarkdown, [data-testid="stMarkdownContainer"],
     [data-testid="stMarkdownContainer"] p,
     [data-testid="stCaptionContainer"],
     [data-testid="stCaptionContainer"] p {{
-        color: {COWBOYS_NAVY} !important;
+        color: {TEXT_LIGHT} !important;
     }}
-    /* BUG FIX: the rule above (needed to fix white-on-white report text)
-       was ALSO forcing navy text inside text inputs/text areas - but
-       those widgets keep Streamlit's own dark input background, so navy
-       text on a dark background was nearly unreadable (this is the
-       "dark, hard to read" bug reported when typing multiple player
-       names into a text area). Inputs get their own explicit light
-       color here, scoped narrowly so it doesn't leak back into report
-       text. -webkit-text-fill-color covers a real Chrome/Safari quirk
-       where autofill/theme styling can override plain color. */
     input, textarea,
     .stTextArea textarea, .stTextInput input, .stNumberInput input,
     [data-testid="stTextAreaContainer"] textarea,
     [data-testid="stTextInputRootElement"] input {{
-        color: {COWBOYS_WHITE} !important;
-        -webkit-text-fill-color: {COWBOYS_WHITE} !important;
+        color: {TEXT_LIGHT} !important;
+        -webkit-text-fill-color: {TEXT_LIGHT} !important;
     }}
-    /* Coverage Matchup - StatRankings CoverageIQ-style cards */
+    /* Coverage Matchup cards - real dark-mode equivalents, not just a
+       renamed light palette. Card backgrounds were #fff/#fafafa (light
+       boxes on white); now use the same dark card color as everywhere
+       else. Borders were light grays (#ddd/#f0f0f0) meant to be subtle
+       against white - now a dark border that's subtle against dark
+       instead. Gray label text (#5a6b7a/#8a8a8a/#444) was tuned for
+       readability on white - now uses MUTED_TEXT, tuned for readability
+       on dark. */
     .cov-card {{
-        background: {COWBOYS_WHITE};
-        border: 1px solid #ddd;
+        background: {CARD_BG};
+        border: 1px solid {BORDER_DARK};
         border-radius: 10px;
         padding: 16px 22px;
         margin-bottom: 18px;
-        box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+        box-shadow: 0 1px 4px rgba(0,0,0,0.3);
     }}
     .cov-card-header {{
         font-size: 19px;
         font-weight: 700;
-        color: {COWBOYS_NAVY};
+        color: {TEXT_LIGHT};
         margin-bottom: 2px;
     }}
     .cov-card-usage {{
         font-size: 13px;
-        color: #5a6b7a;
+        color: {MUTED_TEXT};
         margin-bottom: 6px;
     }}
     .cov-z-badge {{
@@ -126,13 +130,13 @@ st.markdown(f"""
         border-radius: 10px;
         font-size: 12px;
         font-weight: 700;
-        color: {COWBOYS_WHITE};
-        background: {COWBOYS_NAVY};
+        color: {TEXT_LIGHT};
+        background: {ACCENT_BLUE};
         margin-left: 6px;
     }}
     .cov-fit-warning {{
         font-size: 12px;
-        color: #b02a37;
+        color: #ff6b6b;
         font-weight: 600;
         margin-bottom: 8px;
     }}
@@ -142,15 +146,15 @@ st.markdown(f"""
         margin-top: 10px;
     }}
     .cov-align-block {{
-        background: #fafafa;
-        border: 1px solid #eee;
+        background: {DARK_BG};
+        border: 1px solid {BORDER_DARK};
         border-radius: 8px;
         padding: 10px 14px;
         margin-top: 10px;
     }}
     .cov-align-header {{
         font-weight: 700;
-        color: {COWBOYS_NAVY};
+        color: {TEXT_LIGHT};
         font-size: 13px;
         margin-bottom: 4px;
     }}
@@ -160,16 +164,16 @@ st.markdown(f"""
     }}
     .cov-col-title {{
         font-weight: 700;
-        color: {COWBOYS_NAVY};
+        color: {TEXT_LIGHT};
         font-size: 14px;
         margin-bottom: 6px;
         padding-bottom: 4px;
-        border-bottom: 2px solid {COWBOYS_NAVY};
+        border-bottom: 2px solid {ACCENT_BLUE};
     }}
     .cov-thin-flag {{
         font-size: 11px;
         font-weight: 700;
-        color: {COWBOYS_WHITE};
+        color: {TEXT_LIGHT};
         background: #b02a37;
         padding: 1px 6px;
         border-radius: 8px;
@@ -177,7 +181,7 @@ st.markdown(f"""
     }}
     .cov-no-data {{
         font-size: 13px;
-        color: #8a8a8a;
+        color: {MUTED_TEXT};
         font-style: italic;
     }}
     .stat-row {{
@@ -185,11 +189,11 @@ st.markdown(f"""
         justify-content: space-between;
         align-items: center;
         padding: 5px 0;
-        border-bottom: 1px solid #f0f0f0;
+        border-bottom: 1px solid {BORDER_DARK};
         font-size: 13px;
     }}
     .stat-label {{
-        color: #444;
+        color: {MUTED_TEXT};
         font-weight: 600;
     }}
     .stat-value {{
@@ -202,12 +206,12 @@ st.markdown(f"""
         border-radius: 12px;
         font-size: 11px;
         font-weight: 700;
-        color: {COWBOYS_WHITE};
+        color: {TEXT_LIGHT};
         white-space: nowrap;
     }}
     .tier-elite {{ background: #1b7a3d; }}
     .tier-above-avg {{ background: #66bb6a; }}
-    .tier-average {{ background: #8a8a8a; }}
+    .tier-average {{ background: #6b7280; }}
     .tier-below-avg {{ background: #ef8c1e; }}
     .tier-poor {{ background: #c0392b; }}
     .cov-more {{
@@ -217,7 +221,7 @@ st.markdown(f"""
         cursor: pointer;
         font-size: 11px;
         font-weight: 600;
-        color: #5a6b7a;
+        color: {MUTED_TEXT};
         list-style: none;
     }}
     .cov-more summary::-webkit-details-marker {{
@@ -230,21 +234,21 @@ st.markdown(f"""
         content: "▾ ";
     }}
     [data-testid="stMetricValue"] {{
-        color: {COWBOYS_NAVY};
+        color: {TEXT_LIGHT};
     }}
-    .cowboys-banner {{
-        background: linear-gradient(90deg, {COWBOYS_NAVY} 0%, {COWBOYS_SILVER} 100%);
+    .nfl-banner {{
+        background: linear-gradient(90deg, {CARD_BG} 0%, {ACCENT_BLUE} 100%);
         padding: 14px 20px;
         border-radius: 8px;
         margin-bottom: 12px;
     }}
-    .cowboys-banner h1 {{
-        color: {COWBOYS_WHITE} !important;
+    .nfl-banner h1 {{
+        color: {TEXT_LIGHT} !important;
         margin: 0;
         font-size: 28px;
     }}
-    .cowboys-banner p {{
-        color: {COWBOYS_WHITE} !important;
+    .nfl-banner p {{
+        color: {TEXT_LIGHT} !important;
         margin: 2px 0 0 0;
         opacity: 0.9;
     }}
@@ -252,10 +256,11 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 st.markdown(
-    '<div class="cowboys-banner"><h1>\u2605 Dallas Cowboys Matchup Tool</h1>'
+    '<div class="nfl-banner"><h1>🏈 NFL Matchup Tool</h1>'
     '<p>Scan a week\'s slate across the league, then type in lines per row for live edge/probability.</p></div>',
     unsafe_allow_html=True,
 )
+
 
 # DEPLOY VERSION MARKER - bump this string on every file delivered, so a
 # glance at the app tells you in 5 seconds whether a new deploy actually
@@ -476,12 +481,19 @@ if mode == "Draft Rankings":
 elif mode == "Coverage Matchup (premium data)":
     pass  # own section, rendered below alongside the Draft Rankings display block
 else:
-    button_label = "Run backtest" if mode.startswith("Backtest") else "Scan full slate"
-    if mode.startswith("Backtest"):
-        btn_col1, btn_col2 = st.columns(2)
-    else:
-        btn_col1 = st.container()
-        btn_col2 = None
+    # REAL BUG FOUND AND FIXED: this whole section (including the Season
+    # Readiness Report / "Run Readiness Report for this week range"
+    # button) was gated behind mode.startswith("Backtest") - but the
+    # separate "Backtest" mode option was removed from the mode selector
+    # a while back (consolidated elsewhere), and this check was never
+    # updated to match. Since this else-branch is only ever reached for
+    # "Scan (adjustable lines)" mode now (Draft Rankings and Coverage
+    # Matchup are both handled by earlier branches above), btn_col2 -
+    # and the real, working build_season_accuracy_report tool inside it -
+    # has been permanently unreachable dead code, not something tonight's
+    # changes broke. Always create both columns now.
+    button_label = "Scan full slate"
+    btn_col1, btn_col2 = st.columns(2)
 
     with btn_col1:
         if st.button(button_label, type="primary"):
@@ -544,6 +556,128 @@ else:
                         except Exception as e:
                             st.error(f"Season readiness report failed: {e}")
                             st.session_state.season_report = None
+
+# -----------------------------------------------------------------------
+# SEASON READINESS REPORT DISPLAY - pulled into a real function so it can
+# render in TWO places: standalone (if only the backtest has ever been
+# run, slate_df still empty) AND stacked directly below the live scan
+# results/Slip Builder/Locked Slips when BOTH have data - matching the
+# MLB tool's layout (live scan on top, backtest below, both visible
+# together on one page) instead of the old mutually-exclusive toggle
+# where running one hid the other entirely.
+# -----------------------------------------------------------------------
+def _render_season_report(report):
+    raw = report["raw"]
+
+    if raw.empty:
+        st.warning("No scoreable rows came back for this season - check that the season has completed weeks with real player_stats data.")
+        return
+    st.subheader(f"Season Readiness Report — {season}")
+    st.caption(
+        "Every starter row across every completed week, mu vs real result - not just "
+        "the biggest surprises. This is the pre-season calibration check: is "
+        "quality_score actually predictive, are the coverage/box mu adjustments "
+        "moving mu the right direction more than a coinflip, and is accuracy uneven "
+        "across any prop type or position. There's no free historical NFL prop-line "
+        "archive, so edge/lean itself can't be backtested against a real market line "
+        "- these are the checks that ARE possible without one."
+    )
+
+    rcol1, rcol2, rcol3 = st.columns(3)
+    with rcol1:
+        st.metric("Total scored rows", len(raw))
+    with rcol2:
+        st.metric("Mean absolute miss (all rows)", round(raw["abs_miss"].mean(), 1))
+    with rcol3:
+        adj_acc = report["adjustment_direction_accuracy"]
+        st.metric(
+            "mu-adjustment direction accuracy",
+            f"{adj_acc:.1%}" if pd.notna(adj_acc) else "n/a",
+            help="Of rows where the coverage/box adjustment actually moved mu, the % "
+                 "of the time that move was toward the real result. Should clear 50% "
+                 "by a real margin - if it doesn't, the adjustment isn't adding signal "
+                 "as currently weighted.",
+        )
+
+    st.markdown("**Accuracy by prop type** — is any specific prop systematically worse?")
+    st.dataframe(
+        report["by_prop_type"].style.background_gradient(subset=["mean_abs_miss"], cmap="RdYlGn_r"),
+        width='stretch',
+    )
+
+    st.markdown("**Accuracy by position**")
+    st.dataframe(
+        report["by_position"].style.background_gradient(subset=["mean_abs_miss"], cmap="RdYlGn_r"),
+        width='stretch',
+    )
+
+    if not report["by_quality_tier"].empty:
+        st.markdown(
+            "**Is quality_score actually predictive?** Higher tiers should show "
+            "tighter/more favorable misses than lower tiers - if they don't, "
+            "quality_score isn't earning its keep as currently weighted."
+        )
+        st.dataframe(
+            report["by_quality_tier"].style.background_gradient(
+                subset=["mean_abs_miss", "mean_match_ratio"], cmap="RdYlGn_r"
+            ),
+            width='stretch',
+        )
+        st.caption(
+            "Color both columns for a reason: mean_abs_miss alone can mislead - it's "
+            "naturally bigger for high-volume players regardless of tier, so a tier full "
+            "of bell-cow RBs can look green without actually being more accurate. "
+            "mean_match_ratio (miss scaled to that player's own normal variance) is the "
+            "real apples-to-apples check - if IT climbs (gets worse/redder) as the tier "
+            "goes up, quality_score is overconfident at the top even if raw miss looks fine."
+        )
+
+    if not report["role_verification_check"].empty:
+        st.markdown("**Does the role-verification trend signal add real accuracy?**")
+        st.dataframe(report["role_verification_check"], width='stretch')
+
+    with st.expander("Every scored row (raw)"):
+        st.dataframe(raw, width='stretch')
+
+    st.markdown("---")
+    st.markdown("**Filtered check** — set your own floor and see if it actually tightens the miss")
+    st.caption(
+        "games_sampled here means weeks of real history behind that row, scaled for a "
+        "17-game season - not the same '10' MLB used for a 162-game season. edge isn't "
+        "filterable here since there's no real line in a backtest row to compute it from."
+    )
+    fcol_q, fcol_g = st.columns(2)
+    with fcol_q:
+        min_quality_check = st.slider("Minimum quality_score", 0, 100, 70, 5, key="readiness_quality_filter")
+    with fcol_g:
+        min_games_check = st.slider("Minimum games_sampled", 0, 17, 3, 1, key="readiness_games_filter")
+
+    check_cols = [c for c in ["player_display_name", "team", "position", "prop_type", "week",
+                               "mu", "actual", "miss", "abs_miss", "sigma", "match_ratio",
+                               "quality_score", "games_sampled"] if c in raw.columns]
+    filtered_check = raw[
+        (raw["quality_score"].fillna(0) >= min_quality_check)
+        & (raw["games_sampled"].fillna(0) >= min_games_check)
+    ][check_cols].sort_values("quality_score", ascending=False, na_position="last")
+
+    if filtered_check.empty:
+        st.info("No rows clear that floor - try lowering it.")
+    else:
+        fchk1, fchk2 = st.columns(2)
+        with fchk1:
+            st.metric(f"Rows at quality_score>={min_quality_check}", len(filtered_check))
+        with fchk2:
+            st.metric("Mean absolute miss (this subset)", round(filtered_check["abs_miss"].mean(), 1))
+        st.caption(
+            "Compare this mean absolute miss to the overall mean absolute miss above - if "
+            f"this quality_score>={min_quality_check} subset isn't meaningfully tighter than "
+            "the all-rows number, quality_score isn't separating good matchups from bad ones "
+            "yet at this threshold."
+        )
+        styled_check = filtered_check.style.background_gradient(subset=["abs_miss"], cmap="RdYlGn_r")
+        st.dataframe(styled_check, width='stretch')
+
+
 
 # -----------------------------------------------------------------------
 # DRAFT RANKINGS DISPLAY
@@ -689,120 +823,17 @@ if mode == "Draft Rankings":
     else:
         st.info("Click 'Build Draft Rankings' to generate your league-specific board.")
 
-# -----------------------------------------------------------------------
-# SEASON READINESS REPORT DISPLAY
-# -----------------------------------------------------------------------
-elif st.session_state.show_season_report and st.session_state.season_report is not None:
-    report = st.session_state.season_report
-    raw = report["raw"]
-
-    if raw.empty:
-        st.warning("No scoreable rows came back for this season - check that the season has completed weeks with real player_stats data.")
-    else:
-        st.subheader(f"Season Readiness Report — {season}")
-        st.caption(
-            "Every starter row across every completed week, mu vs real result - not just "
-            "the biggest surprises. This is the pre-season calibration check: is "
-            "quality_score actually predictive, are the coverage/box mu adjustments "
-            "moving mu the right direction more than a coinflip, and is accuracy uneven "
-            "across any prop type or position. There's no free historical NFL prop-line "
-            "archive, so edge/lean itself can't be backtested against a real market line "
-            "- these are the checks that ARE possible without one."
-        )
-
-        rcol1, rcol2, rcol3 = st.columns(3)
-        with rcol1:
-            st.metric("Total scored rows", len(raw))
-        with rcol2:
-            st.metric("Mean absolute miss (all rows)", round(raw["abs_miss"].mean(), 1))
-        with rcol3:
-            adj_acc = report["adjustment_direction_accuracy"]
-            st.metric(
-                "mu-adjustment direction accuracy",
-                f"{adj_acc:.1%}" if pd.notna(adj_acc) else "n/a",
-                help="Of rows where the coverage/box adjustment actually moved mu, the % "
-                     "of the time that move was toward the real result. Should clear 50% "
-                     "by a real margin - if it doesn't, the adjustment isn't adding signal "
-                     "as currently weighted.",
-            )
-
-        st.markdown("**Accuracy by prop type** — is any specific prop systematically worse?")
-        st.dataframe(
-            report["by_prop_type"].style.background_gradient(subset=["mean_abs_miss"], cmap="RdYlGn_r"),
-            width='stretch',
-        )
-
-        st.markdown("**Accuracy by position**")
-        st.dataframe(
-            report["by_position"].style.background_gradient(subset=["mean_abs_miss"], cmap="RdYlGn_r"),
-            width='stretch',
-        )
-
-        if not report["by_quality_tier"].empty:
-            st.markdown(
-                "**Is quality_score actually predictive?** Higher tiers should show "
-                "tighter/more favorable misses than lower tiers - if they don't, "
-                "quality_score isn't earning its keep as currently weighted."
-            )
-            st.dataframe(
-                report["by_quality_tier"].style.background_gradient(
-                    subset=["mean_abs_miss", "mean_match_ratio"], cmap="RdYlGn_r"
-                ),
-                width='stretch',
-            )
-            st.caption(
-                "Color both columns for a reason: mean_abs_miss alone can mislead - it's "
-                "naturally bigger for high-volume players regardless of tier, so a tier full "
-                "of bell-cow RBs can look green without actually being more accurate. "
-                "mean_match_ratio (miss scaled to that player's own normal variance) is the "
-                "real apples-to-apples check - if IT climbs (gets worse/redder) as the tier "
-                "goes up, quality_score is overconfident at the top even if raw miss looks fine."
-            )
-
-        if not report["role_verification_check"].empty:
-            st.markdown("**Does the role-verification trend signal add real accuracy?**")
-            st.dataframe(report["role_verification_check"], width='stretch')
-
-        with st.expander("Every scored row (raw)"):
-            st.dataframe(raw, width='stretch')
-
-        st.markdown("---")
-        st.markdown("**Filtered check** — set your own floor and see if it actually tightens the miss")
-        st.caption(
-            "games_sampled here means weeks of real history behind that row, scaled for a "
-            "17-game season - not the same '10' MLB used for a 162-game season. edge isn't "
-            "filterable here since there's no real line in a backtest row to compute it from."
-        )
-        fcol_q, fcol_g = st.columns(2)
-        with fcol_q:
-            min_quality_check = st.slider("Minimum quality_score", 0, 100, 70, 5, key="readiness_quality_filter")
-        with fcol_g:
-            min_games_check = st.slider("Minimum games_sampled", 0, 17, 3, 1, key="readiness_games_filter")
-
-        check_cols = [c for c in ["player_display_name", "team", "position", "prop_type", "week",
-                                   "mu", "actual", "miss", "abs_miss", "sigma", "match_ratio",
-                                   "quality_score", "games_sampled"] if c in raw.columns]
-        filtered_check = raw[
-            (raw["quality_score"].fillna(0) >= min_quality_check)
-            & (raw["games_sampled"].fillna(0) >= min_games_check)
-        ][check_cols].sort_values("quality_score", ascending=False, na_position="last")
-
-        if filtered_check.empty:
-            st.info("No rows clear that floor - try lowering it.")
-        else:
-            fchk1, fchk2 = st.columns(2)
-            with fchk1:
-                st.metric(f"Rows at quality_score>={min_quality_check}", len(filtered_check))
-            with fchk2:
-                st.metric("Mean absolute miss (this subset)", round(filtered_check["abs_miss"].mean(), 1))
-            st.caption(
-                "Compare this mean absolute miss to the overall mean absolute miss above - if "
-                f"this quality_score>={min_quality_check} subset isn't meaningfully tighter than "
-                "the all-rows number, quality_score isn't separating good matchups from bad ones "
-                "yet at this threshold."
-            )
-            styled_check = filtered_check.style.background_gradient(subset=["abs_miss"], cmap="RdYlGn_r")
-            st.dataframe(styled_check, width='stretch')
+elif (st.session_state.slate_df is None or st.session_state.slate_df.empty) \
+        and st.session_state.season_report is not None:
+    # Standalone case: backtest has been run, but the live scan never has
+    # (or its results were cleared) - nothing to stack it below yet, so it
+    # renders on its own, same as before. Checks season_report directly,
+    # NOT show_season_report (that flag flips back to False the instant
+    # the regular scan button is clicked, regardless of whether real
+    # backtest data still exists - reusing it here would silently hide
+    # the backtest again the moment a new scan runs, the exact problem
+    # this whole change is meant to fix).
+    _render_season_report(st.session_state.season_report)
 
 # -----------------------------------------------------------------------
 # Filters + editable table (Scan / Backtest modes)
@@ -1428,6 +1459,16 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
             if st.button("Clear ALL locked slips", key="nfl_clear_all_locked"):
                 st.session_state.nfl_locked_slips = []
                 st.rerun()
+
+    # Backtest stacked directly below the live scan/Slip Builder/Locked
+    # Slips, matching the MLB tool's layout (scan on top, backtest below,
+    # both visible together) - only when the backtest has actually been
+    # run at least once; otherwise nothing extra shows here. Checks
+    # season_report directly, not show_season_report - see the standalone
+    # branch above for why that flag specifically can't be reused here.
+    if st.session_state.season_report is not None:
+        st.divider()
+        _render_season_report(st.session_state.season_report)
 
 elif mode == "Coverage Matchup (premium data)":
     st.subheader("Coverage Matchup — Premium FantasyPoints Data")
