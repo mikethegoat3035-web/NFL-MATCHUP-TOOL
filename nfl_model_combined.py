@@ -3013,385 +3013,20 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
     # --- Passing props ---
     qb_pool = week_rosters[week_rosters["position"] == "QB"]
     for _, qb in qb_pool.iterrows():
-        gsis_id = qb.get("gsis_id")
-        team = qb.get("team")
-        if team_filter and team not in team_filter:
-            continue
-        mu = calc_prop_mu(
-            gsis_id, "passing_yards", player_stats_df, season, week, current_team=team,
-            league_fallback_mu=fallback_mus.get(("QB", "passing_yards")),
-        )
-        sigma = calc_player_sigma(
-            gsis_id, "passing_yards", player_stats_df, season, week, current_team=team,
-            league_fallback_sigma=fallback_sigmas.get(("QB", "passing_yards")),
-        )
-
-        opponent = get_opponent_this_week(team, season, week, schedules_df)
-        opp_coverage_row = None
-        if opponent is not None and not coverage_profile.empty:
-            match = coverage_profile[coverage_profile["defteam"] == opponent]
-            if not match.empty:
-                opp_coverage_row = match.iloc[0].to_dict()
-        coverage_info = calc_coverage_quality_score(opp_coverage_row, coverage_profile)
-        n_plays = opp_coverage_row.get("n_plays", 0) if opp_coverage_row else 0
-
-        # Play-action exploit: does THIS QB run PA often and perform well
-        # in it, AND is the opponent (specifically in whichever coverage
-        # they lean on most - falls back to their overall PA-allowed
-        # number if that coverage lacks a PA-specific sample) actually
-        # vulnerable to it. Averaged with the structural coverage-elevation
-        # signal above into one combined structural component, rather than
-        # replacing it - both are real, separate tendency signals.
-        qb_pa_row = qb_pa_profile[qb_pa_profile["gsis_id"] == gsis_id]
-        qb_pa_row = qb_pa_row.iloc[0].to_dict() if not qb_pa_row.empty else {}
-        def_pa_row = def_pa_profile[def_pa_profile["defteam"] == opponent]
-        def_pa_row = def_pa_row.iloc[0].to_dict() if not def_pa_row.empty else {}
-        playaction_info = calc_playaction_exploit_strength(
-            qb_pa_row, def_pa_row, coverage_pa_crosswalk, opponent, opp_coverage_row
-        )
-        # GATED per ENABLE_PLAYACTION_IN_QUALITY_SCORE - still computed and
-        # still attached to the row below for visibility, just excluded
-        # from scoring until validated (see feature-flag note above).
-        pa_exploit_for_scoring = playaction_info.get("exploit_strength") if ENABLE_PLAYACTION_IN_QUALITY_SCORE else np.nan
-
-        # QB coverage exploit signal - premium data, real outlier-coverage
-        # gated (see calc_qb_coverage_exploit_strength in
-        # coverage_matchup.py). GATED same as every other premium/isolated
-        # signal here - off by default pending its own live test.
-        qb_coverage_info = {"exploit_strength": np.nan, "outlier_coverages_checked": []}
-        if (ENABLE_QB_COVERAGE_IN_QUALITY_SCORE and coverage_bundle is not None
-                and calc_qb_coverage_exploit_strength is not None and opponent is not None):
-            qb_coverage_info = calc_qb_coverage_exploit_strength(
-                coverage_bundle, qb.get("full_name"), team, opponent,
+        try:
+            gsis_id = qb.get("gsis_id")
+            team = qb.get("team")
+            if team_filter and team not in team_filter:
+                continue
+            mu = calc_prop_mu(
+                gsis_id, "passing_yards", player_stats_df, season, week, current_team=team,
+                league_fallback_mu=fallback_mus.get(("QB", "passing_yards")),
             )
-        qb_coverage_exploit_for_scoring = qb_coverage_info.get("exploit_strength") if ENABLE_QB_COVERAGE_IN_QUALITY_SCORE else np.nan
-
-        structural_parts = [v for v in [coverage_info.get("exploit_strength"), pa_exploit_for_scoring,
-                                         qb_coverage_exploit_for_scoring] if pd.notna(v)]
-        combined_structural_exploit = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
-
-        # ACTUAL mu adjustment (not just a quality_score side signal) using
-        # this QB's own real man/zone efficiency split from their play
-        # history, weighted by this specific opponent's man/zone tendency.
-        # GATED per ENABLE_COVERAGE_MU_ADJUSTMENT (see flag note above) -
-        # still computed below when the gate check passes, so mu_before_
-        # coverage_adj stays available for comparison, just not applied.
-        adjusted_mu = mu
-        if ENABLE_COVERAGE_MU_ADJUSTMENT and pd.notna(mu) and opp_coverage_row:
-            man_pct = opp_coverage_row.get("man_pct")
-            zone_pct = opp_coverage_row.get("zone_pct")
-            if pd.notna(man_pct) and pd.notna(zone_pct):
-                coverage_eff = build_player_coverage_efficiency(
-                    gsis_id, "passer", season, participation_df, pbp_history_df,
-                    current_team=team, prior_participation_df=prior_participation_df,
-                    prior_pbp_df=prior_pbp_df,
-                )
-                adjusted_mu = calc_coverage_adjusted_mu(mu, coverage_eff, man_pct, zone_pct)
-
-        # NEW, SEPARATE full-coverage-type version - GATED per
-        # ENABLE_FULL_COVERAGE_MU_ADJUSTMENT, off by default pending its
-        # own live test. See rec_yards block for the full rationale.
-        full_coverage_weight_used = 0.0
-        if ENABLE_FULL_COVERAGE_MU_ADJUSTMENT and pd.notna(mu) and opp_coverage_row:
-            player_full_coverage_eff = build_player_full_coverage_efficiency(
-                gsis_id, "passer", participation_df, pbp_history_df,
+            sigma = calc_player_sigma(
+                gsis_id, "passing_yards", player_stats_df, season, week, current_team=team,
+                league_fallback_sigma=fallback_sigmas.get(("QB", "passing_yards")),
             )
-            full_cov_result = calc_full_coverage_adjusted_mu(adjusted_mu, player_full_coverage_eff, opp_coverage_row)
-            adjusted_mu = full_cov_result["adjusted_mu"]
-            full_coverage_weight_used = full_cov_result["coverage_weight_used"]
 
-        confidence_info = get_data_confidence(gsis_id, player_stats_df, season, week, current_team=team)
-        own_grades = get_player_grades(gsis_id, qb_metrics)
-        def_grades = get_defense_grades(opponent, def_metrics)
-
-        # PROE is team-level (posteam), not per-player, so it doesn't ride
-        # along with get_player_grades() the way gsis_id-keyed metrics do -
-        # looked up by team and merged in directly here.
-        if not proe_profile.empty:
-            team_proe = proe_profile[proe_profile["posteam"] == team]
-            if not team_proe.empty:
-                own_grades["proe_grade"] = team_proe.iloc[0].get("proe_grade")
-                own_grades["proe"] = team_proe.iloc[0].get("proe")
-
-        # Grade-based crosswalk (own skill grades vs opponent's allowed
-        # grades, tailored to pass_yards - see PROP_METRIC_CROSSWALK) and
-        # real-role verification (recent vs season pass-attempt volume),
-        # blended with the combined structural (coverage + play-action)
-        # exploit signal above - mirrors the MLB tool's pitch-crosswalk +
-        # lineup_verification blend.
-        grade_exploit = calc_grade_matchup_strength({**own_grades, **def_grades}, "pass_yards")
-        role_trend = build_role_trend(gsis_id, "attempts", ngs_pass_df, "player_gsis_id", season, week)
-        role_score = calc_role_verification_score(role_trend)
-        blended_exploit = calc_blended_matchup_strength(
-            combined_structural_exploit, grade_exploit, role_score
-        )
-        quality_score = calc_quality_score(
-            matchup_exploit_strength=blended_exploit,
-            sample_size_games=confidence_info["games_sampled_current"],  # this QB's own real sample - see calc_quality_score bugfix note
-            coverage_confidence=min(n_plays / 300, 1.0),
-        )
-        _record_quality_score(gsis_id, quality_score)
-
-        rows.append({
-            "gsis_id": gsis_id, "player_display_name": qb.get("full_name"),
-            "team": team, "position": "QB", "prop_type": "pass_yards",
-            "matchup": team_to_matchup.get(team),
-            "mu": adjusted_mu, "mu_before_coverage_adj": mu, "sigma": sigma, "opponent": opponent,
-            "opp_man_pct": opp_coverage_row.get("man_pct") if opp_coverage_row else np.nan,
-            "opp_zone_pct": opp_coverage_row.get("zone_pct") if opp_coverage_row else np.nan,
-            "opp_dominant_coverage": coverage_info["dominant_coverage"],
-            "opp_dominant_coverage_pct": coverage_info["dominant_coverage_pct"],
-            "opp_num_elevated_coverages": coverage_info.get("num_elevated_coverages", 0),
-            "playaction_exploit_strength": playaction_info.get("exploit_strength"),
-            "playaction_used_coverage_specific_data": playaction_info.get("used_coverage_specific_playaction_data"),
-            "qb_coverage_exploit_strength": qb_coverage_info.get("exploit_strength"),
-            "qb_coverage_outliers_checked": qb_coverage_info.get("outlier_coverages_checked"),
-            "full_coverage_weight_used": full_coverage_weight_used,
-            "quality_score": quality_score,
-            "grade_matchup_strength": grade_exploit,
-            "role_verification_score": role_score,
-            "role_trend_ratio": role_trend.get("trend_ratio"),
-            "data_confidence": confidence_info["data_confidence"],
-            "games_sampled_current": confidence_info["games_sampled_current"],
-            **get_full_coverage_breakdown(opp_coverage_row),
-            **own_grades,
-            **def_grades,
-        })
-
-        # --- Sibling QB count/longest props (completions, attempts, TDs,
-        # longest completion) - reuse the SAME matchup signals just
-        # computed for pass_yards (structural coverage/PA/QB-coverage
-        # exploit, grade crosswalk, role verification, quality_score)
-        # rather than recomputing a full independent stack per prop. This
-        # is a deliberate simplification: these are all facets of the same
-        # underlying passing matchup, not fundamentally different
-        # matchups - documented here rather than silently assumed. mu/
-        # sigma themselves ARE independently computed per prop (real
-        # per-stat shrinkage, not copied from pass_yards).
-        # REAL FIX (was: blanket inheritance from pass_yards for all three) -
-        # pass_completions/pass_attempts now get their OWN real
-        # quality_score, computed fresh from the tailored crosswalk
-        # entries just added above (volume/game-script signals - PROE,
-        # pressure faced, CPOE - not pass_yards' efficiency/explosive-
-        # play grades, which measure a genuinely different thing). Same
-        # blended_matchup_strength/role_verification/sample-size formula
-        # as every other quality_score in this file, just fed a different
-        # grade_exploit input. pass_tds is deliberately LEFT on the
-        # inherited pass_yards quality_score for now - not yet given its
-        # own crosswalk, an honest, stated gap rather than a silent one.
-        merged_grades = {**own_grades, **def_grades}
-        for sib_prop, sib_col in (("pass_completions", "completions"),
-                                   ("pass_attempts", "attempts"),
-                                   ("pass_tds", "passing_tds")):
-            sib_mu = calc_prop_mu(
-                gsis_id, sib_col, player_stats_df, season, week, current_team=team,
-                league_fallback_mu=fallback_mus.get(("QB", sib_col)),
-            )
-            sib_sigma = calc_player_sigma(
-                gsis_id, sib_col, player_stats_df, season, week, current_team=team,
-                league_fallback_sigma=fallback_sigmas.get(("QB", sib_col)),
-            )
-            if sib_prop in PROP_METRIC_CROSSWALK:
-                sib_grade_exploit = calc_grade_matchup_strength(merged_grades, sib_prop)
-                sib_blended = calc_blended_matchup_strength(combined_structural_exploit, sib_grade_exploit, role_score)
-                sib_quality_score = calc_quality_score(
-                    matchup_exploit_strength=sib_blended,
-                    sample_size_games=confidence_info["games_sampled_current"],
-                    coverage_confidence=min(n_plays / 300, 1.0),
-                )
-                _record_quality_score(gsis_id, sib_quality_score)
-            else:
-                sib_grade_exploit, sib_quality_score = grade_exploit, quality_score
-            rows.append({
-                "gsis_id": gsis_id, "player_display_name": qb.get("full_name"),
-                "team": team, "position": "QB", "prop_type": sib_prop,
-                "matchup": team_to_matchup.get(team),
-                "mu": sib_mu, "sigma": sib_sigma, "opponent": opponent,
-                "quality_score": sib_quality_score,
-                "grade_matchup_strength": sib_grade_exploit,
-                "role_verification_score": role_score,
-                "data_confidence": confidence_info["data_confidence"],
-                "games_sampled_current": confidence_info["games_sampled_current"],
-            })
-
-        # Longest completion - own-history-only (see qb_longest_df note
-        # above: no prior-season bridge yet), so min_games gates it more
-        # often than the other props for thin-sample QBs.
-        longest_mu = calc_prop_mu(gsis_id, "longest_play", qb_longest_df, season, week, current_team=None)
-        longest_sigma = calc_player_sigma(gsis_id, "longest_play", qb_longest_df, season, week, current_team=None)
-        rows.append({
-            "gsis_id": gsis_id, "player_display_name": qb.get("full_name"),
-            "team": team, "position": "QB", "prop_type": "longest_completion",
-            "matchup": team_to_matchup.get(team),
-            "mu": longest_mu, "sigma": longest_sigma, "opponent": opponent,
-            "quality_score": quality_score,
-            "data_confidence": confidence_info["data_confidence"],
-            "games_sampled_current": confidence_info["games_sampled_current"],
-        })
-
-    # --- Rushing props ---
-    rush_pool = week_rosters[week_rosters["position"].isin(["RB", "QB"])]
-    for _, rb in rush_pool.iterrows():
-        gsis_id = rb.get("gsis_id")
-        position = rb.get("position")
-        rb_team = rb.get("team")
-        if team_filter and rb_team not in team_filter:
-            continue
-        mu = calc_prop_mu(
-            gsis_id, "rushing_yards", player_stats_df, season, week, current_team=rb_team,
-            league_fallback_mu=fallback_mus.get((position, "rushing_yards")),
-        )
-        sigma = calc_player_sigma(
-            gsis_id, "rushing_yards", player_stats_df, season, week, current_team=rb_team,
-            league_fallback_sigma=fallback_sigmas.get((position, "rushing_yards")),
-        )
-        if pd.notna(mu):  # skip QBs/RBs with no real rushing history at all
-            rb_opponent = get_opponent_this_week(rb_team, season, week, schedules_df)
-            opp_box_row = None
-            if rb_opponent is not None and not box_def_profile.empty:
-                match = box_def_profile[box_def_profile["defteam"] == rb_opponent]
-                if not match.empty:
-                    opp_box_row = match.iloc[0].to_dict()
-            box_info = calc_box_quality_score(opp_box_row, box_def_profile)
-            n_box_plays = opp_box_row.get("n_plays", 0) if opp_box_row else 0
-
-            # ACTUAL mu adjustment using this RB's own real light-vs-stacked
-            # box yards-per-carry split, weighted by this week's opponent's
-            # stacked-box rate - run-game equivalent of the QB/WR coverage
-            # adjustment above. GATED per ENABLE_BOX_MU_ADJUSTMENT (see flag
-            # note above) - still computed below so mu_before_box_adj stays
-            # available for comparison, just not applied to mu itself.
-            adjusted_rush_mu = mu
-            if ENABLE_BOX_MU_ADJUSTMENT and opp_box_row and pd.notna(box_info.get("box_stack_pct")):
-                box_eff = build_player_rush_box_efficiency(
-                    gsis_id, season, ftn_df, pbp_history_df,
-                    current_team=rb_team, prior_ftn_df=prior_ftn_df, prior_pbp_df=prior_pbp_df,
-                )
-                adjusted_rush_mu = calc_box_adjusted_mu(mu, box_eff, box_info.get("box_stack_pct"))
-
-            # Run-concept exploit signal - premium data, only computed when
-            # a bundle was actually passed in AND the flag is on (see
-            # calc_run_concept_exploit_strength in rb_matchup.py for the
-            # real logic). GATED same as every other premium/isolated
-            # signal - off by default pending its own live test. Position
-            # check mirrors rush_pool's own RB/QB filter (QBs rarely have
-            # FantasyPoints run-concept rows, so this will naturally
-            # degrade to NaN for most QB rush_yards rows).
-            run_concept_info = {"exploit_strength": np.nan, "concepts_checked": []}
-            if (ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE and rb_bundle is not None
-                    and calc_run_concept_exploit_strength is not None and rb_opponent is not None):
-                run_concept_info = calc_run_concept_exploit_strength(
-                    rb_bundle, rb.get("full_name"), rb_team, rb_opponent,
-                )
-            run_concept_exploit_for_scoring = run_concept_info.get("exploit_strength") if ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE else np.nan
-
-            rb_confidence_info = get_data_confidence(gsis_id, player_stats_df, season, week, current_team=rb_team)
-            own_grades = get_player_grades(gsis_id, rb_metrics)
-            def_grades = get_defense_grades(rb_opponent, def_metrics)
-
-            grade_exploit = calc_grade_matchup_strength({**own_grades, **def_grades}, "rush_yards")
-            role_trend = build_role_trend(gsis_id, "rush_attempts", ngs_rush_df, "player_gsis_id", season, week)
-            role_score = calc_role_verification_score(role_trend)
-            structural_parts = [v for v in [box_info.get("exploit_strength"), run_concept_exploit_for_scoring]
-                                 if pd.notna(v)]
-            combined_rush_structural = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
-            blended_exploit = calc_blended_matchup_strength(
-                combined_rush_structural, grade_exploit, role_score
-            )
-            rush_quality_score = calc_quality_score(
-                matchup_exploit_strength=blended_exploit,
-                sample_size_games=rb_confidence_info["games_sampled_current"],  # this RB's own real sample - see calc_quality_score bugfix note
-                coverage_confidence=min(n_box_plays / 300, 1.0),
-            )
-            _record_quality_score(gsis_id, rush_quality_score)
-
-            rows.append({
-                "gsis_id": gsis_id, "player_display_name": rb.get("full_name"),
-                "team": rb.get("team"), "position": position, "prop_type": "rush_yards",
-                "matchup": team_to_matchup.get(rb_team),
-                "mu": adjusted_rush_mu, "mu_before_box_adj": mu, "sigma": sigma, "opponent": rb_opponent,
-                "opp_box_stack_pct": box_info.get("box_stack_pct"),
-                "opp_box_elevated": box_info.get("box_elevated"),
-                "run_concept_exploit_strength": run_concept_info.get("exploit_strength"),
-                "run_concepts_checked": run_concept_info.get("concepts_checked"),
-                "quality_score": rush_quality_score,
-                "grade_matchup_strength": grade_exploit,
-                "role_verification_score": role_score,
-                "role_trend_ratio": role_trend.get("trend_ratio"),
-                "data_confidence": rb_confidence_info["data_confidence"],
-                "games_sampled_current": rb_confidence_info["games_sampled_current"],
-                **own_grades,
-                **def_grades,
-            })
-
-            # --- Sibling rushing count/longest props (attempts, TDs,
-            # longest rush) - rush_attempts now gets its OWN real
-            # quality_score (game-script-focused crosswalk, see
-            # PROP_METRIC_CROSSWALK) instead of inheriting rush_yards'
-            # per-carry-skill grades wholesale. rush_tds stays inherited
-            # for now, same honest, stated gap as pass_tds.
-            merged_grades_rush = {**own_grades, **def_grades}
-            for sib_prop, sib_col in (("rush_attempts", "carries"), ("rush_tds", "rushing_tds")):
-                sib_mu = calc_prop_mu(
-                    gsis_id, sib_col, player_stats_df, season, week, current_team=rb_team,
-                    league_fallback_mu=fallback_mus.get((position, sib_col)),
-                )
-                sib_sigma = calc_player_sigma(
-                    gsis_id, sib_col, player_stats_df, season, week, current_team=rb_team,
-                    league_fallback_sigma=fallback_sigmas.get((position, sib_col)),
-                )
-                if sib_prop in PROP_METRIC_CROSSWALK:
-                    sib_grade_exploit = calc_grade_matchup_strength(merged_grades_rush, sib_prop)
-                    sib_blended = calc_blended_matchup_strength(combined_rush_structural, sib_grade_exploit, role_score)
-                    sib_quality_score = calc_quality_score(
-                        matchup_exploit_strength=sib_blended,
-                        sample_size_games=rb_confidence_info["games_sampled_current"],
-                        coverage_confidence=min(n_box_plays / 300, 1.0),
-                    )
-                    _record_quality_score(gsis_id, sib_quality_score)
-                else:
-                    sib_grade_exploit, sib_quality_score = grade_exploit, rush_quality_score
-                rows.append({
-                    "gsis_id": gsis_id, "player_display_name": rb.get("full_name"),
-                    "team": rb.get("team"), "position": position, "prop_type": sib_prop,
-                    "matchup": team_to_matchup.get(rb_team),
-                    "mu": sib_mu, "sigma": sib_sigma, "opponent": rb_opponent,
-                    "quality_score": sib_quality_score,
-                    "grade_matchup_strength": sib_grade_exploit,
-                    "role_verification_score": role_score,
-                    "data_confidence": rb_confidence_info["data_confidence"],
-                    "games_sampled_current": rb_confidence_info["games_sampled_current"],
-                })
-
-            longest_rush_mu = calc_prop_mu(gsis_id, "longest_play", rush_longest_df, season, week, current_team=None)
-            longest_rush_sigma = calc_player_sigma(gsis_id, "longest_play", rush_longest_df, season, week, current_team=None)
-            rows.append({
-                "gsis_id": gsis_id, "player_display_name": rb.get("full_name"),
-                "team": rb.get("team"), "position": position, "prop_type": "longest_rush",
-                "matchup": team_to_matchup.get(rb_team),
-                "mu": longest_rush_mu, "sigma": longest_rush_sigma, "opponent": rb_opponent,
-                "quality_score": rush_quality_score,
-                "data_confidence": rb_confidence_info["data_confidence"],
-                "games_sampled_current": rb_confidence_info["games_sampled_current"],
-            })
-
-    # --- Receiving props ---
-    rec_pool = week_rosters[week_rosters["position"].isin(["WR", "TE", "RB"])]
-    for _, wr in rec_pool.iterrows():
-        gsis_id = wr.get("gsis_id")
-        position = wr.get("position")
-        team = wr.get("team")
-        if team_filter and team not in team_filter:
-            continue
-        mu = calc_prop_mu(
-            gsis_id, "receiving_yards", player_stats_df, season, week, current_team=team,
-            league_fallback_mu=fallback_mus.get((position, "receiving_yards")),
-        )
-        sigma = calc_player_sigma(
-            gsis_id, "receiving_yards", player_stats_df, season, week, current_team=team,
-            league_fallback_sigma=fallback_sigmas.get((position, "receiving_yards")),
-        )
-        if pd.notna(mu):
             opponent = get_opponent_this_week(team, season, week, schedules_df)
             opp_coverage_row = None
             if opponent is not None and not coverage_profile.empty:
@@ -3401,85 +3036,106 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
             coverage_info = calc_coverage_quality_score(opp_coverage_row, coverage_profile)
             n_plays = opp_coverage_row.get("n_plays", 0) if opp_coverage_row else 0
 
-            # Personnel-grouping exploit: does this team's dominant
-            # personnel package (11/12/21 etc.) match up against a real
-            # weakness in THIS specific opponent's defense against that
-            # exact grouping - same crosswalk pattern as play-action for
-            # pass_yards, applied to personnel here since it's the more
-            # directly relevant tendency signal for receiving props.
-            personnel_info = calc_personnel_exploit_strength(
-                team, offense_personnel_tendency, opponent, defense_personnel_allowed
+            # Play-action exploit: does THIS QB run PA often and perform well
+            # in it, AND is the opponent (specifically in whichever coverage
+            # they lean on most - falls back to their overall PA-allowed
+            # number if that coverage lacks a PA-specific sample) actually
+            # vulnerable to it. Averaged with the structural coverage-elevation
+            # signal above into one combined structural component, rather than
+            # replacing it - both are real, separate tendency signals.
+            qb_pa_row = qb_pa_profile[qb_pa_profile["gsis_id"] == gsis_id]
+            qb_pa_row = qb_pa_row.iloc[0].to_dict() if not qb_pa_row.empty else {}
+            def_pa_row = def_pa_profile[def_pa_profile["defteam"] == opponent]
+            def_pa_row = def_pa_row.iloc[0].to_dict() if not def_pa_row.empty else {}
+            playaction_info = calc_playaction_exploit_strength(
+                qb_pa_row, def_pa_row, coverage_pa_crosswalk, opponent, opp_coverage_row
             )
-            # GATED per ENABLE_PERSONNEL_IN_QUALITY_SCORE - same isolation
-            # treatment as the play-action gate above.
-            personnel_exploit_for_scoring = personnel_info.get("exploit_strength") if ENABLE_PERSONNEL_IN_QUALITY_SCORE else np.nan
+            # GATED per ENABLE_PLAYACTION_IN_QUALITY_SCORE - still computed and
+            # still attached to the row below for visibility, just excluded
+            # from scoring until validated (see feature-flag note above).
+            pa_exploit_for_scoring = playaction_info.get("exploit_strength") if ENABLE_PLAYACTION_IN_QUALITY_SCORE else np.nan
 
-            # Alignment (Wide/Slot/Inline/Backfield) x real opponent
-            # outlier-coverage exploit signal - premium data, only computed
-            # when a bundle was actually passed in AND the flag is on
-            # (see calc_alignment_exploit_strength in coverage_matchup.py
-            # for the real logic). GATED same as PA/personnel - isolated,
-            # off by default pending its own live test.
-            alignment_info = {"exploit_strength": np.nan, "dominant_alignment": None, "alignment_fit_pct": None}
-            if (ENABLE_ALIGNMENT_IN_QUALITY_SCORE and coverage_bundle is not None
-                    and calc_alignment_exploit_strength is not None and opponent is not None):
-                alignment_info = calc_alignment_exploit_strength(
-                    coverage_bundle, wr.get("full_name"), position, team, opponent,
+            # QB coverage exploit signal - premium data, real outlier-coverage
+            # gated (see calc_qb_coverage_exploit_strength in
+            # coverage_matchup.py). GATED same as every other premium/isolated
+            # signal here - off by default pending its own live test.
+            qb_coverage_info = {"exploit_strength": np.nan, "outlier_coverages_checked": []}
+            if (ENABLE_QB_COVERAGE_IN_QUALITY_SCORE and coverage_bundle is not None
+                    and calc_qb_coverage_exploit_strength is not None and opponent is not None):
+                qb_coverage_info = calc_qb_coverage_exploit_strength(
+                    coverage_bundle, qb.get("full_name"), team, opponent,
                 )
-            alignment_exploit_for_scoring = alignment_info.get("exploit_strength") if ENABLE_ALIGNMENT_IN_QUALITY_SCORE else np.nan
+            qb_coverage_exploit_for_scoring = qb_coverage_info.get("exploit_strength") if ENABLE_QB_COVERAGE_IN_QUALITY_SCORE else np.nan
 
-            structural_parts = [v for v in [coverage_info.get("exploit_strength"), personnel_exploit_for_scoring,
-                                             alignment_exploit_for_scoring] if pd.notna(v)]
+            structural_parts = [v for v in [coverage_info.get("exploit_strength"), pa_exploit_for_scoring,
+                                             qb_coverage_exploit_for_scoring] if pd.notna(v)]
             combined_structural_exploit = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
 
-            # ACTUAL mu adjustment using this receiver's own real man/zone
-            # efficiency split, weighted by this specific opponent's tendency.
-            # GATED per ENABLE_COVERAGE_MU_ADJUSTMENT (see flag note above).
+            # ACTUAL mu adjustment (not just a quality_score side signal) using
+            # this QB's own real man/zone efficiency split from their play
+            # history, weighted by this specific opponent's man/zone tendency.
+            # GATED per ENABLE_COVERAGE_MU_ADJUSTMENT (see flag note above) -
+            # still computed below when the gate check passes, so mu_before_
+            # coverage_adj stays available for comparison, just not applied.
             adjusted_mu = mu
-            man_pct = opp_coverage_row.get("man_pct") if opp_coverage_row else None
-            zone_pct = opp_coverage_row.get("zone_pct") if opp_coverage_row else None
-            if ENABLE_COVERAGE_MU_ADJUSTMENT and pd.notna(man_pct) and pd.notna(zone_pct):
-                coverage_eff = build_player_coverage_efficiency(
-                    gsis_id, "receiver", season, participation_df, pbp_history_df,
-                    current_team=team, prior_participation_df=prior_participation_df,
-                    prior_pbp_df=prior_pbp_df,
-                )
-                adjusted_mu = calc_coverage_adjusted_mu(mu, coverage_eff, man_pct, zone_pct)
+            if ENABLE_COVERAGE_MU_ADJUSTMENT and pd.notna(mu) and opp_coverage_row:
+                man_pct = opp_coverage_row.get("man_pct")
+                zone_pct = opp_coverage_row.get("zone_pct")
+                if pd.notna(man_pct) and pd.notna(zone_pct):
+                    coverage_eff = build_player_coverage_efficiency(
+                        gsis_id, "passer", season, participation_df, pbp_history_df,
+                        current_team=team, prior_participation_df=prior_participation_df,
+                        prior_pbp_df=prior_pbp_df,
+                    )
+                    adjusted_mu = calc_coverage_adjusted_mu(mu, coverage_eff, man_pct, zone_pct)
 
             # NEW, SEPARATE full-coverage-type version - GATED per
-            # ENABLE_FULL_COVERAGE_MU_ADJUSTMENT, off by default pending
-            # its own live test. Applied on top of adjusted_mu (which is
-            # just `mu` unchanged while the man/zone version stays off) so
-            # this can be tested in isolation regardless of that flag's state.
+            # ENABLE_FULL_COVERAGE_MU_ADJUSTMENT, off by default pending its
+            # own live test. See rec_yards block for the full rationale.
             full_coverage_weight_used = 0.0
-            if ENABLE_FULL_COVERAGE_MU_ADJUSTMENT and opp_coverage_row:
+            if ENABLE_FULL_COVERAGE_MU_ADJUSTMENT and pd.notna(mu) and opp_coverage_row:
                 player_full_coverage_eff = build_player_full_coverage_efficiency(
-                    gsis_id, "receiver", participation_df, pbp_history_df,
+                    gsis_id, "passer", participation_df, pbp_history_df,
                 )
                 full_cov_result = calc_full_coverage_adjusted_mu(adjusted_mu, player_full_coverage_eff, opp_coverage_row)
                 adjusted_mu = full_cov_result["adjusted_mu"]
                 full_coverage_weight_used = full_cov_result["coverage_weight_used"]
 
-            rec_confidence_info = get_data_confidence(gsis_id, player_stats_df, season, week, current_team=team)
-            own_grades = get_player_grades(gsis_id, rec_metrics)
+            confidence_info = get_data_confidence(gsis_id, player_stats_df, season, week, current_team=team)
+            own_grades = get_player_grades(gsis_id, qb_metrics)
             def_grades = get_defense_grades(opponent, def_metrics)
 
-            grade_exploit = calc_grade_matchup_strength({**own_grades, **def_grades}, "rec_yards")
-            role_trend = build_role_trend(gsis_id, "target_share", player_stats_df, "gsis_id", season, week)
+            # PROE is team-level (posteam), not per-player, so it doesn't ride
+            # along with get_player_grades() the way gsis_id-keyed metrics do -
+            # looked up by team and merged in directly here.
+            if not proe_profile.empty:
+                team_proe = proe_profile[proe_profile["posteam"] == team]
+                if not team_proe.empty:
+                    own_grades["proe_grade"] = team_proe.iloc[0].get("proe_grade")
+                    own_grades["proe"] = team_proe.iloc[0].get("proe")
+
+            # Grade-based crosswalk (own skill grades vs opponent's allowed
+            # grades, tailored to pass_yards - see PROP_METRIC_CROSSWALK) and
+            # real-role verification (recent vs season pass-attempt volume),
+            # blended with the combined structural (coverage + play-action)
+            # exploit signal above - mirrors the MLB tool's pitch-crosswalk +
+            # lineup_verification blend.
+            grade_exploit = calc_grade_matchup_strength({**own_grades, **def_grades}, "pass_yards")
+            role_trend = build_role_trend(gsis_id, "attempts", ngs_pass_df, "player_gsis_id", season, week)
             role_score = calc_role_verification_score(role_trend)
             blended_exploit = calc_blended_matchup_strength(
                 combined_structural_exploit, grade_exploit, role_score
             )
             quality_score = calc_quality_score(
                 matchup_exploit_strength=blended_exploit,
-                sample_size_games=rec_confidence_info["games_sampled_current"],  # this receiver's own real sample - see calc_quality_score bugfix note
+                sample_size_games=confidence_info["games_sampled_current"],  # this QB's own real sample - see calc_quality_score bugfix note
                 coverage_confidence=min(n_plays / 300, 1.0),
             )
             _record_quality_score(gsis_id, quality_score)
 
             rows.append({
-                "gsis_id": gsis_id, "player_display_name": wr.get("full_name"),
-                "team": team, "position": position, "prop_type": "rec_yards",
+                "gsis_id": gsis_id, "player_display_name": qb.get("full_name"),
+                "team": team, "position": "QB", "prop_type": "pass_yards",
                 "matchup": team_to_matchup.get(team),
                 "mu": adjusted_mu, "mu_before_coverage_adj": mu, "sigma": sigma, "opponent": opponent,
                 "opp_man_pct": opp_coverage_row.get("man_pct") if opp_coverage_row else np.nan,
@@ -3487,118 +3143,474 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 "opp_dominant_coverage": coverage_info["dominant_coverage"],
                 "opp_dominant_coverage_pct": coverage_info["dominant_coverage_pct"],
                 "opp_num_elevated_coverages": coverage_info.get("num_elevated_coverages", 0),
-                "personnel_exploit_strength": personnel_info.get("exploit_strength"),
-                "dominant_personnel": personnel_info.get("dominant_personnel"),
-                "alignment_exploit_strength": alignment_info.get("exploit_strength"),
-                "dominant_alignment": alignment_info.get("dominant_alignment"),
-                "alignment_fit_pct": alignment_info.get("alignment_fit_pct"),
-                "alignment_outlier_coverages": alignment_info.get("outlier_coverages_checked"),
+                "playaction_exploit_strength": playaction_info.get("exploit_strength"),
+                "playaction_used_coverage_specific_data": playaction_info.get("used_coverage_specific_playaction_data"),
+                "qb_coverage_exploit_strength": qb_coverage_info.get("exploit_strength"),
+                "qb_coverage_outliers_checked": qb_coverage_info.get("outlier_coverages_checked"),
                 "full_coverage_weight_used": full_coverage_weight_used,
-                **get_full_coverage_breakdown(opp_coverage_row),
                 "quality_score": quality_score,
                 "grade_matchup_strength": grade_exploit,
                 "role_verification_score": role_score,
                 "role_trend_ratio": role_trend.get("trend_ratio"),
-                "data_confidence": rec_confidence_info["data_confidence"],
-                "games_sampled_current": rec_confidence_info["games_sampled_current"],
+                "data_confidence": confidence_info["data_confidence"],
+                "games_sampled_current": confidence_info["games_sampled_current"],
+                **get_full_coverage_breakdown(opp_coverage_row),
                 **own_grades,
                 **def_grades,
             })
 
-            # --- Sibling receiving count/longest props (receptions,
-            # targets, TDs, longest catch) - receptions/targets now get
-            # their OWN real quality_score (pure-opportunity crosswalk:
-            # target_share/WOPR, deliberately excluding separation/YAC-
-            # over-expectation, which measure what happens AFTER a target/
-            # catch, not how often he gets one - real noise for a volume
-            # prop). rec_tds stays inherited for now, same honest gap.
-            # Applies to WR/TE/RB alike since rec_pool already includes
-            # all three.
-            merged_grades_rec = {**own_grades, **def_grades}
-            for sib_prop, sib_col in (("receptions", "receptions"), ("targets", "targets"),
-                                       ("rec_tds", "receiving_tds")):
+            # --- Sibling QB count/longest props (completions, attempts, TDs,
+            # longest completion) - reuse the SAME matchup signals just
+            # computed for pass_yards (structural coverage/PA/QB-coverage
+            # exploit, grade crosswalk, role verification, quality_score)
+            # rather than recomputing a full independent stack per prop. This
+            # is a deliberate simplification: these are all facets of the same
+            # underlying passing matchup, not fundamentally different
+            # matchups - documented here rather than silently assumed. mu/
+            # sigma themselves ARE independently computed per prop (real
+            # per-stat shrinkage, not copied from pass_yards).
+            # REAL FIX (was: blanket inheritance from pass_yards for all three) -
+            # pass_completions/pass_attempts now get their OWN real
+            # quality_score, computed fresh from the tailored crosswalk
+            # entries just added above (volume/game-script signals - PROE,
+            # pressure faced, CPOE - not pass_yards' efficiency/explosive-
+            # play grades, which measure a genuinely different thing). Same
+            # blended_matchup_strength/role_verification/sample-size formula
+            # as every other quality_score in this file, just fed a different
+            # grade_exploit input. pass_tds is deliberately LEFT on the
+            # inherited pass_yards quality_score for now - not yet given its
+            # own crosswalk, an honest, stated gap rather than a silent one.
+            merged_grades = {**own_grades, **def_grades}
+            for sib_prop, sib_col in (("pass_completions", "completions"),
+                                       ("pass_attempts", "attempts"),
+                                       ("pass_tds", "passing_tds")):
                 sib_mu = calc_prop_mu(
                     gsis_id, sib_col, player_stats_df, season, week, current_team=team,
-                    league_fallback_mu=fallback_mus.get((position, sib_col)),
+                    league_fallback_mu=fallback_mus.get(("QB", sib_col)),
                 )
                 sib_sigma = calc_player_sigma(
                     gsis_id, sib_col, player_stats_df, season, week, current_team=team,
-                    league_fallback_sigma=fallback_sigmas.get((position, sib_col)),
+                    league_fallback_sigma=fallback_sigmas.get(("QB", sib_col)),
                 )
                 if sib_prop in PROP_METRIC_CROSSWALK:
-                    sib_grade_exploit = calc_grade_matchup_strength(merged_grades_rec, sib_prop)
+                    sib_grade_exploit = calc_grade_matchup_strength(merged_grades, sib_prop)
                     sib_blended = calc_blended_matchup_strength(combined_structural_exploit, sib_grade_exploit, role_score)
                     sib_quality_score = calc_quality_score(
                         matchup_exploit_strength=sib_blended,
-                        sample_size_games=rec_confidence_info["games_sampled_current"],
+                        sample_size_games=confidence_info["games_sampled_current"],
                         coverage_confidence=min(n_plays / 300, 1.0),
                     )
                     _record_quality_score(gsis_id, sib_quality_score)
                 else:
                     sib_grade_exploit, sib_quality_score = grade_exploit, quality_score
                 rows.append({
-                    "gsis_id": gsis_id, "player_display_name": wr.get("full_name"),
-                    "team": team, "position": position, "prop_type": sib_prop,
+                    "gsis_id": gsis_id, "player_display_name": qb.get("full_name"),
+                    "team": team, "position": "QB", "prop_type": sib_prop,
                     "matchup": team_to_matchup.get(team),
                     "mu": sib_mu, "sigma": sib_sigma, "opponent": opponent,
                     "quality_score": sib_quality_score,
                     "grade_matchup_strength": sib_grade_exploit,
                     "role_verification_score": role_score,
+                    "data_confidence": confidence_info["data_confidence"],
+                    "games_sampled_current": confidence_info["games_sampled_current"],
+                })
+
+            # Longest completion - own-history-only (see qb_longest_df note
+            # above: no prior-season bridge yet), so min_games gates it more
+            # often than the other props for thin-sample QBs.
+            longest_mu = calc_prop_mu(gsis_id, "longest_play", qb_longest_df, season, week, current_team=None)
+            longest_sigma = calc_player_sigma(gsis_id, "longest_play", qb_longest_df, season, week, current_team=None)
+            rows.append({
+                "gsis_id": gsis_id, "player_display_name": qb.get("full_name"),
+                "team": team, "position": "QB", "prop_type": "longest_completion",
+                "matchup": team_to_matchup.get(team),
+                "mu": longest_mu, "sigma": longest_sigma, "opponent": opponent,
+                "quality_score": quality_score,
+                "data_confidence": confidence_info["data_confidence"],
+                "games_sampled_current": confidence_info["games_sampled_current"],
+            })
+
+        except Exception:
+            continue  # this specific player's data is genuinely missing/broken this early in a new season - skip them, don't crash everyone else
+    # --- Rushing props ---
+    rush_pool = week_rosters[week_rosters["position"].isin(["RB", "QB"])]
+    for _, rb in rush_pool.iterrows():
+        try:
+            gsis_id = rb.get("gsis_id")
+            position = rb.get("position")
+            rb_team = rb.get("team")
+            if team_filter and rb_team not in team_filter:
+                continue
+            mu = calc_prop_mu(
+                gsis_id, "rushing_yards", player_stats_df, season, week, current_team=rb_team,
+                league_fallback_mu=fallback_mus.get((position, "rushing_yards")),
+            )
+            sigma = calc_player_sigma(
+                gsis_id, "rushing_yards", player_stats_df, season, week, current_team=rb_team,
+                league_fallback_sigma=fallback_sigmas.get((position, "rushing_yards")),
+            )
+            if pd.notna(mu):  # skip QBs/RBs with no real rushing history at all
+                rb_opponent = get_opponent_this_week(rb_team, season, week, schedules_df)
+                opp_box_row = None
+                if rb_opponent is not None and not box_def_profile.empty:
+                    match = box_def_profile[box_def_profile["defteam"] == rb_opponent]
+                    if not match.empty:
+                        opp_box_row = match.iloc[0].to_dict()
+                box_info = calc_box_quality_score(opp_box_row, box_def_profile)
+                n_box_plays = opp_box_row.get("n_plays", 0) if opp_box_row else 0
+
+                # ACTUAL mu adjustment using this RB's own real light-vs-stacked
+                # box yards-per-carry split, weighted by this week's opponent's
+                # stacked-box rate - run-game equivalent of the QB/WR coverage
+                # adjustment above. GATED per ENABLE_BOX_MU_ADJUSTMENT (see flag
+                # note above) - still computed below so mu_before_box_adj stays
+                # available for comparison, just not applied to mu itself.
+                adjusted_rush_mu = mu
+                if ENABLE_BOX_MU_ADJUSTMENT and opp_box_row and pd.notna(box_info.get("box_stack_pct")):
+                    box_eff = build_player_rush_box_efficiency(
+                        gsis_id, season, ftn_df, pbp_history_df,
+                        current_team=rb_team, prior_ftn_df=prior_ftn_df, prior_pbp_df=prior_pbp_df,
+                    )
+                    adjusted_rush_mu = calc_box_adjusted_mu(mu, box_eff, box_info.get("box_stack_pct"))
+
+                # Run-concept exploit signal - premium data, only computed when
+                # a bundle was actually passed in AND the flag is on (see
+                # calc_run_concept_exploit_strength in rb_matchup.py for the
+                # real logic). GATED same as every other premium/isolated
+                # signal - off by default pending its own live test. Position
+                # check mirrors rush_pool's own RB/QB filter (QBs rarely have
+                # FantasyPoints run-concept rows, so this will naturally
+                # degrade to NaN for most QB rush_yards rows).
+                run_concept_info = {"exploit_strength": np.nan, "concepts_checked": []}
+                if (ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE and rb_bundle is not None
+                        and calc_run_concept_exploit_strength is not None and rb_opponent is not None):
+                    run_concept_info = calc_run_concept_exploit_strength(
+                        rb_bundle, rb.get("full_name"), rb_team, rb_opponent,
+                    )
+                run_concept_exploit_for_scoring = run_concept_info.get("exploit_strength") if ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE else np.nan
+
+                rb_confidence_info = get_data_confidence(gsis_id, player_stats_df, season, week, current_team=rb_team)
+                own_grades = get_player_grades(gsis_id, rb_metrics)
+                def_grades = get_defense_grades(rb_opponent, def_metrics)
+
+                grade_exploit = calc_grade_matchup_strength({**own_grades, **def_grades}, "rush_yards")
+                role_trend = build_role_trend(gsis_id, "rush_attempts", ngs_rush_df, "player_gsis_id", season, week)
+                role_score = calc_role_verification_score(role_trend)
+                structural_parts = [v for v in [box_info.get("exploit_strength"), run_concept_exploit_for_scoring]
+                                     if pd.notna(v)]
+                combined_rush_structural = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
+                blended_exploit = calc_blended_matchup_strength(
+                    combined_rush_structural, grade_exploit, role_score
+                )
+                rush_quality_score = calc_quality_score(
+                    matchup_exploit_strength=blended_exploit,
+                    sample_size_games=rb_confidence_info["games_sampled_current"],  # this RB's own real sample - see calc_quality_score bugfix note
+                    coverage_confidence=min(n_box_plays / 300, 1.0),
+                )
+                _record_quality_score(gsis_id, rush_quality_score)
+
+                rows.append({
+                    "gsis_id": gsis_id, "player_display_name": rb.get("full_name"),
+                    "team": rb.get("team"), "position": position, "prop_type": "rush_yards",
+                    "matchup": team_to_matchup.get(rb_team),
+                    "mu": adjusted_rush_mu, "mu_before_box_adj": mu, "sigma": sigma, "opponent": rb_opponent,
+                    "opp_box_stack_pct": box_info.get("box_stack_pct"),
+                    "opp_box_elevated": box_info.get("box_elevated"),
+                    "run_concept_exploit_strength": run_concept_info.get("exploit_strength"),
+                    "run_concepts_checked": run_concept_info.get("concepts_checked"),
+                    "quality_score": rush_quality_score,
+                    "grade_matchup_strength": grade_exploit,
+                    "role_verification_score": role_score,
+                    "role_trend_ratio": role_trend.get("trend_ratio"),
+                    "data_confidence": rb_confidence_info["data_confidence"],
+                    "games_sampled_current": rb_confidence_info["games_sampled_current"],
+                    **own_grades,
+                    **def_grades,
+                })
+
+                # --- Sibling rushing count/longest props (attempts, TDs,
+                # longest rush) - rush_attempts now gets its OWN real
+                # quality_score (game-script-focused crosswalk, see
+                # PROP_METRIC_CROSSWALK) instead of inheriting rush_yards'
+                # per-carry-skill grades wholesale. rush_tds stays inherited
+                # for now, same honest, stated gap as pass_tds.
+                merged_grades_rush = {**own_grades, **def_grades}
+                for sib_prop, sib_col in (("rush_attempts", "carries"), ("rush_tds", "rushing_tds")):
+                    sib_mu = calc_prop_mu(
+                        gsis_id, sib_col, player_stats_df, season, week, current_team=rb_team,
+                        league_fallback_mu=fallback_mus.get((position, sib_col)),
+                    )
+                    sib_sigma = calc_player_sigma(
+                        gsis_id, sib_col, player_stats_df, season, week, current_team=rb_team,
+                        league_fallback_sigma=fallback_sigmas.get((position, sib_col)),
+                    )
+                    if sib_prop in PROP_METRIC_CROSSWALK:
+                        sib_grade_exploit = calc_grade_matchup_strength(merged_grades_rush, sib_prop)
+                        sib_blended = calc_blended_matchup_strength(combined_rush_structural, sib_grade_exploit, role_score)
+                        sib_quality_score = calc_quality_score(
+                            matchup_exploit_strength=sib_blended,
+                            sample_size_games=rb_confidence_info["games_sampled_current"],
+                            coverage_confidence=min(n_box_plays / 300, 1.0),
+                        )
+                        _record_quality_score(gsis_id, sib_quality_score)
+                    else:
+                        sib_grade_exploit, sib_quality_score = grade_exploit, rush_quality_score
+                    rows.append({
+                        "gsis_id": gsis_id, "player_display_name": rb.get("full_name"),
+                        "team": rb.get("team"), "position": position, "prop_type": sib_prop,
+                        "matchup": team_to_matchup.get(rb_team),
+                        "mu": sib_mu, "sigma": sib_sigma, "opponent": rb_opponent,
+                        "quality_score": sib_quality_score,
+                        "grade_matchup_strength": sib_grade_exploit,
+                        "role_verification_score": role_score,
+                        "data_confidence": rb_confidence_info["data_confidence"],
+                        "games_sampled_current": rb_confidence_info["games_sampled_current"],
+                    })
+
+                longest_rush_mu = calc_prop_mu(gsis_id, "longest_play", rush_longest_df, season, week, current_team=None)
+                longest_rush_sigma = calc_player_sigma(gsis_id, "longest_play", rush_longest_df, season, week, current_team=None)
+                rows.append({
+                    "gsis_id": gsis_id, "player_display_name": rb.get("full_name"),
+                    "team": rb.get("team"), "position": position, "prop_type": "longest_rush",
+                    "matchup": team_to_matchup.get(rb_team),
+                    "mu": longest_rush_mu, "sigma": longest_rush_sigma, "opponent": rb_opponent,
+                    "quality_score": rush_quality_score,
+                    "data_confidence": rb_confidence_info["data_confidence"],
+                    "games_sampled_current": rb_confidence_info["games_sampled_current"],
+                })
+
+        except Exception:
+            continue  # this specific player's data is genuinely missing/broken this early in a new season - skip them, don't crash everyone else
+    # --- Receiving props ---
+    rec_pool = week_rosters[week_rosters["position"].isin(["WR", "TE", "RB"])]
+    for _, wr in rec_pool.iterrows():
+        try:
+            gsis_id = wr.get("gsis_id")
+            position = wr.get("position")
+            team = wr.get("team")
+            if team_filter and team not in team_filter:
+                continue
+            mu = calc_prop_mu(
+                gsis_id, "receiving_yards", player_stats_df, season, week, current_team=team,
+                league_fallback_mu=fallback_mus.get((position, "receiving_yards")),
+            )
+            sigma = calc_player_sigma(
+                gsis_id, "receiving_yards", player_stats_df, season, week, current_team=team,
+                league_fallback_sigma=fallback_sigmas.get((position, "receiving_yards")),
+            )
+            if pd.notna(mu):
+                opponent = get_opponent_this_week(team, season, week, schedules_df)
+                opp_coverage_row = None
+                if opponent is not None and not coverage_profile.empty:
+                    match = coverage_profile[coverage_profile["defteam"] == opponent]
+                    if not match.empty:
+                        opp_coverage_row = match.iloc[0].to_dict()
+                coverage_info = calc_coverage_quality_score(opp_coverage_row, coverage_profile)
+                n_plays = opp_coverage_row.get("n_plays", 0) if opp_coverage_row else 0
+
+                # Personnel-grouping exploit: does this team's dominant
+                # personnel package (11/12/21 etc.) match up against a real
+                # weakness in THIS specific opponent's defense against that
+                # exact grouping - same crosswalk pattern as play-action for
+                # pass_yards, applied to personnel here since it's the more
+                # directly relevant tendency signal for receiving props.
+                personnel_info = calc_personnel_exploit_strength(
+                    team, offense_personnel_tendency, opponent, defense_personnel_allowed
+                )
+                # GATED per ENABLE_PERSONNEL_IN_QUALITY_SCORE - same isolation
+                # treatment as the play-action gate above.
+                personnel_exploit_for_scoring = personnel_info.get("exploit_strength") if ENABLE_PERSONNEL_IN_QUALITY_SCORE else np.nan
+
+                # Alignment (Wide/Slot/Inline/Backfield) x real opponent
+                # outlier-coverage exploit signal - premium data, only computed
+                # when a bundle was actually passed in AND the flag is on
+                # (see calc_alignment_exploit_strength in coverage_matchup.py
+                # for the real logic). GATED same as PA/personnel - isolated,
+                # off by default pending its own live test.
+                alignment_info = {"exploit_strength": np.nan, "dominant_alignment": None, "alignment_fit_pct": None}
+                if (ENABLE_ALIGNMENT_IN_QUALITY_SCORE and coverage_bundle is not None
+                        and calc_alignment_exploit_strength is not None and opponent is not None):
+                    alignment_info = calc_alignment_exploit_strength(
+                        coverage_bundle, wr.get("full_name"), position, team, opponent,
+                    )
+                alignment_exploit_for_scoring = alignment_info.get("exploit_strength") if ENABLE_ALIGNMENT_IN_QUALITY_SCORE else np.nan
+
+                structural_parts = [v for v in [coverage_info.get("exploit_strength"), personnel_exploit_for_scoring,
+                                                 alignment_exploit_for_scoring] if pd.notna(v)]
+                combined_structural_exploit = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
+
+                # ACTUAL mu adjustment using this receiver's own real man/zone
+                # efficiency split, weighted by this specific opponent's tendency.
+                # GATED per ENABLE_COVERAGE_MU_ADJUSTMENT (see flag note above).
+                adjusted_mu = mu
+                man_pct = opp_coverage_row.get("man_pct") if opp_coverage_row else None
+                zone_pct = opp_coverage_row.get("zone_pct") if opp_coverage_row else None
+                if ENABLE_COVERAGE_MU_ADJUSTMENT and pd.notna(man_pct) and pd.notna(zone_pct):
+                    coverage_eff = build_player_coverage_efficiency(
+                        gsis_id, "receiver", season, participation_df, pbp_history_df,
+                        current_team=team, prior_participation_df=prior_participation_df,
+                        prior_pbp_df=prior_pbp_df,
+                    )
+                    adjusted_mu = calc_coverage_adjusted_mu(mu, coverage_eff, man_pct, zone_pct)
+
+                # NEW, SEPARATE full-coverage-type version - GATED per
+                # ENABLE_FULL_COVERAGE_MU_ADJUSTMENT, off by default pending
+                # its own live test. Applied on top of adjusted_mu (which is
+                # just `mu` unchanged while the man/zone version stays off) so
+                # this can be tested in isolation regardless of that flag's state.
+                full_coverage_weight_used = 0.0
+                if ENABLE_FULL_COVERAGE_MU_ADJUSTMENT and opp_coverage_row:
+                    player_full_coverage_eff = build_player_full_coverage_efficiency(
+                        gsis_id, "receiver", participation_df, pbp_history_df,
+                    )
+                    full_cov_result = calc_full_coverage_adjusted_mu(adjusted_mu, player_full_coverage_eff, opp_coverage_row)
+                    adjusted_mu = full_cov_result["adjusted_mu"]
+                    full_coverage_weight_used = full_cov_result["coverage_weight_used"]
+
+                rec_confidence_info = get_data_confidence(gsis_id, player_stats_df, season, week, current_team=team)
+                own_grades = get_player_grades(gsis_id, rec_metrics)
+                def_grades = get_defense_grades(opponent, def_metrics)
+
+                grade_exploit = calc_grade_matchup_strength({**own_grades, **def_grades}, "rec_yards")
+                role_trend = build_role_trend(gsis_id, "target_share", player_stats_df, "gsis_id", season, week)
+                role_score = calc_role_verification_score(role_trend)
+                blended_exploit = calc_blended_matchup_strength(
+                    combined_structural_exploit, grade_exploit, role_score
+                )
+                quality_score = calc_quality_score(
+                    matchup_exploit_strength=blended_exploit,
+                    sample_size_games=rec_confidence_info["games_sampled_current"],  # this receiver's own real sample - see calc_quality_score bugfix note
+                    coverage_confidence=min(n_plays / 300, 1.0),
+                )
+                _record_quality_score(gsis_id, quality_score)
+
+                rows.append({
+                    "gsis_id": gsis_id, "player_display_name": wr.get("full_name"),
+                    "team": team, "position": position, "prop_type": "rec_yards",
+                    "matchup": team_to_matchup.get(team),
+                    "mu": adjusted_mu, "mu_before_coverage_adj": mu, "sigma": sigma, "opponent": opponent,
+                    "opp_man_pct": opp_coverage_row.get("man_pct") if opp_coverage_row else np.nan,
+                    "opp_zone_pct": opp_coverage_row.get("zone_pct") if opp_coverage_row else np.nan,
+                    "opp_dominant_coverage": coverage_info["dominant_coverage"],
+                    "opp_dominant_coverage_pct": coverage_info["dominant_coverage_pct"],
+                    "opp_num_elevated_coverages": coverage_info.get("num_elevated_coverages", 0),
+                    "personnel_exploit_strength": personnel_info.get("exploit_strength"),
+                    "dominant_personnel": personnel_info.get("dominant_personnel"),
+                    "alignment_exploit_strength": alignment_info.get("exploit_strength"),
+                    "dominant_alignment": alignment_info.get("dominant_alignment"),
+                    "alignment_fit_pct": alignment_info.get("alignment_fit_pct"),
+                    "alignment_outlier_coverages": alignment_info.get("outlier_coverages_checked"),
+                    "full_coverage_weight_used": full_coverage_weight_used,
+                    **get_full_coverage_breakdown(opp_coverage_row),
+                    "quality_score": quality_score,
+                    "grade_matchup_strength": grade_exploit,
+                    "role_verification_score": role_score,
+                    "role_trend_ratio": role_trend.get("trend_ratio"),
+                    "data_confidence": rec_confidence_info["data_confidence"],
+                    "games_sampled_current": rec_confidence_info["games_sampled_current"],
+                    **own_grades,
+                    **def_grades,
+                })
+
+                # --- Sibling receiving count/longest props (receptions,
+                # targets, TDs, longest catch) - receptions/targets now get
+                # their OWN real quality_score (pure-opportunity crosswalk:
+                # target_share/WOPR, deliberately excluding separation/YAC-
+                # over-expectation, which measure what happens AFTER a target/
+                # catch, not how often he gets one - real noise for a volume
+                # prop). rec_tds stays inherited for now, same honest gap.
+                # Applies to WR/TE/RB alike since rec_pool already includes
+                # all three.
+                merged_grades_rec = {**own_grades, **def_grades}
+                for sib_prop, sib_col in (("receptions", "receptions"), ("targets", "targets"),
+                                           ("rec_tds", "receiving_tds")):
+                    sib_mu = calc_prop_mu(
+                        gsis_id, sib_col, player_stats_df, season, week, current_team=team,
+                        league_fallback_mu=fallback_mus.get((position, sib_col)),
+                    )
+                    sib_sigma = calc_player_sigma(
+                        gsis_id, sib_col, player_stats_df, season, week, current_team=team,
+                        league_fallback_sigma=fallback_sigmas.get((position, sib_col)),
+                    )
+                    if sib_prop in PROP_METRIC_CROSSWALK:
+                        sib_grade_exploit = calc_grade_matchup_strength(merged_grades_rec, sib_prop)
+                        sib_blended = calc_blended_matchup_strength(combined_structural_exploit, sib_grade_exploit, role_score)
+                        sib_quality_score = calc_quality_score(
+                            matchup_exploit_strength=sib_blended,
+                            sample_size_games=rec_confidence_info["games_sampled_current"],
+                            coverage_confidence=min(n_plays / 300, 1.0),
+                        )
+                        _record_quality_score(gsis_id, sib_quality_score)
+                    else:
+                        sib_grade_exploit, sib_quality_score = grade_exploit, quality_score
+                    rows.append({
+                        "gsis_id": gsis_id, "player_display_name": wr.get("full_name"),
+                        "team": team, "position": position, "prop_type": sib_prop,
+                        "matchup": team_to_matchup.get(team),
+                        "mu": sib_mu, "sigma": sib_sigma, "opponent": opponent,
+                        "quality_score": sib_quality_score,
+                        "grade_matchup_strength": sib_grade_exploit,
+                        "role_verification_score": role_score,
+                        "data_confidence": rec_confidence_info["data_confidence"],
+                        "games_sampled_current": rec_confidence_info["games_sampled_current"],
+                    })
+
+                longest_rec_mu = calc_prop_mu(gsis_id, "longest_play", rec_longest_df, season, week, current_team=None)
+                longest_rec_sigma = calc_player_sigma(gsis_id, "longest_play", rec_longest_df, season, week, current_team=None)
+                rows.append({
+                    "gsis_id": gsis_id, "player_display_name": wr.get("full_name"),
+                    "team": team, "position": position, "prop_type": "longest_reception",
+                    "matchup": team_to_matchup.get(team),
+                    "mu": longest_rec_mu, "sigma": longest_rec_sigma, "opponent": opponent,
+                    "quality_score": quality_score,
                     "data_confidence": rec_confidence_info["data_confidence"],
                     "games_sampled_current": rec_confidence_info["games_sampled_current"],
                 })
 
-            longest_rec_mu = calc_prop_mu(gsis_id, "longest_play", rec_longest_df, season, week, current_team=None)
-            longest_rec_sigma = calc_player_sigma(gsis_id, "longest_play", rec_longest_df, season, week, current_team=None)
-            rows.append({
-                "gsis_id": gsis_id, "player_display_name": wr.get("full_name"),
-                "team": team, "position": position, "prop_type": "longest_reception",
-                "matchup": team_to_matchup.get(team),
-                "mu": longest_rec_mu, "sigma": longest_rec_sigma, "opponent": opponent,
-                "quality_score": quality_score,
-                "data_confidence": rec_confidence_info["data_confidence"],
-                "games_sampled_current": rec_confidence_info["games_sampled_current"],
-            })
-
+        except Exception:
+            continue  # this specific player's data is genuinely missing/broken this early in a new season - skip them, don't crash everyone else
     # --- Fantasy points (offense: QB, RB, WR, TE) ---
     offense_positions = ["QB", "RB", "WR", "TE"]
     fantasy_pool_roster = week_rosters[week_rosters["position"].isin(offense_positions)]
     for _, pr in fantasy_pool_roster.iterrows():
-        gsis_id = pr.get("gsis_id")
-        if team_filter and pr.get("team") not in team_filter:
-            continue
-        recent_games = player_stats_df[
-            (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season)
-            & (player_stats_df["week"] < week)
-        ].sort_values("week", ascending=False).head(6)
-        if len(recent_games) < 2:
-            # bridge across season boundary for Week 1-2 of a new season
-            prior_season_games = player_stats_df[
-                (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season - 1)
+        try:
+            gsis_id = pr.get("gsis_id")
+            if team_filter and pr.get("team") not in team_filter:
+                continue
+            recent_games = player_stats_df[
+                (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season)
+                & (player_stats_df["week"] < week)
             ].sort_values("week", ascending=False).head(6)
-            recent_games = pd.concat([recent_games, prior_season_games])
-        if recent_games.empty:
-            continue
-        fantasy_pts_per_game = recent_games.apply(
-            lambda r: calc_offense_fantasy_points(r.to_dict()), axis=1
-        )
-        mu_fantasy = round(fantasy_pts_per_game.mean(), 2)
-        sigma = round(fantasy_pts_per_game.std(ddof=1), 2) if len(fantasy_pts_per_game) >= 2 else np.nan
+            if len(recent_games) < 2:
+                # bridge across season boundary for Week 1-2 of a new season
+                prior_season_games = player_stats_df[
+                    (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season - 1)
+                ].sort_values("week", ascending=False).head(6)
+                recent_games = pd.concat([recent_games, prior_season_games])
+            if recent_games.empty:
+                continue
+            fantasy_pts_per_game = recent_games.apply(
+                lambda r: calc_offense_fantasy_points(r.to_dict()), axis=1
+            )
+            mu_fantasy = round(fantasy_pts_per_game.mean(), 2)
+            sigma = round(fantasy_pts_per_game.std(ddof=1), 2) if len(fantasy_pts_per_game) >= 2 else np.nan
 
-        # Fantasy quality_score = average of this player's already-computed
-        # pass/rush/rec quality_scores (whichever apply to their position) -
-        # same "Fantasy = average of underlying scores" approach the MLB
-        # tool uses for Pitcher/Hitter Fantasy.
-        component_scores = quality_scores_by_gsis.get(gsis_id, [])
-        fantasy_quality_score = round(sum(component_scores) / len(component_scores), 1) if component_scores else np.nan
+            # Fantasy quality_score = average of this player's already-computed
+            # pass/rush/rec quality_scores (whichever apply to their position) -
+            # same "Fantasy = average of underlying scores" approach the MLB
+            # tool uses for Pitcher/Hitter Fantasy.
+            component_scores = quality_scores_by_gsis.get(gsis_id, [])
+            fantasy_quality_score = round(sum(component_scores) / len(component_scores), 1) if component_scores else np.nan
 
-        rows.append({
-            "gsis_id": gsis_id, "player_display_name": pr.get("full_name"),
-            "team": pr.get("team"), "position": pr.get("position"), "prop_type": "fantasy_points",
-            "matchup": team_to_matchup.get(pr.get("team")),
-            "mu": mu_fantasy, "sigma": sigma, "quality_score": fantasy_quality_score,
-        })
+            rows.append({
+                "gsis_id": gsis_id, "player_display_name": pr.get("full_name"),
+                "team": pr.get("team"), "position": pr.get("position"), "prop_type": "fantasy_points",
+                "matchup": team_to_matchup.get(pr.get("team")),
+                "mu": mu_fantasy, "sigma": sigma, "quality_score": fantasy_quality_score,
+            })
 
+        except Exception:
+            continue  # this specific player's data is genuinely missing/broken this early in a new season - skip them, don't crash everyone else
     # --- Kicker fantasy + FG/XP props ---
     # NOTE: deliberately NOT given a quality_score/matchup-exploit signal,
     # same design exception as the MLB tool's Pitcher Win prop - kicking
@@ -3608,32 +3620,35 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
     # Not a gap, an intentional scope boundary.
     kicker_pool = week_rosters[week_rosters["position"] == "K"]
     for _, kr in kicker_pool.iterrows():
-        gsis_id = kr.get("gsis_id")
-        if team_filter and kr.get("team") not in team_filter:
-            continue
-        recent_games = player_stats_df[
-            (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season)
-            & (player_stats_df["week"] < week)
-        ].sort_values("week", ascending=False).head(6)
-        if len(recent_games) < 2:
-            prior_season_games = player_stats_df[
-                (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season - 1)
+        try:
+            gsis_id = kr.get("gsis_id")
+            if team_filter and kr.get("team") not in team_filter:
+                continue
+            recent_games = player_stats_df[
+                (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season)
+                & (player_stats_df["week"] < week)
             ].sort_values("week", ascending=False).head(6)
-            recent_games = pd.concat([recent_games, prior_season_games])
-        if recent_games.empty:
-            continue
-        kicker_pts_per_game = recent_games.apply(
-            lambda r: calc_kicker_fantasy_points(r.to_dict()), axis=1
-        )
-        mu_kicker = round(kicker_pts_per_game.mean(), 2)
-        sigma = round(kicker_pts_per_game.std(ddof=1), 2) if len(kicker_pts_per_game) >= 2 else np.nan
-        rows.append({
-            "gsis_id": gsis_id, "player_display_name": kr.get("full_name"),
-            "team": kr.get("team"), "position": "K", "prop_type": "kicker_fantasy",
-            "matchup": team_to_matchup.get(kr.get("team")),
-            "mu": mu_kicker, "sigma": sigma,
-        })
+            if len(recent_games) < 2:
+                prior_season_games = player_stats_df[
+                    (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season - 1)
+                ].sort_values("week", ascending=False).head(6)
+                recent_games = pd.concat([recent_games, prior_season_games])
+            if recent_games.empty:
+                continue
+            kicker_pts_per_game = recent_games.apply(
+                lambda r: calc_kicker_fantasy_points(r.to_dict()), axis=1
+            )
+            mu_kicker = round(kicker_pts_per_game.mean(), 2)
+            sigma = round(kicker_pts_per_game.std(ddof=1), 2) if len(kicker_pts_per_game) >= 2 else np.nan
+            rows.append({
+                "gsis_id": gsis_id, "player_display_name": kr.get("full_name"),
+                "team": kr.get("team"), "position": "K", "prop_type": "kicker_fantasy",
+                "matchup": team_to_matchup.get(kr.get("team")),
+                "mu": mu_kicker, "sigma": sigma,
+            })
 
+        except Exception:
+            continue  # this specific player's data is genuinely missing/broken this early in a new season - skip them, don't crash everyone else
     return pd.DataFrame(rows)
 
 
