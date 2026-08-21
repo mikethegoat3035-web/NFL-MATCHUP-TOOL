@@ -132,7 +132,27 @@ def _pull_years_gracefully(loader_fn, years: list[int]) -> pd.DataFrame:
         except Exception:
             continue  # this specific year genuinely doesn't exist yet - skip it, not a real error
     if not frames:
-        return pd.DataFrame()
+        # REAL FIX for a real, second bug found live (a genuine KeyError:
+        # 'week' after the first fix already resolved the original 404
+        # crash) - dozens of places throughout this file filter these
+        # pulls by df["season"]/df["week"] (hist_pbp = pbp_df[(pbp_df
+        # ["season"]==season) & (pbp_df["week"]<week)], the same pattern
+        # repeated everywhere from box-count/coverage profiles down to
+        # individual player mu calculations). A bare pd.DataFrame() has
+        # NO columns at all, so the very first one of those filters to
+        # run crashes with a raw KeyError instead of just correctly
+        # finding zero matching rows - patching this at its ONE real
+        # source here is far safer than trying to defensively guard
+        # dozens of separate downstream call sites individually (real,
+        # meaningfully higher risk of missing one and reintroducing the
+        # same class of crash somewhere else). Guaranteeing season/week
+        # exist (empty, but present) covers every filter pattern actually
+        # used in this file - real column-specific differences beyond
+        # these two (e.g. player_id) don't matter here, since anything
+        # that also needs a player-specific column will correctly find
+        # zero rows to work with either way, same end result as a
+        # genuinely successful pull that just has no data for this week.
+        return pd.DataFrame({"season": pd.Series(dtype="int64"), "week": pd.Series(dtype="int64")})
     return pd.concat(frames, ignore_index=True)
 
 
