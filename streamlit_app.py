@@ -267,7 +267,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v35-dark-theme-stacked-report-2026-08-21"
+DEPLOY_VERSION = "v36-backtest-moved-to-bottom-2026-08-21"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -533,69 +533,31 @@ else:
     st.divider()
 
     button_label = "Scan full slate"
-    btn_col1, btn_col2 = st.columns(2)
 
-    with btn_col1:
-        if st.button(button_label, type="primary"):
-            with st.spinner(f"Pulling and scoring Week {week}, {season}..."):
-                try:
-                    if mode.startswith("Backtest"):
-                        st.session_state.slate_df = backtest_week(
-                            season, week,
-                            coverage_bundle=st.session_state.get("coverage_bundle"),
-                            rb_bundle=st.session_state.get("rb_bundle"),
-                        )
-                        st.session_state.backtest_mode = True
-                        st.session_state.show_season_report = False
-                    else:
-                        st.session_state.slate_df = scan_full_slate_nfl(
-                            season, week,
-                            coverage_bundle=st.session_state.get("coverage_bundle"),
-                            rb_bundle=st.session_state.get("rb_bundle"),
-                        )
-                        st.session_state.backtest_mode = False
-                        st.session_state.show_season_report = False
-                    st.success(f"Loaded {len(st.session_state.slate_df)} prop rows.")
-                except Exception as e:
-                    st.error(f"{'Backtest' if mode.startswith('Backtest') else 'Scan'} failed: {e}")
-                    st.session_state.slate_df = None
-
-    if btn_col2 is not None:
-        with btn_col2:
-            st.caption(
-                "Runs a range of weeks, not necessarily the whole season - start small "
-                "(e.g. a 4-6 week range) to confirm it works within Streamlit Cloud's free-"
-                "tier memory limit before attempting the full season in one run."
-            )
-            rcol1, rcol2 = st.columns(2)
-            with rcol1:
-                report_start_week = st.number_input(
-                    "Report start week", min_value=2, max_value=18, value=2, step=1,
-                    help="Week 1 is skipped automatically - there's no prior-week history to project from yet.",
-                )
-            with rcol2:
-                report_end_week = st.number_input(
-                    "Report end week", min_value=2, max_value=18, value=6, step=1,
-                )
-            if st.button("Run Readiness Report for this week range", type="secondary"):
-                if report_end_week < report_start_week:
-                    st.error("End week must be >= start week.")
+    if st.button(button_label, type="primary"):
+        with st.spinner(f"Pulling and scoring Week {week}, {season}..."):
+            try:
+                if mode.startswith("Backtest"):
+                    st.session_state.slate_df = backtest_week(
+                        season, week,
+                        coverage_bundle=st.session_state.get("coverage_bundle"),
+                        rb_bundle=st.session_state.get("rb_bundle"),
+                    )
+                    st.session_state.backtest_mode = True
+                    st.session_state.show_season_report = False
                 else:
-                    weeks_to_run = list(range(report_start_week, report_end_week + 1))
-                    with st.spinner(f"Scoring weeks {report_start_week}-{report_end_week} of {season} against real results..."):
-                        try:
-                            st.session_state.season_report = build_season_accuracy_report(
-                                season, weeks=weeks_to_run,
-                                coverage_bundle=st.session_state.get("coverage_bundle"),
-                                rb_bundle=st.session_state.get("rb_bundle"),
-                            )
-                            st.session_state.backtest_mode = True
-                            st.session_state.show_season_report = True
-                            n_rows = len(st.session_state.season_report["raw"])
-                            st.success(f"Scored {n_rows} rows across weeks {report_start_week}-{report_end_week} of {season}.")
-                        except Exception as e:
-                            st.error(f"Season readiness report failed: {e}")
-                            st.session_state.season_report = None
+                    st.session_state.slate_df = scan_full_slate_nfl(
+                        season, week,
+                        coverage_bundle=st.session_state.get("coverage_bundle"),
+                        rb_bundle=st.session_state.get("rb_bundle"),
+                    )
+                    st.session_state.backtest_mode = False
+                    st.session_state.show_season_report = False
+                st.success(f"Loaded {len(st.session_state.slate_df)} prop rows.")
+            except Exception as e:
+                st.error(f"{'Backtest' if mode.startswith('Backtest') else 'Scan'} failed: {e}")
+                st.session_state.slate_df = None
+
 
 # -----------------------------------------------------------------------
 # SEASON READINESS REPORT DISPLAY - pulled into a real function so it can
@@ -881,159 +843,6 @@ elif (st.session_state.slate_df is None or st.session_state.slate_df.empty) \
 elif st.session_state.slate_df is not None and not st.session_state.slate_df.empty:
     df = st.session_state.slate_df.copy()
 
-    # -------------------------------------------------------------------
-    # BEST QUALITY MATCHUPS - built directly into the scan itself now
-    # (was a separate mode, folded in per feedback: no reason to force a
-    # mode switch just to see the curated best-quality view). Shown for
-    # BOTH Scan and Backtest (a backtest row has the same gsis_id/prop_type/
-    # team/opponent/week columns needed for the same real breakdown - a
-    # played week is actually a great way to sanity-check this feature
-    # works, no different underlying data than a live scan). Filters by a
-    # MINIMUM quality_score (not just top-N) so "keep options limited but
-    # quality high" is a real floor, not just a count.
-    # -------------------------------------------------------------------
-    if True:
-        bm_df = df[df["prop_type"].isin(["pass_yards", "rec_yards"])].dropna(subset=["quality_score"])
-        if not bm_df.empty:
-            st.subheader("🏆 Best Quality Matchups")
-            if st.session_state.backtest_mode:
-                st.caption("Backtest data - real per-coverage breakdown for an already-played week, "
-                           "same underlying function as a live Scan.")
-            bmf1, bmf2 = st.columns(2)
-            with bmf1:
-                bm_min_quality = st.slider("Minimum quality_score", 0, 100, 75, 5, key="bm_min_quality")
-            with bmf2:
-                bm_prop_filter = st.selectbox("Prop type", ["Both", "pass_yards", "rec_yards"], key="bm_prop_filter")
-
-            bm_filtered = bm_df[bm_df["quality_score"] >= bm_min_quality]
-            if bm_prop_filter != "Both":
-                bm_filtered = bm_filtered[bm_filtered["prop_type"] == bm_prop_filter]
-            bm_filtered = bm_filtered.sort_values("quality_score", ascending=False)
-
-            if bm_filtered.empty:
-                st.caption(f"No rows clear quality_score >= {bm_min_quality} - lower the floor to see more.")
-            else:
-                summary_cols = [c for c in ["player_display_name", "team", "matchup", "position", "prop_type",
-                                             "mu", "quality_score", "opponent"] if c in bm_filtered.columns]
-                st.dataframe(
-                    bm_filtered[summary_cols].style.background_gradient(subset=["quality_score"], cmap="Greens"),
-                    width='stretch', hide_index=True,
-                )
-
-                st.markdown("**Why did the model pick one of these?**")
-                use_full_season_toggle = st.checkbox(
-                    "Use full season for this breakdown (more real sample volume)", value=True,
-                    key="bm_full_season",
-                    help="ON (default): uses every real play from the whole season for the "
-                         "coverage/efficiency breakdown below - this is a validation view, not "
-                         "the live betting mu itself, so more real volume gives a fuller picture "
-                         "with no leakage concern. OFF: shows only the same before-this-week "
-                         "data mu itself actually used.",
-                )
-                player_options = [
-                    f"{r['player_display_name']} ({r['prop_type']}, quality={r['quality_score']:.0f})"
-                    for _, r in bm_filtered.iterrows()
-                ]
-                picked = st.selectbox("Pick one to see the breakdown", player_options, key="bm_picked_player")
-                picked_row = bm_filtered.iloc[player_options.index(picked)]
-
-                with st.spinner("Pulling this player's real per-coverage sample..."):
-                    try:
-                        explanation = get_player_matchup_explanation(
-                            picked_row["gsis_id"], picked_row["prop_type"], picked_row["team"],
-                            picked_row["opponent"], int(season), int(week),
-                            use_full_season=use_full_season_toggle,
-                        )
-                    except Exception as e:
-                        explanation = None
-                        st.error(f"Couldn't pull the detailed breakdown: {e}")
-
-                if explanation is not None:
-                    coverage_mix = explanation.get("coverage_mix", {})
-                    player_sample = explanation.get("player_coverage_sample", {})
-
-                    if coverage_mix:
-                        # BUGFIX: the Altair version of this chart broke in
-                        # production (a Python typing/schema compatibility
-                        # error deep inside altair's own import, unrelated
-                        # to anything in this file - it fails before our
-                        # code even runs). Reverted to a combination of
-                        # things ALREADY confirmed working in this exact
-                        # deployment all session: matplotlib (the original
-                        # pie chart worked fine) + a styled, sortable
-                        # dataframe (background_gradient has worked
-                        # reliably in every other table all session) -
-                        # zero new dependency risk, same "tied together"
-                        # goal achieved a different way.
-                        rows = []
-                        for cov_type, usage_pct in coverage_mix.items():
-                            sample = player_sample.get(cov_type)
-                            rows.append({
-                                "coverage_type": cov_type,
-                                "defense_usage_pct": round(usage_pct * 100, 1),
-                                "player_ypp_here": sample["ypp"] if sample else None,
-                                "real_plays_sampled": sample["n_plays"] if sample else 0,
-                                "sample_status": "✅ Reliable" if sample else "⬜ No sample yet",
-                            })
-                        detail_df = pd.DataFrame(rows).sort_values("defense_usage_pct", ascending=False)
-
-                        dcol1, dcol2 = st.columns([1, 1])
-                        with dcol1:
-                            st.markdown(f"**{picked_row['opponent']}'s real coverage mix**")
-                            import matplotlib.pyplot as plt
-                            fig, ax = plt.subplots(figsize=(4, 4))
-                            ax.pie(coverage_mix.values(), labels=coverage_mix.keys(), autopct="%1.0f%%",
-                                   textprops={"fontsize": 8})
-                            ax.set_title(f"{picked_row['opponent']} coverage mix", fontsize=9)
-                            st.pyplot(fig)
-                        with dcol2:
-                            st.markdown(
-                                f"**Tied directly to {picked_row['player_display_name']}'s real "
-                                "efficiency in each one:**"
-                            )
-                            styled_detail = detail_df.style.background_gradient(
-                                subset=["defense_usage_pct"], cmap="Blues"
-                            ).background_gradient(
-                                subset=["player_ypp_here"], cmap="Greens"
-                            )
-                            st.dataframe(styled_detail, width='stretch', hide_index=True)
-                        st.caption(
-                            "✅ Reliable = 8+ real plays behind that coverage's yards/play number, used in "
-                            "the weighting. ⬜ No sample yet = the defense runs it, but there's not enough "
-                            "real sample yet for this player against it - excluded rather than guessed at."
-                        )
-                    else:
-                        st.caption("No real coverage-mix data available for this defense yet.")
-
-                    no_sample = explanation.get("coverage_types_no_sample", [])
-                    if no_sample:
-                        st.warning(
-                            f"**{picked_row['opponent']} also runs real snaps of {', '.join(no_sample)}, but "
-                            f"{picked_row['player_display_name']} doesn't have a reliable sample against "
-                            f"{'that' if len(no_sample) == 1 else 'those'} yet — excluded from the weighting "
-                            "rather than guessed at."
-                        )
-                    else:
-                        st.success(f"{picked_row['player_display_name']} has a reliable real sample against every "
-                                   f"coverage {picked_row['opponent']} meaningfully uses.")
-
-                    st.caption(
-                        f"Overall real yards/play across every coverage this season: "
-                        f"{explanation.get('player_overall_ypp', 'n/a')} — "
-                        "the baseline the coverage-specific numbers above are compared against."
-                    )
-
-                    grade_cols_to_show = [c for c in picked_row.index if c.endswith("_grade") and pd.notna(picked_row[c])]
-                    if grade_cols_to_show:
-                        st.markdown("**Underlying skill grades (0-100 percentile vs the league this season)**")
-                        grade_table = pd.DataFrame({
-                            "metric": grade_cols_to_show,
-                            "grade": [picked_row[c] for c in grade_cols_to_show],
-                        }).sort_values("grade", ascending=False)
-                        st.dataframe(grade_table, width='stretch', hide_index=True)
-
-            st.markdown("---")
-            st.caption("Full scan results (every prop, every position) below.")
 
     # -----------------------------------------------------------------------
     # GAME-BY-GAME PICKER - lets you pick a single matchup (like a scoreboard)
@@ -1066,7 +875,7 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         st.info(f"Showing {st.session_state.selected_game} only - sorted by quality_score (best matchups first).")
 
     st.subheader("Filters")
-    fcol1, fcol2, fcol3, fcol4 = st.columns(4)
+    fcol1, fcol2, fcol3, fcol4, fcol5 = st.columns(5)
     with fcol1:
         prop_types = ["All"] + sorted(df["prop_type"].dropna().unique().tolist())
         prop_filter = st.selectbox("Prop type", prop_types)
@@ -1075,7 +884,10 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         position_filter = st.selectbox("Position", positions)
     with fcol3:
         if not st.session_state.backtest_mode:
-            min_edge_filter = st.slider("Minimum edge (after entering lines)", 0.0, 1.0, 0.0, 0.05)
+            # Defaulted to 0.10, matching the MLB tool's real base filter -
+            # was 0.0 (off) before, real gap: NFL had no baseline edge floor
+            # at all here, unlike MLB's established .10/10 starting point.
+            min_edge_filter = st.slider("Minimum edge (after entering lines)", 0.0, 1.0, 0.10, 0.05)
         else:
             min_edge_filter = 0.0
     with fcol4:
@@ -1090,6 +902,15 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         # Best Quality Matchups panel below).
         min_quality_filter = st.slider("Minimum quality_score", 0, 100, 0, 5,
                                         help="Applies to every prop type. 0 = off.")
+    with fcol5:
+        # REAL GAP FOUND: no games_sampled floor existed anywhere in this
+        # section at all before - MLB's real base filter is edge>=.10 AND
+        # games>=10 together, not edge alone. Defaulted to 10 to match
+        # that same real baseline, using games_sampled_current (this
+        # player's own real current-season sample, already computed via
+        # get_data_confidence elsewhere in this file).
+        min_games_filter = st.slider("Minimum games_sampled", 0, 17, 10, 1,
+                                      help="Real games behind this player's own current-season mu. 0 = off.")
 
     filtered = df.copy()
     if prop_filter != "All":
@@ -1098,6 +919,8 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         filtered = filtered[filtered["position"] == position_filter]
     if min_quality_filter > 0 and "quality_score" in filtered.columns:
         filtered = filtered[filtered["quality_score"].fillna(0) >= min_quality_filter]
+    if min_games_filter > 0 and "games_sampled_current" in filtered.columns:
+        filtered = filtered[filtered["games_sampled_current"].fillna(0) >= min_games_filter]
 
     if st.session_state.backtest_mode:
         # -----------------------------------------------------------
@@ -1503,9 +1326,7 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
     # Backtest stacked directly below the live scan/Slip Builder/Locked
     # Slips, matching the MLB tool's layout (scan on top, backtest below,
     # both visible together) - only when the backtest has actually been
-    # run at least once; otherwise nothing extra shows here. Checks
-    # season_report directly, not show_season_report - see the standalone
-    # branch above for why that flag specifically can't be reused here.
+    # run at least once; otherwise nothing extra shows here.
     if st.session_state.season_report is not None:
         st.divider()
         _render_season_report(st.session_state.season_report)
@@ -4742,3 +4563,49 @@ elif mode == "Coverage Matchup (premium data)":
 
 elif mode not in ("Draft Rankings", "Coverage Matchup (premium data)"):
     st.info("Click the button above to load this week's props.")
+
+if mode == "Scan (adjustable lines)":
+    st.divider()
+    # ---------------------------------------------------------------
+    # Season backtest controls - moved to the BOTTOM of the scan page,
+    # matching the MLB tool's layout (live scan/Slip Builder/Locked Slips
+    # up top, backtest trigger + results below). Previously sat right
+    # next to the daily scan button near the top; the actual per-game
+    # scan boxes above are untouched by this move.
+    # ---------------------------------------------------------------
+    st.subheader("Season backtest (2025 or a completed 2026 range)")
+    st.caption(
+        "Runs a range of weeks, not necessarily the whole season - start small "
+        "(e.g. a 4-6 week range) to confirm it works within Streamlit Cloud's free-"
+        "tier memory limit before attempting the full season in one run."
+    )
+    rcol1, rcol2 = st.columns(2)
+    with rcol1:
+        report_start_week = st.number_input(
+            "Report start week", min_value=2, max_value=18, value=2, step=1,
+            help="Week 1 is skipped automatically - there's no prior-week history to project from yet.",
+        )
+    with rcol2:
+        report_end_week = st.number_input(
+            "Report end week", min_value=2, max_value=18, value=6, step=1,
+        )
+    if st.button("Run Readiness Report for this week range", type="secondary"):
+        if report_end_week < report_start_week:
+            st.error("End week must be >= start week.")
+        else:
+            weeks_to_run = list(range(report_start_week, report_end_week + 1))
+            with st.spinner(f"Scoring weeks {report_start_week}-{report_end_week} of {season} against real results..."):
+                try:
+                    st.session_state.season_report = build_season_accuracy_report(
+                        season, weeks=weeks_to_run,
+                        coverage_bundle=st.session_state.get("coverage_bundle"),
+                        rb_bundle=st.session_state.get("rb_bundle"),
+                    )
+                    st.session_state.backtest_mode = True
+                    st.session_state.show_season_report = True
+                    n_rows = len(st.session_state.season_report["raw"])
+                    st.success(f"Scored {n_rows} rows across weeks {report_start_week}-{report_end_week} of {season}.")
+                except Exception as e:
+                    st.error(f"Season readiness report failed: {e}")
+                    st.session_state.season_report = None
+
