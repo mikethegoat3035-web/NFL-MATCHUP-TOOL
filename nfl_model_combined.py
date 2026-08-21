@@ -2706,23 +2706,31 @@ def calc_role_verification_score(role_trend: dict, min_games: int = 2) -> float:
 def calc_blended_matchup_strength(structural_exploit: float, grade_exploit: float,
                                    role_verification_score: float,
                                    structural_weight: float = 0.5,
-                                   matchup_weight: float = 0.35) -> float:
+                                   matchup_weight: float = 0.15) -> float:
     """
     Combines the structural tendency signal (coverage-elevation or
     box-count exploit strength, 0-1) with the grade-based crosswalk signal
     (calc_grade_matchup_strength, 0-1) into one matchup signal, then blends
     that with the role-verification score.
 
-    REWEIGHTED per real 2025 backtest results (build_season_accuracy_report):
-    role_verification_score showed a real, strong effect (fading-role rows
-    missed by ~37.6 yards on average vs ~21.5 for steady/growing-role rows -
-    nearly 2x), while adjustment_direction_accuracy (whether the coverage/
-    box-driven mu adjustment moved toward the real result) came back at
-    48.4% across 7,641 real rows - WORSE than a coinflip. That's real
-    evidence the structural+grade matchup_signal isn't earning the 60%
-    weight it originally had, and role_verification_score deserves more
-    than its original 40%. matchup_weight now defaults to 0.35 (was 0.6),
-    role_verification gets the remaining 0.65 (was 0.4).
+    REWEIGHTED AGAIN (real 2025 full-range backtest, 21,259 rows, run after
+    tonight's sibling-prop crosswalk work): matchup_weight had already been
+    cut from 0.6 to 0.35 once before, on real evidence the structural+grade
+    signal was underperforming. This second, larger backtest shows the
+    problem persists even at 0.35 - correlation between quality_score and
+    match_ratio came back essentially zero (roughly -0.05 to +0.05) for
+    EVERY prop type checked, including pass_yards/rush_yards/rec_yards,
+    which have had bespoke, carefully-built crosswalks the whole project,
+    not just the sibling props built tonight. That rules out "wrong
+    metrics feed the grade" as the explanation (multiple different metric
+    sets, same flat result) and points at the weighting itself still
+    being the problem, not solved by the first reweight.
+    role_verification_score, by contrast, has now been reconfirmed strong
+    and consistent across many separate real backtests (~1.8-2x miss gap
+    between fading and steady/growing role, every single time it's been
+    checked) - a genuinely proven signal, unlike matchup_exploit_strength.
+    matchup_weight cut further to 0.15 (role_verification now 0.85) on
+    that same real-evidence-driven basis as the original reweight.
 
     NOT a claim that the root cause inside the coverage/box logic itself
     has been found and fixed - the backtest export used to find this
@@ -2731,7 +2739,9 @@ def calc_blended_matchup_strength(structural_exploit: float, grade_exploit: floa
     This reweighting is a data-justified damage-limitation move (trust the
     proven signal more, the unproven/underperforming one less), not a
     verified root-cause fix. Re-run build_season_accuracy_report on the
-    same week range after this change to see whether it actually helped.
+    same week range after this change to see whether it actually helped -
+    same honest test the first reweight called for, not yet different
+    this time either.
 
     Degrades gracefully: a missing structural or grade component just
     reweights across whatever IS available; a completely absent matchup
