@@ -8,6 +8,7 @@ same workflow as the MLB tool's adjustable Best Edges table.
 import streamlit as st
 import pandas as pd
 import numpy as np
+from datetime import datetime
 from nfl_model_combined import (
     scan_full_slate_nfl, rescore_quality_mu_row_nfl, backtest_week, build_season_accuracy_report,
     diagnose_participation_data, get_player_matchup_explanation, diagnose_injuries_data,
@@ -1202,6 +1203,231 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                 "light-box/stacked-box efficiency split (see mu_before_coverage_adj / "
                 "mu_before_box_adj to compare)."
             )
+
+        st.divider()
+
+        # ---------------------------------------------------------------
+        # Quality/edge/confidence gate + Slip Builder + Locked Slips + Top-up
+        # - direct port of the MLB tool's version, same architecture, same
+        # conflict rules. Real differences from the MLB version, on
+        # purpose, not oversights:
+        #   - "matchup" (e.g. "LAR @ KC") plays the role of MLB's game_pk -
+        #     it's the real, exact per-game identifier already on every
+        #     row here, so the same-game conflict rule reuses it directly.
+        #   - No batting-order tiebreak - there's no NFL equivalent, so the
+        #     strength score here is just quality_score + edge, nothing
+        #     invented to fill that slot.
+        #   - Gate defaults to 0/0/0 (off) here, NOT MLB's 70/70/0.20 -
+        #     those numbers were never validated against NFL's own real
+        #     edge/quality distribution, so defaulting to MLB's tuned
+        #     values here would be presenting an unproven number as if it
+        #     were calibrated. Set your own once you have a feel for what
+        #     real NFL edge/quality looks like.
+        #   - Deliberately NOT added: any cross-game correlation rule
+        #     beyond literal same-matchup (e.g. flagging two different
+        #     games with a similar projected script/weather) - there's no
+        #     real weather or win-probability signal in this model to back
+        #     that rule honestly, so it's left out rather than faked.
+        # ---------------------------------------------------------------
+        st.header("🎯 Minimum bar (quality/confidence/edge)")
+        nfl_g1, nfl_g2, nfl_g3 = st.columns(3)
+        with nfl_g1:
+            nfl_min_quality_gate = st.number_input("Min quality_score", min_value=0, max_value=100, value=0, step=1, key="nfl_min_quality_gate")
+        with nfl_g2:
+            nfl_min_prob_gate = st.number_input("Min confidence % (whichever direction it leans)",
+                                                 min_value=50, max_value=100, value=50, step=1, key="nfl_min_prob_gate")
+        with nfl_g3:
+            nfl_min_edge_gate = st.number_input("Min edge", min_value=0.0, max_value=0.5, value=0.0, step=0.01, key="nfl_min_edge_gate")
+
+        nfl_confidence = scan_sorted["p_over"].apply(lambda p: max(p, 1 - p) if pd.notna(p) else np.nan)
+        nfl_qualified_df = scan_sorted[
+            (scan_sorted["quality_score"].fillna(0) >= nfl_min_quality_gate)
+            & (nfl_confidence.fillna(0) >= nfl_min_prob_gate / 100.0)
+            & (scan_sorted["edge"].fillna(0) >= nfl_min_edge_gate)
+        ].copy()
+        st.caption(f"{len(nfl_qualified_df)} of {len(scan_sorted)} rows clear the bar above.")
+
+        # Color-coded read-only view, same 3-scheme style as the MLB tool -
+        # data_editor itself can't render color (Streamlit limitation), so
+        # this sits alongside the actual checkbox-editing table below as a
+        # visual reference, not a second data source.
+        def _nfl_color_edge(val):
+            if pd.isna(val):
+                return ""
+            intensity = min(val / 0.5, 1.0)
+            return f"background-color: rgba(0, 200, 0, {intensity * 0.6})"
+
+        def _nfl_color_prob(val):
+            if pd.isna(val):
+                return ""
+            if val >= 0.5:
+                intensity = min((val - 0.5) / 0.5, 1.0)
+                return f"background-color: rgba(0, 200, 0, {intensity * 0.6})"
+            intensity = min((0.5 - val) / 0.5, 1.0)
+            return f"background-color: rgba(200, 0, 0, {intensity * 0.6})"
+
+        def _nfl_color_quality(val):
+            if pd.isna(val):
+                return ""
+            intensity = min(val / 100, 1.0)
+            return f"background-color: rgba(0, 150, 220, {intensity * 0.5})"
+
+        nfl_preview_cols = ["player_display_name", "team", "matchup", "prop_type", "line",
+                            "mu", "edge", "p_over", "quality_score", "games_sampled_current"]
+        nfl_styled_preview = (nfl_qualified_df[nfl_preview_cols].style
+                              .map(_nfl_color_edge, subset=["edge"])
+                              .map(_nfl_color_prob, subset=["p_over"])
+                              .map(_nfl_color_quality, subset=["quality_score"]))
+        st.dataframe(nfl_styled_preview, width='stretch', hide_index=True)
+
+        nfl_qualified_df.insert(0, "Include", False)
+
+        nfl_checked = st.data_editor(
+            nfl_qualified_df[["Include", "player_display_name", "team", "matchup", "prop_type",
+                              "line", "mu", "edge", "p_over", "quality_score", "games_sampled_current"]],
+            column_config={"Include": st.column_config.CheckboxColumn(
+                "Include", help="Check to add this leg to the slip builder below")},
+            disabled=["player_display_name", "team", "matchup", "prop_type", "line", "mu",
+                      "edge", "p_over", "quality_score", "games_sampled_current"],
+            width='stretch', key="nfl_include_editor",
+        )
+
+        st.header("🎰 Slip Builder")
+        nfl_target_size = st.selectbox("Target slip size", [3, 2, 4], index=0, key="nfl_slip_size")
+        nfl_selected = nfl_checked[nfl_checked["Include"] == True].copy()
+        if nfl_selected.empty:
+            st.caption("Check the Include box on legs above to start building slips.")
+        else:
+            nfl_selected["_strength"] = nfl_selected["quality_score"].fillna(50) + nfl_selected["edge"].fillna(0) * 100 * 0.5
+            nfl_selected = nfl_selected.sort_values("_strength", ascending=False).reset_index(drop=True)
+
+            n = len(nfl_selected)
+            base = nfl_target_size
+            if n < base:
+                nfl_slip_sizes = [n] if n > 0 else []
+            else:
+                n_slips, remainder = n // base, n % base
+                nfl_slip_sizes = [base] * n_slips
+                if remainder:
+                    if remainder + base <= 4:
+                        nfl_slip_sizes[-1] += remainder
+                    else:
+                        nfl_slip_sizes.append(max(2, remainder))
+
+            nfl_slips = [[] for _ in nfl_slip_sizes]
+            nfl_slip_games = [set() for _ in nfl_slip_sizes]
+            nfl_slip_players = [set() for _ in nfl_slip_sizes]
+            nfl_leftover = []
+            for _, leg in nfl_selected.iterrows():
+                placed = False
+                for i, size in enumerate(nfl_slip_sizes):
+                    if len(nfl_slips[i]) >= size:
+                        continue
+                    if leg["matchup"] in nfl_slip_games[i] or leg["player_display_name"] in nfl_slip_players[i]:
+                        continue
+                    nfl_slips[i].append(leg)
+                    nfl_slip_games[i].add(leg["matchup"])
+                    nfl_slip_players[i].add(leg["player_display_name"])
+                    placed = True
+                    break
+                if not placed:
+                    nfl_leftover.append(leg)
+
+            for i, slip in enumerate(nfl_slips):
+                if not slip:
+                    continue
+                avg_q = sum(l["quality_score"] for l in slip if pd.notna(l["quality_score"])) / max(len(slip), 1)
+                st.subheader(f"Slip {i + 1} — {len(slip)}-man (avg quality {avg_q:.0f})")
+                st.dataframe(pd.DataFrame(slip)[["player_display_name", "team", "matchup", "prop_type",
+                                                  "line", "quality_score", "edge", "games_sampled_current"]],
+                            width='stretch', hide_index=True)
+
+            if nfl_leftover:
+                st.warning(f"{len(nfl_leftover)} checked leg(s) couldn't be placed without breaking the "
+                           f"same-game/same-player rule against every open slip slot - shown below, "
+                           f"add manually or check a different combination of legs.")
+                st.dataframe(pd.DataFrame(nfl_leftover)[["player_display_name", "team", "matchup", "prop_type",
+                                                          "line", "quality_score", "edge"]],
+                            width='stretch', hide_index=True)
+
+            if st.button("🔒 Lock in these slips", key="nfl_lock_slips_btn"):
+                if "nfl_locked_slips" not in st.session_state:
+                    st.session_state.nfl_locked_slips = []
+                new_locked = [pd.DataFrame(slip)[["player_display_name", "team", "prop_type", "line",
+                                                   "quality_score", "edge", "games_sampled_current", "matchup"]]
+                              for slip in nfl_slips if slip]
+                st.session_state.nfl_locked_slips.extend(new_locked)
+                st.success(f"Locked in {len(new_locked)} slip(s) - they'll now survive a rescan.")
+
+        if st.session_state.get("nfl_locked_slips"):
+            st.divider()
+            st.header("🔒 Locked Slips (survive a rescan)")
+            st.caption("Saved copies - rescanning above won't touch these. Survives a rescan, "
+                       "not a full app reboot/redeploy (that restarts everything from scratch).")
+            nfl_all_locked = pd.concat(
+                st.session_state.nfl_locked_slips,
+                keys=range(1, len(st.session_state.nfl_locked_slips) + 1), names=["slip_number"]
+            ).reset_index(level=0)
+            nfl_locked_display_cols = [c for c in nfl_all_locked.columns if c != "matchup"]
+            nfl_locked_csv = nfl_all_locked[nfl_locked_display_cols].to_csv(index=False).encode("utf-8")
+            st.download_button("📥 Download ALL locked slips as CSV", nfl_locked_csv,
+                               file_name=f"nfl_locked_slips_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                               mime="text/csv", key="nfl_dl_locked_slips")
+
+            nfl_currently_checked = nfl_qualified_df.merge(
+                nfl_checked[nfl_checked["Include"] == True][["player_display_name", "prop_type", "line"]],
+                on=["player_display_name", "prop_type", "line"], how="inner",
+            ) if not nfl_checked.empty else pd.DataFrame()
+            nfl_growable = [i for i, s in enumerate(st.session_state.nfl_locked_slips) if len(s) < 4]
+            if not nfl_currently_checked.empty and nfl_growable:
+                st.subheader("Add a checked leg to an existing locked slip")
+                nfl_target_idx = st.selectbox(
+                    "Which locked slip?", nfl_growable,
+                    format_func=lambda i: f"Locked Slip {i + 1} ({len(st.session_state.nfl_locked_slips[i])}-man, room for {4 - len(st.session_state.nfl_locked_slips[i])} more)",
+                    key="nfl_topup_target",
+                )
+                nfl_leg_opts = list(nfl_currently_checked["player_display_name"] + " - " + nfl_currently_checked["prop_type"])
+                nfl_picks = st.multiselect("Which checked leg(s) to add?", nfl_leg_opts, key="nfl_topup_legs")
+                if st.button("Add to locked slip", key="nfl_topup_btn") and nfl_picks:
+                    target = st.session_state.nfl_locked_slips[nfl_target_idx]
+                    existing_games = set(target["matchup"])
+                    existing_players = set(target["player_display_name"])
+                    added, skipped = 0, []
+                    for pick in nfl_picks:
+                        row = nfl_currently_checked[
+                            (nfl_currently_checked["player_display_name"] + " - " + nfl_currently_checked["prop_type"]) == pick
+                        ].iloc[0]
+                        if len(target) >= 4:
+                            skipped.append((pick, "slip already at 4-man max")); continue
+                        if row["player_display_name"] in existing_players:
+                            skipped.append((pick, "same player already in this slip")); continue
+                        if row["matchup"] in existing_games:
+                            skipped.append((pick, "another leg from this same game is already in this slip")); continue
+                        target = pd.concat([target, pd.DataFrame([row[
+                            ["player_display_name", "team", "prop_type", "line", "quality_score",
+                             "edge", "games_sampled_current", "matchup"]
+                        ]])], ignore_index=True)
+                        existing_players.add(row["player_display_name"]); existing_games.add(row["matchup"])
+                        added += 1
+                    st.session_state.nfl_locked_slips[nfl_target_idx] = target
+                    if added:
+                        st.success(f"Added {added} leg(s) to Locked Slip {nfl_target_idx + 1}.")
+                    if skipped:
+                        st.warning("Skipped: " + ", ".join(f"{p} ({r})" for p, r in skipped))
+
+            for i, locked_slip in enumerate(st.session_state.nfl_locked_slips):
+                lcol1, lcol2 = st.columns([5, 1])
+                with lcol1:
+                    st.subheader(f"Locked Slip {i + 1} — {len(locked_slip)}-man")
+                with lcol2:
+                    if st.button("Remove", key=f"nfl_remove_locked_{i}"):
+                        st.session_state.nfl_locked_slips.pop(i)
+                        st.rerun()
+                display_cols_locked = [c for c in locked_slip.columns if c != "matchup"]
+                st.dataframe(locked_slip[display_cols_locked], width='stretch', hide_index=True)
+            if st.button("Clear ALL locked slips", key="nfl_clear_all_locked"):
+                st.session_state.nfl_locked_slips = []
+                st.rerun()
 
 elif mode == "Coverage Matchup (premium data)":
     st.subheader("Coverage Matchup — Premium FantasyPoints Data")
