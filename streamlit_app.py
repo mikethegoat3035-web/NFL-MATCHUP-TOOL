@@ -574,7 +574,7 @@ def _render_season_report(report):
     if raw.empty:
         st.warning("No scoreable rows came back for this season - check that the season has completed weeks with real player_stats data.")
         return
-    st.subheader(f"Season Readiness Report — {season}")
+    st.subheader(f"Season Readiness Report — {report.get('season', season)}")
     st.caption(
         "Every starter row across every completed week, mu vs real result - not just "
         "the biggest surprises. This is the pre-season calibration check: is "
@@ -4579,6 +4579,23 @@ if mode == "Scan (adjustable lines)":
         "(e.g. a 4-6 week range) to confirm it works within Streamlit Cloud's free-"
         "tier memory limit before attempting the full season in one run."
     )
+    # REAL BUG FOUND AND FIXED: this section used to silently reuse the
+    # TOP section's "season" widget - meaning setting season=2026 up top
+    # for a live scan also forced this backtest to run against 2026,
+    # whether or not enough real games existed yet, with no way to
+    # independently check 2025's completed season while scanning 2026
+    # live. Genuinely separate, own widget now - defaults to 2025 (the
+    # last fully-completed season, the safe default for methodology
+    # checks), switchable to 2026 later once real weeks have actually
+    # been played, completely independent of whatever the top section
+    # is currently scanning.
+    bt_season = st.number_input(
+        "Backtest season", min_value=2020, max_value=2030, value=2025, step=1,
+        help="Independent of the Season picker above - set this to 2025 to validate "
+             "methodology on a complete season, or to 2026 later once enough real "
+             "weeks exist to check progress mid-season.",
+        key="bt_season_input",
+    )
     rcol1, rcol2 = st.columns(2)
     with rcol1:
         report_start_week = st.number_input(
@@ -4594,17 +4611,18 @@ if mode == "Scan (adjustable lines)":
             st.error("End week must be >= start week.")
         else:
             weeks_to_run = list(range(report_start_week, report_end_week + 1))
-            with st.spinner(f"Scoring weeks {report_start_week}-{report_end_week} of {season} against real results..."):
+            with st.spinner(f"Scoring weeks {report_start_week}-{report_end_week} of {bt_season} against real results..."):
                 try:
                     st.session_state.season_report = build_season_accuracy_report(
-                        season, weeks=weeks_to_run,
+                        bt_season, weeks=weeks_to_run,
                         coverage_bundle=st.session_state.get("coverage_bundle"),
                         rb_bundle=st.session_state.get("rb_bundle"),
                     )
+                    st.session_state.season_report["season"] = bt_season
                     st.session_state.backtest_mode = True
                     st.session_state.show_season_report = True
                     n_rows = len(st.session_state.season_report["raw"])
-                    st.success(f"Scored {n_rows} rows across weeks {report_start_week}-{report_end_week} of {season}.")
+                    st.success(f"Scored {n_rows} rows across weeks {report_start_week}-{report_end_week} of {bt_season}.")
                 except Exception as e:
                     st.error(f"Season readiness report failed: {e}")
                     st.session_state.season_report = None
