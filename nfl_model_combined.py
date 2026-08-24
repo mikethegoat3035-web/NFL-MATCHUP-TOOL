@@ -152,6 +152,34 @@ def _pull_years_gracefully(loader_fn, years: list[int]) -> pd.DataFrame:
         # that also needs a player-specific column will correctly find
         # zero rows to work with either way, same end result as a
         # genuinely successful pull that just has no data for this week.
+        # FURTHER REAL FIX (found live this session): the season/week-only
+        # stub above covers every filter that only ever checks season/week,
+        # but real code elsewhere in this file also does column-specific
+        # merges/selects (game_id, play_id, defteam, posteam,
+        # nflverse_game_id, play_type, sack_player_id, etc.) that aren't
+        # covered by season/week alone. Confirmed via a live crash scanning
+        # a season with zero real games played yet (2026, before its
+        # season started): KeyError: 'nflverse_game_id' inside
+        # build_blended_coverage_profile, and the identical shape of crash
+        # in build_box_count_profile - neither guarded by the stub above,
+        # since neither of those is filtering on season/week. Rather than
+        # hand-list every column every pull_* type actually needs (a real
+        # maintenance trap - a new merge added later could silently need a
+        # column such a list doesn't have), fall back to the immediately
+        # PRIOR year's real schema as a template: if last year's pull for
+        # this same loader_fn succeeds, borrow its real columns with ZERO
+        # rows. Any filter/merge on any column now correctly finds zero
+        # rows instead of crashing, and the season/week-only stub below
+        # still covers the rare case where even the prior year fails too
+        # (a genuinely new stat type with no history at all).
+        try:
+            prior_year = min(years) - 1
+            template = loader_fn(seasons=[prior_year])
+            template = template.to_pandas() if hasattr(template, "to_pandas") else template
+            if template is not None and len(template.columns) > 2:
+                return template.iloc[0:0].copy()
+        except Exception:
+            pass
         return pd.DataFrame({"season": pd.Series(dtype="int64"), "week": pd.Series(dtype="int64")})
     return pd.concat(frames, ignore_index=True)
 
@@ -185,7 +213,14 @@ def pull_player_stats(years: list[int]) -> pd.DataFrame:
     """
     df = _pull_years_gracefully(nfl.load_player_stats, years)
     df = df.to_pandas() if hasattr(df, "to_pandas") else df
-    if not df.empty:
+    # NOTE: checks columns, not df.empty - a real-schema-but-zero-rows frame
+    # (a season with no games played yet, post the schema-template fix in
+    # _pull_years_gracefully above) is also "empty" by pandas' definition,
+    # but still needs this rename applied so downstream gsis_id joins find
+    # the column at all instead of silently seeing player_id. Confirmed via
+    # a live crash otherwise: KeyError: 'gsis_id' in build_league_fallback_
+    # sigmas when scanning a season with zero real games played yet.
+    if "player_id" in df.columns:
         df = df.rename(columns={"player_id": "gsis_id"})
     return df
 
@@ -3103,9 +3138,21 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
       team_changed, use_depth_chart_estimate
     """
     schedules_df = pull_schedules([season])
-    rosters_df = pull_rosters([season])
+    # REAL BUG FOUND+FIXED this session: rosters_df/player_stats_df were
+    # pulled for the CURRENT season only, but detect_role_change() (line
+    # ~1144) and 5 separate prior_season_query fallback branches later in
+    # this function all filter these same two DataFrames for season - 1
+    # rows - a real, previously undetected gap that silently never had
+    # anything to fall back to. It stayed invisible for weeks 4+ of an
+    # already-underway season (current-season history alone was always
+    # enough to avoid the empty-fallback path), and only surfaced as
+    # visibly broken (0 output rows, no crash) scanning a season with zero
+    # current-season games yet - exactly the week 1 case this fallback
+    # exists for. Pulling both seasons here, once, is what every one of
+    # those 6 call sites already assumed was happening.
+    rosters_df = pull_rosters([season, season - 1])
     depth_charts_df = pull_depth_charts([season]) if nfl else pd.DataFrame()
-    player_stats_df = pull_player_stats([season])
+    player_stats_df = pull_player_stats([season, season - 1])
     ngs_pass_df = pull_ngs("passing", [season])
     ngs_rush_df = pull_ngs("rushing", [season])
     ngs_rec_df = pull_ngs("receiving", [season])
