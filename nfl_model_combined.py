@@ -2292,6 +2292,225 @@ def build_defense_advanced_metrics(season: int, week: int, pbp_df: pd.DataFrame,
     return merged
 
 
+# ---------------------------------------------------------------------------
+# 5f. PERSONNEL-CHANGE ADJUSTMENT - accounts for real offseason defensive
+#     roster churn (trades/FA signings) so weeks 1-5 defense grades (before
+#     enough current-season pbp accumulates to reflect it organically)
+#     reflect actual new personnel instead of stale team-level history.
+#     CONFIRMED: the offense side already handles this correctly -
+#     detect_role_change() lets individual player grades follow a traded
+#     player via gsis_id regardless of team, no fix needed there. This is
+#     the DEFENSE-side gap: def_metrics_df (build_defense_advanced_metrics,
+#     above) is team-level only, with no way to reflect "this defense just
+#     lost its best pass rusher" until real current-season snaps pile up.
+# ---------------------------------------------------------------------------
+
+DEFENSE_POSITION_GRADE_MAP = {
+    # Real position groups confirmed against a live load_rosters() pull
+    # (broad groups only - DL/LB/DB - nflreadpy does not expose fine-
+    # grained DE/DT/OLB/ILB/CB/S splits). Maps each group to the
+    # def_metrics_df *_grade columns a changed player at that position
+    # would plausibly move.
+    "DL": ["pressure_rate_generated_grade", "run_epa_allowed_grade", "run_explosive_allowed_rate_grade"],
+    "LB": ["run_epa_allowed_grade", "run_explosive_allowed_rate_grade", "pass_epa_allowed_grade"],
+    "DB": ["pass_epa_allowed_grade", "pass_explosive_allowed_rate_grade"],
+}
+
+
+def detect_team_changes(season: int, week: int, rosters_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Systematic year-over-year roster comparison for defensive personnel
+    (DL/LB/DB) - catches trades AND free-agent signings alike, not a
+    hand-picked list. For every defender on this season's roster whose
+    team differs from where they were on last season's roster, returns
+    one row: gsis_id, full_name, position, old_team (departure side),
+    new_team (arrival side). A real trade shows up as two separate rows
+    (one per player moving), so it nets out correctly on both teams once
+    calc_personnel_change_adjustment applies both - see below.
+
+    Real limitation: only catches players who were on an NFL roster in
+    BOTH seasons. A rookie's first team correctly does not appear here
+    (no prior_team to compare against, not a "change").
+    """
+    current = rosters_df[
+        (rosters_df["season"] == season) & (rosters_df["position"].isin(DEFENSE_POSITION_GRADE_MAP))
+    ][["gsis_id", "team", "position", "full_name"]].drop_duplicates(subset=["gsis_id"])
+    prior = rosters_df[
+        (rosters_df["season"] == season - 1) & (rosters_df["position"].isin(DEFENSE_POSITION_GRADE_MAP))
+    ][["gsis_id", "team"]].drop_duplicates(subset=["gsis_id"]).rename(columns={"team": "prior_team"})
+
+    if current.empty or prior.empty:
+        return pd.DataFrame(columns=["gsis_id", "full_name", "position", "old_team", "new_team"])
+
+    merged = current.merge(prior, on="gsis_id", how="inner")
+    changed = merged[merged["team"] != merged["prior_team"]].copy()
+    changed = changed.rename(columns={"team": "new_team", "prior_team": "old_team"})
+    return changed[["gsis_id", "full_name", "position", "old_team", "new_team"]].reset_index(drop=True)
+
+
+def build_defender_individual_metrics(season: int, week: int, pbp_df: pd.DataFrame,
+                                       rosters_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Real per-player defensive counting stats from pbp (sacks incl. half-
+    sacks weighted 0.5 each - same convention as the official stat -, QB
+    hits, tackles-for-loss, interceptions weighted 2x as a real turnover
+    vs a mere disruption, pass-defenses) - everything else defensive in
+    this file is team-level only, so a changed starter's OWN quality had
+    nowhere to plug in without this.
+
+    CONFIRMED real pbp columns (checked directly against a live pull,
+    same verify-before-build discipline as the coverage-casing bug):
+    sack_player_id, half_sack_1/2_player_id, qb_hit_1/2_player_id,
+    tackle_for_loss_1/2_player_id, interception_player_id, pass_defense_
+    1/2_player_id. Uses weeks BEFORE the target week only, same leak-
+    avoidance as everywhere else in this file.
+
+    Each defender is attributed to whichever defteam he was actually
+    credited with these counted plays for (not trusted from a roster
+    snapshot) - catches an in-season trade directly from the real plays.
+    Counts are normalized by that team's real games played so far this
+    season, then percentile-graded WITHIN position group (DL/LB/DB
+    separately, via rosters_df - a DB's near-zero sack count isn't a real
+    signal of anything, and mixing groups would bury the real signal each
+    group does have).
+
+    Real limitation (stated, not fixed): no per-snap normalization is
+    possible here - pull_snap_counts() keys on pfr_player_id, a different
+    id system than gsis_id with no verified crosswalk in this codebase
+    (same reason build_role_trend doesn't use it either). Team-games-
+    played is a rough exposure proxy, not a true per-snap rate.
+    """
+    hist = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)]
+    if hist.empty:
+        return pd.DataFrame()
+
+    id_cols_weighted = [
+        ("sack_player_id", 1.0),
+        ("half_sack_1_player_id", 0.5),
+        ("half_sack_2_player_id", 0.5),
+        ("qb_hit_1_player_id", 1.0),
+        ("qb_hit_2_player_id", 1.0),
+        ("tackle_for_loss_1_player_id", 1.0),
+        ("tackle_for_loss_2_player_id", 1.0),
+        ("interception_player_id", 2.0),
+        ("pass_defense_1_player_id", 1.0),
+        ("pass_defense_2_player_id", 1.0),
+    ]
+    id_cols_weighted = [(c, w) for c, w in id_cols_weighted if c in hist.columns]
+    if not id_cols_weighted:
+        return pd.DataFrame()
+
+    long_rows = []
+    for col, weight in id_cols_weighted:
+        sub = hist[[col, "defteam", "game_id"]].dropna(subset=[col]).rename(columns={col: "gsis_id"})
+        sub["weight"] = weight
+        long_rows.append(sub)
+    long_df = pd.concat(long_rows, ignore_index=True)
+    if long_df.empty:
+        return pd.DataFrame()
+
+    impact = long_df.groupby("gsis_id")["weight"].sum().reset_index(name="impact_raw")
+    team_attribution = long_df.groupby("gsis_id")["defteam"].agg(lambda s: s.value_counts().idxmax())
+    games_per_team = hist.groupby("defteam")["game_id"].nunique()
+
+    impact["defteam"] = impact["gsis_id"].map(team_attribution)
+    impact["team_games"] = impact["defteam"].map(games_per_team)
+    impact = impact.dropna(subset=["defteam", "team_games"])
+    impact = impact[impact["team_games"] > 0]
+    impact["impact_rate"] = impact["impact_raw"] / impact["team_games"]
+
+    # Position comes from the CURRENT roster snapshot (this season), so a
+    # player traded mid-season still grades within his real position group.
+    pos_lookup = rosters_df[rosters_df["season"] == season][["gsis_id", "position"]].drop_duplicates(subset=["gsis_id"])
+    impact = impact.merge(pos_lookup, on="gsis_id", how="left")
+    impact = impact.dropna(subset=["position"])
+    impact = impact[impact["position"].isin(DEFENSE_POSITION_GRADE_MAP)]
+    if impact.empty:
+        return pd.DataFrame()
+
+    impact["defender_impact_grade"] = np.nan
+    for pos, group in impact.groupby("position"):
+        impact.loc[group.index, "defender_impact_grade"] = group["impact_rate"].apply(
+            lambda v: calc_percentile_grade(v, group["impact_rate"])
+        )
+
+    return impact[["gsis_id", "position", "defteam", "impact_raw", "team_games",
+                    "impact_rate", "defender_impact_grade"]].reset_index(drop=True)
+
+
+def calc_personnel_change_adjustment(def_metrics_df: pd.DataFrame, team_changes_df: pd.DataFrame,
+                                      defender_metrics_df: pd.DataFrame, weight_cap: float = 0.30) -> pd.DataFrame:
+    """
+    Blends each changed defender's OWN grade (build_defender_individual_
+    metrics) into his new/old team's team-level defense grades
+    (def_metrics_df, build_defense_advanced_metrics) - the real fix for
+    the gap confirmed above: a defense that just lost its best pass rusher
+    keeps its OLD team-level pass-rush grade until enough real current-
+    season pbp accumulates (weeks 1-5ish), exactly the window this fixes.
+
+    Direction is symmetric, so a real two-player trade nets out on both
+    sides:
+      - ARRIVAL: the new team's relevant grade columns blend TOWARD the
+        player's own defender_impact_grade (gaining a great player raises
+        the relevant grades; gaining a replacement-level one barely moves
+        them).
+      - DEPARTURE: the old team's relevant grade columns blend toward the
+        INVERSE of the player's grade (100 - grade) - losing a great
+        player hurts those grades, losing a replacement-level one barely
+        moves them.
+
+    weight scales with how far the player's grade is from a neutral 50 (a
+    truly average changed starter barely moves anything), capped at
+    weight_cap (default 30%) for any single player so one offseason move
+    can meaningfully nudge a grade but never dominate it.
+
+    Only the *_grade columns listed in DEFENSE_POSITION_GRADE_MAP for that
+    player's position group are touched (a DB trade doesn't touch run-
+    defense grades, etc.) - the underlying raw stat columns (pass_epa_
+    allowed, etc.) are left alone, same as every other adjustment layer
+    in this file (mu_before_* pattern).
+
+    Real stated limitations (not fixed here): a changed defender with NO
+    row in defender_metrics_df (no countable sack/hit/TFL/INT/PD all
+    season - common for run-stuffing DL or zone-heavy DBs) is skipped
+    entirely rather than defaulted to a neutral 50, since "no data" and
+    "average" aren't the same thing. A player who changes BOTH position
+    group and team in the same move isn't specially handled - he's scored
+    under whatever position group his CURRENT roster row shows. A real
+    starter whose value doesn't show up in a countable stat gets zero
+    adjustment - a structural gap, not a bug.
+    """
+    if def_metrics_df is None or def_metrics_df.empty or team_changes_df is None or team_changes_df.empty:
+        return def_metrics_df
+
+    adjusted = def_metrics_df.copy()
+    grade_lookup = (
+        defender_metrics_df.set_index("gsis_id")["defender_impact_grade"].to_dict()
+        if defender_metrics_df is not None and not defender_metrics_df.empty else {}
+    )
+
+    for _, change in team_changes_df.iterrows():
+        player_grade = grade_lookup.get(change["gsis_id"])
+        if player_grade is None or pd.isna(player_grade):
+            continue  # no countable stat for this player this season - skip, don't guess
+
+        cols = DEFENSE_POSITION_GRADE_MAP.get(change["position"], [])
+        weight = min(abs(player_grade - 50) / 50 * weight_cap, weight_cap)
+        if weight <= 0 or not cols:
+            continue
+
+        for team, target_grade in ((change["new_team"], player_grade), (change["old_team"], 100 - player_grade)):
+            if team not in adjusted["defteam"].values:
+                continue
+            row_idx = adjusted.index[adjusted["defteam"] == team]
+            for col in cols:
+                if col not in adjusted.columns:
+                    continue
+                adjusted.loc[row_idx, col] = adjusted.loc[row_idx, col].apply(
+                    lambda v: round(v * (1 - weight) + target_grade * weight, 1) if pd.notna(v) else v
+                )
+
+    return adjusted
 
 
 def calc_coverage_quality_score(coverage_row: dict, coverage_profile_df: pd.DataFrame = None,
@@ -2587,6 +2806,21 @@ ENABLE_COVERAGE_MU_ADJUSTMENT = False
 # a reliable real sample for (renormalized, not forced). Kept OFF by
 # default pending its own live test - untested, not yet proven either way.
 ENABLE_FULL_COVERAGE_MU_ADJUSTMENT = False
+
+# Defense-side personnel-change adjustment (detect_team_changes /
+# build_defender_individual_metrics / calc_personnel_change_adjustment,
+# see section 5f above). Built and unit-verified standalone in a prior
+# session but never wired into a live scan before now - kept OFF by
+# default pending its own isolated live test (weeks 1-5 specifically,
+# since that's the exact window it's meant to help; weeks 6+ already
+# lean on real current-season pbp and this should matter less there),
+# same one-change-at-a-time discipline as every other flag in this
+# section. When True, def_metrics_df's *_grade columns are adjusted
+# in-place inside build_weekly_slate right after def_pa_profile merges
+# in, before any of the three get_defense_grades() call sites read it -
+# so pass_yards/rec_yards/rush_yards quality_score all see it identically,
+# no separate wiring needed per prop type.
+ENABLE_PERSONNEL_CHANGE_ADJUSTMENT = False
 
 
 PROP_METRIC_CROSSWALK = {
@@ -2981,6 +3215,17 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
             def_pa_profile[["defteam", "pa_epa_allowed", "pa_vulnerability_gap", "pa_epa_allowed_grade"]],
             on="defteam", how="left",
         )
+
+    # Personnel-change adjustment (see section 5f) - gated, off by default
+    # pending its own isolated live test. Applied last, after every other
+    # merge into def_metrics, so it nudges the FINAL grades every prop
+    # type's get_defense_grades() call reads, not an intermediate state.
+    team_changes = pd.DataFrame()
+    if ENABLE_PERSONNEL_CHANGE_ADJUSTMENT and not def_metrics.empty:
+        team_changes = detect_team_changes(season, week, rosters_df)
+        if not team_changes.empty:
+            defender_metrics = build_defender_individual_metrics(season, week, pbp_history_df, rosters_df)
+            def_metrics = calc_personnel_change_adjustment(def_metrics, team_changes, defender_metrics)
 
     this_week_games = schedules_df[
         (schedules_df["season"] == season) & (schedules_df["week"] == week)
