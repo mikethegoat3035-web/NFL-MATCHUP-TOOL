@@ -267,7 +267,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v37-2026-empty-season-scan-fix-2026-08-24"
+DEPLOY_VERSION = "v38-empty-filtered-slate-crash-fix-2026-08-24"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -1024,8 +1024,28 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                 results.append({**row.to_dict(), "p_over": np.nan, "edge": np.nan})
 
         scored_df = pd.DataFrame(results)
-        if min_edge_filter > 0:
+        if min_edge_filter > 0 and "edge" in scored_df.columns:
             scored_df = scored_df[scored_df["edge"].fillna(0) >= min_edge_filter]
+
+        if scored_df.empty:
+            # REAL BUG FOUND+FIXED this session: an empty `results` list
+            # (every row filtered out upstream by quality_score/games_
+            # sampled_current/prop/position - genuinely possible for a
+            # week 1 scan, where games_sampled_current is 0 for everyone
+            # until real current-season data accumulates) produces
+            # pd.DataFrame([]) - ZERO ROWS AND ZERO COLUMNS, not just zero
+            # rows. "edge" then isn't a column at all, so it silently drops
+            # out of display_cols below and .sort_values("edge") crashes
+            # with a raw KeyError instead of showing a clear message.
+            # Short-circuit here with the same graceful-degrade pattern
+            # used throughout this file rather than let it reach the sort.
+            st.info(
+                "No rows match the current filters. Early in a season (week 1-3 "
+                "especially) most players still show games_sampled_current = 0, "
+                "so a min-games or min-quality filter can wipe out the whole "
+                "slate - try lowering those filters."
+            )
+            st.stop()
 
         base_display_cols = ["player_display_name", "team", "matchup", "position", "prop_type",
                               "mu", "sigma", "data_confidence", "games_sampled_current",
