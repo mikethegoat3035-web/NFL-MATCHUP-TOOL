@@ -2843,7 +2843,7 @@ ENABLE_BOX_MU_ADJUSTMENT = False
 # actual mu multiplier), not a remaining bug in either implementation.
 # Disabled from moving mu for the same reason as box; still computed and
 # shown via mu_before_coverage_adj for comparison.
-ENABLE_COVERAGE_MU_ADJUSTMENT = True  # v11 casing fix + isolated test - flipped on for the first real live test of this mechanism, nothing else changed this round
+ENABLE_COVERAGE_MU_ADJUSTMENT = False  # TESTED LIVE (weeks 4-11, n=1027 fired rows) - mechanism confirmed working (v11 casing fix genuinely fires now, 78% of eligible rows), but the EFFECT is a coin flip: adjustment_direction_accuracy 51.0% (target 58-62%), abs_miss on adjusted rows got slightly WORSE (30.22->30.35). Same real-but-unhelpful verdict as box adjustment. Coverage as a GRADING INPUT (man/zone lean, dominant coverage, coverage-specific outliers feeding quality_score/grade_matchup_strength) is untouched and stays fully on - only this direct blunt man/zone mu-nudge is disabled. mu_before_coverage_adj still populated for comparison
 
 # NEW, SEPARATE mechanism - full-coverage-type player split (Cover 0-9
 # individually, not just the coarser man/zone binary above). Built per
