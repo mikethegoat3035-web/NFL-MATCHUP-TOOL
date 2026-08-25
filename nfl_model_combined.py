@@ -2843,7 +2843,7 @@ ENABLE_BOX_MU_ADJUSTMENT = False
 # actual mu multiplier), not a remaining bug in either implementation.
 # Disabled from moving mu for the same reason as box; still computed and
 # shown via mu_before_coverage_adj for comparison.
-ENABLE_COVERAGE_MU_ADJUSTMENT = False
+ENABLE_COVERAGE_MU_ADJUSTMENT = True  # v11 casing fix + isolated test - flipped on for the first real live test of this mechanism, nothing else changed this round
 
 # NEW, SEPARATE mechanism - full-coverage-type player split (Cover 0-9
 # individually, not just the coarser man/zone binary above). Built per
