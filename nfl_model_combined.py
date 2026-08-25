@@ -557,7 +557,18 @@ def build_qb_playaction_profile(season: int, week: int, pbp_df: pd.DataFrame,
     hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)
                        & (pbp_df["play_type"] == "pass")]
     if hist_pbp.empty:
-        return pd.DataFrame()
+        # REAL FIX (found live this session): a bare pd.DataFrame() here
+        # (zero columns, not just zero rows) crashes the FIRST unguarded
+        # caller that does qb_pa_profile["gsis_id"] directly (confirmed
+        # live: KeyError: 'gsis_id' scanning a season with zero games
+        # played yet - week 1 of ANY season structurally hits this, since
+        # weeks < 1 is always empty regardless of the season). Every
+        # OTHER consumer of this function already guards with
+        # `if not qb_pa_profile.empty:` first, so declaring the real
+        # output schema here (0 rows) is a strictly safer no-op for them
+        # and the actual fix for the one unguarded site.
+        return pd.DataFrame(columns=["gsis_id", "pa_epa", "pa_plays", "non_pa_epa", "non_pa_plays",
+                                      "pa_rate", "pa_epa_diff", "pa_rate_grade", "pa_epa_diff_grade"])
 
     merged = hist_pbp.merge(
         ftn_df[["nflverse_game_id", "nflverse_play_id", "is_play_action"]],
@@ -565,7 +576,7 @@ def build_qb_playaction_profile(season: int, week: int, pbp_df: pd.DataFrame,
     )
     df = merged.dropna(subset=["passer_player_id", "is_play_action"])
     if df.empty:
-        return pd.DataFrame()
+        return df  # already has real columns from the merge above (just 0 rows) - safe as-is
 
     agg = df.groupby(["passer_player_id", "is_play_action"]).agg(
         epa=("epa", "mean"), n=("epa", "count"),
@@ -596,7 +607,10 @@ def build_defense_playaction_allowed(season: int, week: int, pbp_df: pd.DataFram
     hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)
                        & (pbp_df["play_type"] == "pass")]
     if hist_pbp.empty:
-        return pd.DataFrame()
+        # Same real fix as build_qb_playaction_profile above - see its
+        # comment for the full reasoning (confirmed live crash otherwise).
+        return pd.DataFrame(columns=["defteam", "pa_epa_allowed", "non_pa_epa_allowed",
+                                      "pa_vulnerability_gap", "pa_epa_allowed_grade"])
 
     merged = hist_pbp.merge(
         ftn_df[["nflverse_game_id", "nflverse_play_id", "is_play_action"]],
@@ -604,7 +618,7 @@ def build_defense_playaction_allowed(season: int, week: int, pbp_df: pd.DataFram
     )
     df = merged.dropna(subset=["defteam", "is_play_action"])
     if df.empty:
-        return pd.DataFrame()
+        return df  # already has real columns from the merge above (just 0 rows) - safe as-is
 
     agg = df.groupby(["defteam", "is_play_action"]).agg(epa=("epa", "mean")).reset_index()
     pa = agg[agg["is_play_action"] == True].rename(columns={"epa": "pa_epa_allowed"}).drop(columns=["is_play_action"])
@@ -3170,18 +3184,42 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
     # week's own result would be data leakage, not a real projection.
     pbp_history_df = pbp_df[pbp_df["week"] < week]
 
-    # Per-game longest-play tables for the new longest_completion/
+    # Prior-season pulls for the cross-season, team-filtered coverage/box
+    # efficiency fallbacks (build_player_coverage_efficiency,
+    # build_player_rush_box_efficiency) - lets players who DIDN'T change
+    # teams use last season's plays for a much better sample early in a
+    # new season, while still correctly excluding a traded player's
+    # old-team plays. Pulled here (moved above the longest-play tables
+    # below) so both can share the same prior_pbp_df pull.
+    prior_participation_df = pull_participation([season - 1])
+    prior_pbp_df = pull_pbp([season - 1])
+    prior_ftn_df = pull_ftn_charting([season - 1])
+
+    # Per-game longest-play tables for the longest_completion/
     # longest_reception/longest_rush props (see build_longest_play_by_game).
-    # Built once here, current season only (weeks before target week) -
-    # NOTE: unlike calc_prop_mu's own_stats path, these are NOT bridged to
-    # a prior-season fallback (that would need prior_pbp_df run through
-    # the same aggregation too) - an intentional scope limit for this
-    # first pass, so Week 1-2 rows for these 3 props will more often come
-    # back NaN (flagged low-confidence, not guessed) than the yardage
-    # props do. Revisit if that proves too big a gap in practice.
-    qb_longest_df = build_longest_play_by_game(pbp_history_df, "QB")
-    rec_longest_df = build_longest_play_by_game(pbp_history_df, "WR")
-    rush_longest_df = build_longest_play_by_game(pbp_history_df, "RB")
+    # REAL FIX (found live this session, closing the gap the original
+    # comment here explicitly flagged as worth revisiting): these are now
+    # bridged to a prior-season fallback exactly like every other prop's
+    # own-history mu, by concatenating this season's per-game longest-play
+    # rows with last season's, same team-scoped shape calc_prop_mu already
+    # knows how to blend from (current_team=team passed at each call site
+    # below, not None) - a traded player's old-team longest plays are
+    # excluded by that same existing team-match logic, not specially
+    # handled here. Before this fix, Week 1-3 longest_X props were
+    # structurally guaranteed NaN even when the yardage/volume props for
+    # the same player had a perfectly good prior-season number to show.
+    qb_longest_df = pd.concat([
+        build_longest_play_by_game(pbp_history_df, "QB"),
+        build_longest_play_by_game(prior_pbp_df, "QB"),
+    ], ignore_index=True)
+    rec_longest_df = pd.concat([
+        build_longest_play_by_game(pbp_history_df, "WR"),
+        build_longest_play_by_game(prior_pbp_df, "WR"),
+    ], ignore_index=True)
+    rush_longest_df = pd.concat([
+        build_longest_play_by_game(pbp_history_df, "RB"),
+        build_longest_play_by_game(prior_pbp_df, "RB"),
+    ], ignore_index=True)
 
     # BUGFIX: explosive_rates was previously computed from the full-season
     # pbp_df (including the target week itself and every week after it) -
@@ -3189,16 +3227,6 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
     # guards against. Now built from pbp_history_df, same as every other
     # weeks-before-target computation in this file.
     explosive_rates = build_explosive_rates(pbp_history_df)
-
-    # Prior-season pulls for the cross-season, team-filtered coverage/box
-    # efficiency fallbacks (build_player_coverage_efficiency,
-    # build_player_rush_box_efficiency) - lets players who DIDN'T change
-    # teams use last season's plays for a much better sample early in a
-    # new season, while still correctly excluding a traded player's
-    # old-team plays.
-    prior_participation_df = pull_participation([season - 1])
-    prior_pbp_df = pull_pbp([season - 1])
-    prior_ftn_df = pull_ftn_charting([season - 1])
 
     # Collects each player's quality_score(s) across pass/rush/rec rows so
     # the fantasy_points row below can average them, the same way the MLB
@@ -3507,11 +3535,11 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                     "games_sampled_current": confidence_info["games_sampled_current"],
                 })
 
-            # Longest completion - own-history-only (see qb_longest_df note
-            # above: no prior-season bridge yet), so min_games gates it more
-            # often than the other props for thin-sample QBs.
-            longest_mu = calc_prop_mu(gsis_id, "longest_play", qb_longest_df, season, week, current_team=None)
-            longest_sigma = calc_player_sigma(gsis_id, "longest_play", qb_longest_df, season, week, current_team=None)
+            # Longest completion - now bridged to prior season too (see
+            # qb_longest_df build note above), team-scoped like every
+            # other prop's fallback.
+            longest_mu = calc_prop_mu(gsis_id, "longest_play", qb_longest_df, season, week, current_team=team)
+            longest_sigma = calc_player_sigma(gsis_id, "longest_play", qb_longest_df, season, week, current_team=team)
             rows.append({
                 "gsis_id": gsis_id, "player_display_name": qb.get("full_name"),
                 "team": team, "position": "QB", "prop_type": "longest_completion",
@@ -3659,8 +3687,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                         "games_sampled_current": rb_confidence_info["games_sampled_current"],
                     })
 
-                longest_rush_mu = calc_prop_mu(gsis_id, "longest_play", rush_longest_df, season, week, current_team=None)
-                longest_rush_sigma = calc_player_sigma(gsis_id, "longest_play", rush_longest_df, season, week, current_team=None)
+                longest_rush_mu = calc_prop_mu(gsis_id, "longest_play", rush_longest_df, season, week, current_team=rb_team)
+                longest_rush_sigma = calc_player_sigma(gsis_id, "longest_play", rush_longest_df, season, week, current_team=rb_team)
                 rows.append({
                     "gsis_id": gsis_id, "player_display_name": rb.get("full_name"),
                     "team": rb.get("team"), "position": position, "prop_type": "longest_rush",
@@ -3847,8 +3875,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                         "games_sampled_current": rec_confidence_info["games_sampled_current"],
                     })
 
-                longest_rec_mu = calc_prop_mu(gsis_id, "longest_play", rec_longest_df, season, week, current_team=None)
-                longest_rec_sigma = calc_player_sigma(gsis_id, "longest_play", rec_longest_df, season, week, current_team=None)
+                longest_rec_mu = calc_prop_mu(gsis_id, "longest_play", rec_longest_df, season, week, current_team=team)
+                longest_rec_sigma = calc_player_sigma(gsis_id, "longest_play", rec_longest_df, season, week, current_team=team)
                 rows.append({
                     "gsis_id": gsis_id, "player_display_name": wr.get("full_name"),
                     "team": team, "position": position, "prop_type": "longest_reception",
@@ -4893,7 +4921,12 @@ def build_longest_play_by_game(pbp_df: pd.DataFrame, position: str) -> pd.DataFr
     returning wrong/empty data, so a real schema mismatch surfaces
     immediately instead of masquerading as "this player has no long plays."
 
-    Returns columns: gsis_id, season, week, longest_play.
+    Returns columns: gsis_id, team, season, week, longest_play. `team`
+    (posteam - the offense's team on that play, real for QB/RB/WR alike)
+    added so calc_prop_mu's existing team-scoped prior-season fallback can
+    actually use this table the same way it already uses player_stats_df -
+    previously missing, so passing current_team into calc_prop_mu for this
+    stat raised a real KeyError: 'team' instead of silently working.
     """
     position = position.upper()
     if position == "RB":
@@ -4903,7 +4936,7 @@ def build_longest_play_by_game(pbp_df: pd.DataFrame, position: str) -> pd.DataFr
     else:
         id_col, want_play_type = "receiver_player_id", "pass"
 
-    required = {id_col, "yards_gained", "season", "week", "play_type"}
+    required = {id_col, "yards_gained", "season", "week", "play_type", "posteam"}
     missing = required - set(pbp_df.columns)
     if missing:
         raise KeyError(f"build_longest_play_by_game: expected pbp columns not found: {missing}")
@@ -4917,10 +4950,15 @@ def build_longest_play_by_game(pbp_df: pd.DataFrame, position: str) -> pd.DataFr
 
     sub = sub.dropna(subset=[id_col])
     if sub.empty:
-        return pd.DataFrame(columns=["gsis_id", "season", "week", "longest_play"])
+        return pd.DataFrame(columns=["gsis_id", "team", "season", "week", "longest_play"])
 
-    agg = sub.groupby([id_col, "season", "week"])["yards_gained"].max().reset_index()
-    return agg.rename(columns={id_col: "gsis_id", "yards_gained": "longest_play"})
+    # sort so the row kept per (player, game) at their longest play also
+    # carries the CORRECT team for that specific game (mid-season trades -
+    # rare but real, same category of case the rest of this file already
+    # guards for elsewhere)
+    idx = sub.groupby([id_col, "season", "week"])["yards_gained"].idxmax()
+    agg = sub.loc[idx, [id_col, "posteam", "season", "week", "yards_gained"]]
+    return agg.rename(columns={id_col: "gsis_id", "posteam": "team", "yards_gained": "longest_play"})
 
 
 def build_coverage_crossref_game_log(player_gsis_id: str, position: str,
