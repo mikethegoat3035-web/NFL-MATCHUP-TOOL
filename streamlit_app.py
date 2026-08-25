@@ -267,7 +267,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v40-longest-play-prior-season-bridge-2026-08-25"
+DEPLOY_VERSION = "v41-curated-slate-view-2026-08-25"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -1001,11 +1001,28 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                 "and rookies, who may need longer."
             )
 
+        # Curated view by default, same MLB-style "player/team/opp/mu/edge"
+        # shape, not a full column dump - see full note further down where
+        # this same toggle also controls the post-scoring display table.
+        show_full_diagnostics = st.checkbox(
+            "Show full diagnostic columns (coverage breakdown, advanced grades, "
+            "play-action/personnel/alignment signals)",
+            value=False,
+            help="Off by default for a cleaner, MLB-style slate view. Turn on to "
+                 "see exactly which signals feed a specific row's quality_score.",
+        )
+        core_editor_cols = ["player_display_name", "team", "opponent", "matchup",
+                             "position", "prop_type", "line", "mu", "sigma",
+                             "data_confidence", "games_sampled_current", "quality_score"]
+        editor_col_order = core_editor_cols if not show_full_diagnostics else None
+        editor_col_order = [c for c in editor_col_order if c in filtered.columns] if editor_col_order else None
+
         edited = st.data_editor(
             filtered,
             column_config={
                 "line": st.column_config.NumberColumn("line", help="Enter the book/DFS line for this prop"),
             },
+            column_order=editor_col_order,
             disabled=[c for c in filtered.columns if c not in ("line",)],
             num_rows="fixed",
             width='stretch',
@@ -1047,25 +1064,41 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
             )
             st.stop()
 
-        base_display_cols = ["player_display_name", "team", "matchup", "position", "prop_type",
-                              "mu", "sigma", "data_confidence", "games_sampled_current",
-                              "opponent", "opp_dominant_coverage",
-                              "opp_dominant_coverage_pct", "opp_num_elevated_coverages",
-                              "opp_man_pct", "opp_zone_pct",
-                              "opp_box_stack_pct", "opp_box_elevated",
-                              "playaction_exploit_strength", "playaction_used_coverage_specific_data",
-                              "personnel_exploit_strength", "dominant_personnel",
-                              "quality_score", "grade_matchup_strength",
-                              "role_verification_score", "role_trend_ratio",
-                              "line", "p_over", "edge"]
-        # Include the full individual coverage-type breakdown AND every
-        # advanced metric grade (QB/WR/TE/RB own performance grades, plus
-        # opponent defense grades) - column names vary by what's actually
-        # available for a given player/week, so these are picked up
-        # dynamically rather than hardcoded.
-        cov_breakdown_cols = sorted([c for c in scored_df.columns if c.startswith("opp_cov_")])
-        grade_cols = sorted([c for c in scored_df.columns if c.endswith("_grade")])
-        display_cols = base_display_cols + grade_cols + cov_breakdown_cols
+        # REAL FIX: this table was showing every diagnostic column at once
+        # (coverage breakdown, every advanced metric grade, alignment
+        # data...) by default - genuinely useful for debugging a specific
+        # row, but not what you want scanning a slate for plays, and not
+        # how the MLB tool's Best Edges table works (player/team/opp/mu/
+        # edge, nothing else, by default). Curated core view now shown by
+        # default; the full diagnostic column set (coverage/grade/
+        # alignment breakdown) moves behind an explicit toggle, off by
+        # default - same "curated view + full raw available on request"
+        # pattern already used in the Backtest section's "Every scored row
+        # (raw)" expander, just applied here too.
+        core_display_cols = ["player_display_name", "team", "opponent", "matchup",
+                              "position", "prop_type", "line", "mu", "sigma",
+                              "p_over", "edge", "quality_score", "data_confidence",
+                              "games_sampled_current"]
+
+        if show_full_diagnostics:
+            extra_display_cols = ["opp_dominant_coverage",
+                                   "opp_dominant_coverage_pct", "opp_num_elevated_coverages",
+                                   "opp_man_pct", "opp_zone_pct",
+                                   "opp_box_stack_pct", "opp_box_elevated",
+                                   "playaction_exploit_strength", "playaction_used_coverage_specific_data",
+                                   "personnel_exploit_strength", "dominant_personnel",
+                                   "grade_matchup_strength",
+                                   "role_verification_score", "role_trend_ratio"]
+            # Include the full individual coverage-type breakdown AND every
+            # advanced metric grade (QB/WR/TE/RB own performance grades,
+            # plus opponent defense grades) - column names vary by what's
+            # actually available for a given player/week, so these are
+            # picked up dynamically rather than hardcoded.
+            cov_breakdown_cols = sorted([c for c in scored_df.columns if c.startswith("opp_cov_")])
+            grade_cols = sorted([c for c in scored_df.columns if c.endswith("_grade")])
+            display_cols = core_display_cols + extra_display_cols + grade_cols + cov_breakdown_cols
+        else:
+            display_cols = core_display_cols
         display_cols = [c for c in display_cols if c in scored_df.columns]
         # Default sort is edge (once lines are entered) across the whole
         # week's slate - but when a single game is selected, no line has
