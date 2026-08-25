@@ -267,7 +267,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v41-curated-slate-view-2026-08-25"
+DEPLOY_VERSION = "v43-role-trend-prior-season-bridge-2026-08-25"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -1080,6 +1080,16 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                               "p_over", "edge", "quality_score", "data_confidence",
                               "games_sampled_current"]
 
+        # Compute these UNCONDITIONALLY - a later line (the color-gradient
+        # styling below) references them regardless of the checkbox state.
+        # REAL BUG FOUND+FIXED: previously only computed inside the
+        # `if show_full_diagnostics:` branch, so leaving the checkbox at
+        # its default (off) hit a genuine NameError on that later
+        # unconditional reference - confirmed live via the exact
+        # traceback (line ~1126, `+ grade_cols + cov_breakdown_cols`).
+        cov_breakdown_cols = sorted([c for c in scored_df.columns if c.startswith("opp_cov_")])
+        grade_cols = sorted([c for c in scored_df.columns if c.endswith("_grade")])
+
         if show_full_diagnostics:
             extra_display_cols = ["opp_dominant_coverage",
                                    "opp_dominant_coverage_pct", "opp_num_elevated_coverages",
@@ -1094,8 +1104,6 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
             # plus opponent defense grades) - column names vary by what's
             # actually available for a given player/week, so these are
             # picked up dynamically rather than hardcoded.
-            cov_breakdown_cols = sorted([c for c in scored_df.columns if c.startswith("opp_cov_")])
-            grade_cols = sorted([c for c in scored_df.columns if c.endswith("_grade")])
             display_cols = core_display_cols + extra_display_cols + grade_cols + cov_breakdown_cols
         else:
             display_cols = core_display_cols
