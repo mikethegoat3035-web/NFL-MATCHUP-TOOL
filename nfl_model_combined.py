@@ -2998,7 +2998,8 @@ def calc_grade_matchup_strength(row: dict, prop_type: str, offense_weight: float
 # ---------------------------------------------------------------------------
 
 def build_role_trend(gsis_id: str, metric_col: str, source_df: pd.DataFrame, id_col: str,
-                      season: int, week: int, recent_games: int = 3) -> dict:
+                      season: int, week: int, recent_games: int = 3,
+                      prior_source_df: pd.DataFrame = None, min_games: int = 2) -> dict:
     """
     Compares a player's recent (last `recent_games`, weeks < target week)
     usage metric against their full-season average over that same window -
@@ -3015,26 +3016,68 @@ def build_role_trend(gsis_id: str, metric_col: str, source_df: pd.DataFrame, id_
     failure category as the id-mismatch bugs already caught and fixed
     elsewhere in this file. target_share (player_stats) and rush_attempts
     (NGS rushing) are used instead - both confirmed to key on gsis_id.
+
+    PRIOR-SEASON BRIDGE (real gap found+fixed - same bug class as the
+    mu/sigma/longest-play prior-season bridges elsewhere in this file,
+    just not caught until directly asked about): previously this was
+    hardcoded to the current season only, so it went fully neutral (0.5,
+    via calc_role_verification_score's own fallback) for the ENTIRE first
+    few weeks of a season regardless of how much real prior-season data
+    existed - a real full season of 2025 games sitting right there,
+    unused, purely because this one function never looked at it.
+
+    When current-season games are below min_games and prior_source_df is
+    given, this now falls back to the SAME recent-vs-season-average trend
+    computed off the END of last season instead (last `recent_games` weeks
+    of season-1 vs that season's full average). This is a genuinely
+    weaker signal than a real in-season trend, not an equivalent one - an
+    offseason coaching change, a new free-agent signing at the same
+    position, or a depth-chart competition can reset a role in ways last
+    season's ending trend can't see, unlike a raw per-game average (mu),
+    which transfers across an offseason much more directly. Flagged via
+    "bridged_from_prior_season": True in the return so
+    calc_role_verification_score can (and does, see its own note) treat
+    it as real but lower-confidence rather than pretending it's as strong
+    as a verified current-season trend. Not yet backtested at that
+    confidence level - needs its own live test like everything else here.
     """
     hist = source_df[
         (source_df["season"] == season) & (source_df["week"] < week)
         & (source_df[id_col] == gsis_id)
     ].sort_values("week", ascending=False)
-    if hist.empty or metric_col not in hist.columns:
-        return {"recent_value": np.nan, "season_value": np.nan, "trend_ratio": np.nan, "games": 0}
 
-    recent = hist.head(recent_games)[metric_col].mean()
-    season_avg = hist[metric_col].mean()
-    trend_ratio = np.nan
-    if pd.notna(recent) and pd.notna(season_avg) and season_avg > 0:
-        trend_ratio = recent / season_avg
+    if len(hist) >= min_games and metric_col in hist.columns:
+        recent = hist.head(recent_games)[metric_col].mean()
+        season_avg = hist[metric_col].mean()
+        trend_ratio = np.nan
+        if pd.notna(recent) and pd.notna(season_avg) and season_avg > 0:
+            trend_ratio = recent / season_avg
+        return {
+            "recent_value": round(recent, 3) if pd.notna(recent) else np.nan,
+            "season_value": round(season_avg, 3) if pd.notna(season_avg) else np.nan,
+            "trend_ratio": round(trend_ratio, 3) if pd.notna(trend_ratio) else np.nan,
+            "games": len(hist), "bridged_from_prior_season": False,
+        }
 
-    return {
-        "recent_value": round(recent, 3) if pd.notna(recent) else np.nan,
-        "season_value": round(season_avg, 3) if pd.notna(season_avg) else np.nan,
-        "trend_ratio": round(trend_ratio, 3) if pd.notna(trend_ratio) else np.nan,
-        "games": len(hist),
-    }
+    if prior_source_df is not None and metric_col in prior_source_df.columns:
+        prior_hist = prior_source_df[
+            (prior_source_df["season"] == season - 1) & (prior_source_df[id_col] == gsis_id)
+        ].sort_values("week", ascending=False)
+        if not prior_hist.empty:
+            recent = prior_hist.head(recent_games)[metric_col].mean()
+            season_avg = prior_hist[metric_col].mean()
+            trend_ratio = np.nan
+            if pd.notna(recent) and pd.notna(season_avg) and season_avg > 0:
+                trend_ratio = recent / season_avg
+            return {
+                "recent_value": round(recent, 3) if pd.notna(recent) else np.nan,
+                "season_value": round(season_avg, 3) if pd.notna(season_avg) else np.nan,
+                "trend_ratio": round(trend_ratio, 3) if pd.notna(trend_ratio) else np.nan,
+                "games": len(prior_hist), "bridged_from_prior_season": True,
+            }
+
+    return {"recent_value": np.nan, "season_value": np.nan, "trend_ratio": np.nan,
+            "games": 0, "bridged_from_prior_season": False}
 
 
 def calc_role_verification_score(role_trend: dict, min_games: int = 2) -> float:
@@ -3045,11 +3088,25 @@ def calc_role_verification_score(role_trend: dict, min_games: int = 2) -> float:
     penalty, no bonus) if there isn't enough history to trust the trend
     yet - same graceful-degrade shape as calc_coverage_quality_score's
     fallback, so a rookie/new-role player isn't punished for thin data.
+
+    BRIDGED-TREND DAMPING (see build_role_trend's prior-season bridge note):
+    when role_trend came from last season's ending trend rather than a real
+    current-season one, the raw score is pulled halfway back toward neutral
+    (0.5) instead of trusted at full strength - it's real signal, but a
+    genuinely weaker one (an offseason coaching/personnel change can reset
+    a role in ways last season's own ending trend can't see), and this
+    hasn't been backtested at full confidence the way the in-season version
+    has. Preserves direction (a clearly ascending or fading prior-season
+    trend still nudges the score the right way) while being honest that
+    it's carried-over evidence, not verified current evidence.
     """
     if role_trend.get("games", 0) < min_games or pd.isna(role_trend.get("trend_ratio")):
         return 0.5
     ratio = role_trend["trend_ratio"]
-    return round(max(0.0, min(1.0, (ratio - 0.5) / 0.5)), 3)
+    raw_score = max(0.0, min(1.0, (ratio - 0.5) / 0.5))
+    if role_trend.get("bridged_from_prior_season"):
+        raw_score = 0.5 + (raw_score - 0.5) * 0.5
+    return round(raw_score, 3)
 
 
 def calc_blended_matchup_strength(structural_exploit: float, grade_exploit: float,
@@ -3194,6 +3251,13 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
     prior_participation_df = pull_participation([season - 1])
     prior_pbp_df = pull_pbp([season - 1])
     prior_ftn_df = pull_ftn_charting([season - 1])
+    # For the role_trend prior-season bridge (build_role_trend) - QB/RB
+    # role trend use NGS columns (attempts/rush_attempts), which
+    # player_stats_df doesn't carry the same way; WR's role trend uses
+    # target_share, already real in player_stats_df (already pulled for
+    # both seasons above), so no extra pull needed for that one.
+    prior_ngs_pass_df = pull_ngs("passing", [season - 1])
+    prior_ngs_rush_df = pull_ngs("rushing", [season - 1])
 
     # Per-game longest-play tables for the longest_completion/
     # longest_reception/longest_rush props (see build_longest_play_by_game).
@@ -3441,7 +3505,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
             # exploit signal above - mirrors the MLB tool's pitch-crosswalk +
             # lineup_verification blend.
             grade_exploit = calc_grade_matchup_strength({**own_grades, **def_grades}, "pass_yards")
-            role_trend = build_role_trend(gsis_id, "attempts", ngs_pass_df, "player_gsis_id", season, week)
+            role_trend = build_role_trend(gsis_id, "attempts", ngs_pass_df, "player_gsis_id", season, week,
+                                           prior_source_df=prior_ngs_pass_df)
             role_score = calc_role_verification_score(role_trend)
             blended_exploit = calc_blended_matchup_strength(
                 combined_structural_exploit, grade_exploit, role_score
@@ -3614,7 +3679,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 def_grades = get_defense_grades(rb_opponent, def_metrics)
 
                 grade_exploit = calc_grade_matchup_strength({**own_grades, **def_grades}, "rush_yards")
-                role_trend = build_role_trend(gsis_id, "rush_attempts", ngs_rush_df, "player_gsis_id", season, week)
+                role_trend = build_role_trend(gsis_id, "rush_attempts", ngs_rush_df, "player_gsis_id", season, week,
+                                               prior_source_df=prior_ngs_rush_df)
                 role_score = calc_role_verification_score(role_trend)
                 structural_parts = [v for v in [box_info.get("exploit_strength"), run_concept_exploit_for_scoring]
                                      if pd.notna(v)]
@@ -3792,7 +3858,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 def_grades = get_defense_grades(opponent, def_metrics)
 
                 grade_exploit = calc_grade_matchup_strength({**own_grades, **def_grades}, "rec_yards")
-                role_trend = build_role_trend(gsis_id, "target_share", player_stats_df, "gsis_id", season, week)
+                role_trend = build_role_trend(gsis_id, "target_share", player_stats_df, "gsis_id", season, week,
+                                               prior_source_df=player_stats_df)
                 role_score = calc_role_verification_score(role_trend)
                 blended_exploit = calc_blended_matchup_strength(
                     combined_structural_exploit, grade_exploit, role_score
