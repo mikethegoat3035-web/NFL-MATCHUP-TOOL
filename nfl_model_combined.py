@@ -2869,7 +2869,7 @@ ENABLE_FULL_COVERAGE_MU_ADJUSTMENT = False
 # in, before any of the three get_defense_grades() call sites read it -
 # so pass_yards/rec_yards/rush_yards quality_score all see it identically,
 # no separate wiring needed per prop type.
-ENABLE_PERSONNEL_CHANGE_ADJUSTMENT = False
+ENABLE_PERSONNEL_CHANGE_ADJUSTMENT = True  # FLIPPED ON for its first real isolated live test - nothing else changed this round. Time-sensitive: this feature specifically targets weeks 1-5 of a new season, so it needs a real test+decision before 2026 week 1, unlike the other still-off flags which have no such deadline. Test weeks 1-5 (does it help, the window it's built for) AND weeks 6-18 (should stay flat - if it also moves there, something's leaking outside its intended window) as separate ranges, not combined
 
 
 PROP_METRIC_CROSSWALK = {
