@@ -267,7 +267,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v47-week1-backtest-now-allowed-2026-08-25"
+DEPLOY_VERSION = "v49-dead-adjustments-removed-2026-08-26"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
