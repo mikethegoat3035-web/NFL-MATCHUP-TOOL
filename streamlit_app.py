@@ -267,7 +267,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v46-personnel-change-adjustment-enabled-2026-08-25"
+DEPLOY_VERSION = "v47-week1-backtest-now-allowed-2026-08-25"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -3061,8 +3061,10 @@ elif mode == "Coverage Matchup (premium data)":
         with qs_col1:
             qs_season = st.number_input("Season", min_value=2020, max_value=2030, value=2025, step=1, key="qs_season")
         with qs_col2:
-            qs_start_week = st.number_input("Start week", min_value=2, max_value=18, value=4, step=1, key="qs_start_week",
-                                             help="Week 1 is skipped automatically - no prior-week history to project from yet.")
+            qs_start_week = st.number_input("Start week", min_value=1, max_value=18, value=1, step=1, key="qs_start_week",
+                                             help="Week 1 used to be skipped (no prior-week history to project from). "
+                                                  "That's no longer true - prior-season fallback bridges now give week 1 "
+                                                  "a real projection, confirmed working live this session.")
         with qs_col3:
             qs_end_week = st.number_input("End week", min_value=2, max_value=18, value=18, step=1, key="qs_end_week")
         st.caption(
@@ -4660,8 +4662,11 @@ if mode == "Scan (adjustable lines)":
     rcol1, rcol2 = st.columns(2)
     with rcol1:
         report_start_week = st.number_input(
-            "Report start week", min_value=2, max_value=18, value=2, step=1,
-            help="Week 1 is skipped automatically - there's no prior-week history to project from yet.",
+            "Report start week", min_value=1, max_value=18, value=1, step=1,
+            help="Week 1 used to be skipped automatically (no prior-week history to "
+                 "project from). That's no longer true - this season's prior-season "
+                 "fallback bridges (mu/sigma, role trend, longest-play) now give week 1 "
+                 "a real projection to test, confirmed working live this session.",
         )
     with rcol2:
         report_end_week = st.number_input(
