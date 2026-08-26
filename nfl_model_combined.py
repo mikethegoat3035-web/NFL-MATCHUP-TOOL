@@ -1552,162 +1552,6 @@ def calc_quality_score(matchup_exploit_strength: float, sample_size_games: int,
     return round(min(base + sample_bonus + coverage_bonus, 100), 1)
 
 
-def build_player_coverage_efficiency(player_gsis_id: str, role: str, season: int,
-                                      participation_df: pd.DataFrame, pbp_df: pd.DataFrame,
-                                      min_plays_per_bucket: int = 8, current_team: str = None,
-                                      prior_participation_df: pd.DataFrame = None,
-                                      prior_pbp_df: pd.DataFrame = None) -> dict:
-    """
-    Computes a player's REAL historical efficiency (yards per play) against
-    man coverage vs zone coverage specifically, using their own play-level
-    history - not an approximation, an actual data-driven split.
-
-    CROSS-SEASON FIX (same principle as calc_prop_mu/calc_player_sigma):
-    previously this ONLY looked at the current season's plays before the
-    target week, with no fallback at all - meaning EVERY player, even ones
-    who didn't change teams, had no coverage-specific adjustment until they
-    personally racked up 8+ real plays against both man AND zone THIS
-    season (often several weeks in). Now, if current_team and prior-season
-    data are provided, insufficient current-season buckets are topped up
-    with prior-season plays FILTERED TO THE SAME TEAM (via posteam) -
-    exactly like the team-filtered mu/sigma fallback. A player who didn't
-    change teams gets a much larger, more reliable sample right away. A
-    traded player (e.g. AJ Brown, Eagles->Patriots June 2026) correctly
-    gets NOTHING from the prior-season fallback here, since none of his
-    2025 plays have posteam=="NE" - his old-team plays are excluded, same
-    as intended, not a gap in this fix.
-
-    REVIVED (min_plays_per_bucket back to 8, was raised to 14): confirmed
-    via a real 2025 backtest's full raw export that at 14, this fired on
-    0 of 2,521 eligible rows all season - requiring 14+ real plays against
-    BOTH man AND zone specifically for one player is too strict a bar to
-    ever clear, even with the cross-season top-up above. The 14 threshold
-    was raised speculatively to fix adjustment_direction_accuracy (stuck
-    at 47%) - but a later isolated test proved that number was being
-    driven ENTIRELY by the box-count adjustment (833 of 833 non-trivial
-    adjustments were box, zero were coverage), so tightening THIS
-    function's threshold was never actually addressing the real cause.
-
-    REAL ROOT CAUSE FOUND (the actual reason for the 0% fire rate, not the
-    threshold at all): the man/zone bucket matching below used to compare
-    against hardcoded TITLE-CASE strings ("Man"/"Zone"), while the
-    CONFIRMED-WORKING build_coverage_profile() function (whose real output
-    - opp_man_pct/opp_zone_pct - has shown correct real percentages in
-    every backtest export all session) pivots dynamically on whatever raw
-    values actually exist, with no hardcoded casing assumption at all -
-    strong indirect evidence the real column's values don't match "Man"/
-    "Zone" exactly. This means the 0% fire rate was NEVER actually about
-    sample size - even the ORIGINAL threshold of 8 (before any of tonight's
-    tuning) would have produced 0% for this same reason. Fixed to match
-    case-insensitively (.str.lower() == "man"/"zone") so it can't silently
-    fail on a casing assumption again, whatever the real casing turns out
-    to be.
-
-    role: "receiver" or "passer". Joins participation_df (which carries
-    defense_man_zone_type per play) to pbp_df on (game_id, play_id) - same
-    join fix already used in build_coverage_profile() - then filters to
-    plays where this specific player was the receiver/passer.
-
-    Returns {"man_ypp": x, "zone_ypp": y, "overall_ypp": z,
-             "man_plays": n, "zone_plays": n} - ypp = yards per play.
-    Buckets still below min_plays_per_bucket after the cross-season top-up
-    return NaN (too small a sample to trust), and the caller should fall
-    back to no adjustment rather than react to noise.
-    """
-    def _get_player_plays(part_df, pbp_source_df):
-        merged = part_df.merge(
-            pbp_source_df[["game_id", "play_id", "defteam", "posteam",
-                            "receiver_player_id", "receiving_yards",
-                            "passer_player_id", "passing_yards"]],
-            left_on=["nflverse_game_id", "play_id"],
-            right_on=["game_id", "play_id"],
-            how="left",
-        )
-        player_col = "receiver_player_id" if role == "receiver" else "passer_player_id"
-        return merged[
-            (merged[player_col] == player_gsis_id) & merged["defense_man_zone_type"].notna()
-        ]
-
-    player_plays = _get_player_plays(participation_df, pbp_df)
-
-    def _bucket_count(plays_df, coverage_type):
-        return len(plays_df[plays_df["defense_man_zone_type"].str.lower() == coverage_type])
-
-    # REAL VALUES CONFIRMED via live diagnostic (diagnose_participation_data(),
-    # run against real 2025 week 8 data): defense_man_zone_type's actual real
-    # values are "MAN_COVERAGE" / "ZONE_COVERAGE" (with underscore) - NOT
-    # "man"/"zone" or "Man"/"Zone", both of which were guessed and both wrong
-    # across two earlier fix attempts tonight (confirmed 0% fire rate either
-    # way). This is the first version matched against real, directly-observed
-    # data instead of an assumption.
-    man_n = _bucket_count(player_plays, "man_coverage")
-    zone_n = _bucket_count(player_plays, "zone_coverage")
-
-    # top up with team-filtered prior-season plays if either bucket is short
-    if (man_n < min_plays_per_bucket or zone_n < min_plays_per_bucket) \
-            and current_team is not None and prior_participation_df is not None and prior_pbp_df is not None:
-        prior_plays = _get_player_plays(prior_participation_df, prior_pbp_df)
-        prior_plays = prior_plays[prior_plays["posteam"] == current_team]
-        player_plays = pd.concat([player_plays, prior_plays])
-
-    def _bucket_avg(coverage_type):
-        bucket = player_plays[player_plays["defense_man_zone_type"].str.lower() == coverage_type]
-        n = len(bucket)
-        if n < min_plays_per_bucket:
-            return np.nan, n
-        yards_col = "receiving_yards" if role == "receiver" else "passing_yards"
-        return round(bucket[yards_col].mean(), 2), n
-
-    man_avg, man_n = _bucket_avg("man_coverage")
-    zone_avg, zone_n = _bucket_avg("zone_coverage")
-    yards_col = "receiving_yards" if role == "receiver" else "passing_yards"
-    overall_avg = round(player_plays[yards_col].mean(), 2) if len(player_plays) > 0 else np.nan
-
-    return {
-        "man_ypp": man_avg, "zone_ypp": zone_avg, "overall_ypp": overall_avg,
-        "man_plays": man_n, "zone_plays": zone_n,
-    }
-
-
-def calc_coverage_adjusted_mu(base_mu: float, coverage_efficiency: dict,
-                               opp_man_pct: float, opp_zone_pct: float,
-                               max_adjustment: float = 0.2) -> float:
-    """
-    Actually ADJUSTS mu based on the player's real man/zone efficiency split
-    and this week's specific opponent's man/zone tendency - not just a
-    quality_score side signal, a real change to the projection itself.
-
-    If either bucket lacks enough plays to trust (NaN from
-    build_player_coverage_efficiency), falls back to base_mu unadjusted
-    rather than react to a small, noisy sample.
-
-    TIGHTENED per real 2025 backtest results: adjustment_direction_accuracy
-    (did this adjustment move mu toward the real result more often than
-    not) came back at 48.4% across 7,641 real rows - worse than a coinflip.
-    min_plays_per_bucket raised from 8 to 14 (build_player_coverage_
-    efficiency requires more real history before trusting a man/zone split
-    enough to adjust mu at all) and max_adjustment tightened from 30% to
-    20% (limits how much damage a still-imperfect signal can do even when
-    it does fire). This limits the blast radius of a proven-unreliable
-    mechanism; it is NOT a verified fix of whatever is actually causing the
-    wrong-direction calls, since the data used to find this problem didn't
-    include enough detail to diagnose the root cause. Re-run
-    build_season_accuracy_report() on the same weeks after this change to
-    see whether direction accuracy actually improves.
-    """
-    man_ypp = coverage_efficiency.get("man_ypp")
-    zone_ypp = coverage_efficiency.get("zone_ypp")
-    overall_ypp = coverage_efficiency.get("overall_ypp")
-
-    if pd.isna(man_ypp) or pd.isna(zone_ypp) or pd.isna(overall_ypp) or overall_ypp == 0:
-        return base_mu  # not enough real data to trust an adjustment
-
-    expected_ypp_this_matchup = (opp_man_pct * man_ypp) + (opp_zone_pct * zone_ypp)
-    multiplier = expected_ypp_this_matchup / overall_ypp
-    multiplier = max(1 - max_adjustment, min(1 + max_adjustment, multiplier))
-
-    return round(base_mu * multiplier, 2)
-
 
 # ---------------------------------------------------------------------------
 # 5b. FULL-COVERAGE-TYPE PLAYER SPLIT (real efficiency by EVERY charted
@@ -1767,11 +1611,11 @@ def build_player_full_coverage_efficiency(player_gsis_id: str, role: str,
 def calc_full_coverage_adjusted_mu(base_mu: float, player_coverage_eff: dict,
                                     opp_coverage_row: dict, max_adjustment: float = 0.2) -> dict:
     """
-    Generalizes calc_coverage_adjusted_mu's exact multiplier logic (real
-    per-player split x this week's opponent tendency, capped adjustment)
-    from 2 buckets (man/zone) to EVERY coverage type both sides have
-    reliable real data for - the fallback the user specifically asked
-    for: a defense that plays 3 real coverages this season where the
+    Generalizes the same real per-player-split x this-week's-opponent-
+    tendency, capped-adjustment logic the removed man/zone-only mu-
+    adjustment used, from 2 buckets (man/zone) to EVERY coverage type both
+    sides have reliable real data for - the fallback the user specifically
+    asked for: a defense that plays 3 real coverages this season where the
     player has adequate sample against 2 of them but not the 3rd
     correctly RENORMALIZES the weighting across just those 2 reliable
     types, rather than forcing in an unreliable split or refusing to
@@ -2341,227 +2185,6 @@ def build_defense_advanced_metrics(season: int, week: int, pbp_df: pd.DataFrame,
     return merged
 
 
-# ---------------------------------------------------------------------------
-# 5f. PERSONNEL-CHANGE ADJUSTMENT - accounts for real offseason defensive
-#     roster churn (trades/FA signings) so weeks 1-5 defense grades (before
-#     enough current-season pbp accumulates to reflect it organically)
-#     reflect actual new personnel instead of stale team-level history.
-#     CONFIRMED: the offense side already handles this correctly -
-#     detect_role_change() lets individual player grades follow a traded
-#     player via gsis_id regardless of team, no fix needed there. This is
-#     the DEFENSE-side gap: def_metrics_df (build_defense_advanced_metrics,
-#     above) is team-level only, with no way to reflect "this defense just
-#     lost its best pass rusher" until real current-season snaps pile up.
-# ---------------------------------------------------------------------------
-
-DEFENSE_POSITION_GRADE_MAP = {
-    # Real position groups confirmed against a live load_rosters() pull
-    # (broad groups only - DL/LB/DB - nflreadpy does not expose fine-
-    # grained DE/DT/OLB/ILB/CB/S splits). Maps each group to the
-    # def_metrics_df *_grade columns a changed player at that position
-    # would plausibly move.
-    "DL": ["pressure_rate_generated_grade", "run_epa_allowed_grade", "run_explosive_allowed_rate_grade"],
-    "LB": ["run_epa_allowed_grade", "run_explosive_allowed_rate_grade", "pass_epa_allowed_grade"],
-    "DB": ["pass_epa_allowed_grade", "pass_explosive_allowed_rate_grade"],
-}
-
-
-def detect_team_changes(season: int, week: int, rosters_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Systematic year-over-year roster comparison for defensive personnel
-    (DL/LB/DB) - catches trades AND free-agent signings alike, not a
-    hand-picked list. For every defender on this season's roster whose
-    team differs from where they were on last season's roster, returns
-    one row: gsis_id, full_name, position, old_team (departure side),
-    new_team (arrival side). A real trade shows up as two separate rows
-    (one per player moving), so it nets out correctly on both teams once
-    calc_personnel_change_adjustment applies both - see below.
-
-    Real limitation: only catches players who were on an NFL roster in
-    BOTH seasons. A rookie's first team correctly does not appear here
-    (no prior_team to compare against, not a "change").
-    """
-    current = rosters_df[
-        (rosters_df["season"] == season) & (rosters_df["position"].isin(DEFENSE_POSITION_GRADE_MAP))
-    ][["gsis_id", "team", "position", "full_name"]].drop_duplicates(subset=["gsis_id"])
-    prior = rosters_df[
-        (rosters_df["season"] == season - 1) & (rosters_df["position"].isin(DEFENSE_POSITION_GRADE_MAP))
-    ][["gsis_id", "team"]].drop_duplicates(subset=["gsis_id"]).rename(columns={"team": "prior_team"})
-
-    if current.empty or prior.empty:
-        return pd.DataFrame(columns=["gsis_id", "full_name", "position", "old_team", "new_team"])
-
-    merged = current.merge(prior, on="gsis_id", how="inner")
-    changed = merged[merged["team"] != merged["prior_team"]].copy()
-    changed = changed.rename(columns={"team": "new_team", "prior_team": "old_team"})
-    return changed[["gsis_id", "full_name", "position", "old_team", "new_team"]].reset_index(drop=True)
-
-
-def build_defender_individual_metrics(season: int, week: int, pbp_df: pd.DataFrame,
-                                       rosters_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Real per-player defensive counting stats from pbp (sacks incl. half-
-    sacks weighted 0.5 each - same convention as the official stat -, QB
-    hits, tackles-for-loss, interceptions weighted 2x as a real turnover
-    vs a mere disruption, pass-defenses) - everything else defensive in
-    this file is team-level only, so a changed starter's OWN quality had
-    nowhere to plug in without this.
-
-    CONFIRMED real pbp columns (checked directly against a live pull,
-    same verify-before-build discipline as the coverage-casing bug):
-    sack_player_id, half_sack_1/2_player_id, qb_hit_1/2_player_id,
-    tackle_for_loss_1/2_player_id, interception_player_id, pass_defense_
-    1/2_player_id. Uses weeks BEFORE the target week only, same leak-
-    avoidance as everywhere else in this file.
-
-    Each defender is attributed to whichever defteam he was actually
-    credited with these counted plays for (not trusted from a roster
-    snapshot) - catches an in-season trade directly from the real plays.
-    Counts are normalized by that team's real games played so far this
-    season, then percentile-graded WITHIN position group (DL/LB/DB
-    separately, via rosters_df - a DB's near-zero sack count isn't a real
-    signal of anything, and mixing groups would bury the real signal each
-    group does have).
-
-    Real limitation (stated, not fixed): no per-snap normalization is
-    possible here - pull_snap_counts() keys on pfr_player_id, a different
-    id system than gsis_id with no verified crosswalk in this codebase
-    (same reason build_role_trend doesn't use it either). Team-games-
-    played is a rough exposure proxy, not a true per-snap rate.
-    """
-    hist = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)]
-    if hist.empty:
-        return pd.DataFrame()
-
-    id_cols_weighted = [
-        ("sack_player_id", 1.0),
-        ("half_sack_1_player_id", 0.5),
-        ("half_sack_2_player_id", 0.5),
-        ("qb_hit_1_player_id", 1.0),
-        ("qb_hit_2_player_id", 1.0),
-        ("tackle_for_loss_1_player_id", 1.0),
-        ("tackle_for_loss_2_player_id", 1.0),
-        ("interception_player_id", 2.0),
-        ("pass_defense_1_player_id", 1.0),
-        ("pass_defense_2_player_id", 1.0),
-    ]
-    id_cols_weighted = [(c, w) for c, w in id_cols_weighted if c in hist.columns]
-    if not id_cols_weighted:
-        return pd.DataFrame()
-
-    long_rows = []
-    for col, weight in id_cols_weighted:
-        sub = hist[[col, "defteam", "game_id"]].dropna(subset=[col]).rename(columns={col: "gsis_id"})
-        sub["weight"] = weight
-        long_rows.append(sub)
-    long_df = pd.concat(long_rows, ignore_index=True)
-    if long_df.empty:
-        return pd.DataFrame()
-
-    impact = long_df.groupby("gsis_id")["weight"].sum().reset_index(name="impact_raw")
-    team_attribution = long_df.groupby("gsis_id")["defteam"].agg(lambda s: s.value_counts().idxmax())
-    games_per_team = hist.groupby("defteam")["game_id"].nunique()
-
-    impact["defteam"] = impact["gsis_id"].map(team_attribution)
-    impact["team_games"] = impact["defteam"].map(games_per_team)
-    impact = impact.dropna(subset=["defteam", "team_games"])
-    impact = impact[impact["team_games"] > 0]
-    impact["impact_rate"] = impact["impact_raw"] / impact["team_games"]
-
-    # Position comes from the CURRENT roster snapshot (this season), so a
-    # player traded mid-season still grades within his real position group.
-    pos_lookup = rosters_df[rosters_df["season"] == season][["gsis_id", "position"]].drop_duplicates(subset=["gsis_id"])
-    impact = impact.merge(pos_lookup, on="gsis_id", how="left")
-    impact = impact.dropna(subset=["position"])
-    impact = impact[impact["position"].isin(DEFENSE_POSITION_GRADE_MAP)]
-    if impact.empty:
-        return pd.DataFrame()
-
-    impact["defender_impact_grade"] = np.nan
-    for pos, group in impact.groupby("position"):
-        impact.loc[group.index, "defender_impact_grade"] = group["impact_rate"].apply(
-            lambda v: calc_percentile_grade(v, group["impact_rate"])
-        )
-
-    return impact[["gsis_id", "position", "defteam", "impact_raw", "team_games",
-                    "impact_rate", "defender_impact_grade"]].reset_index(drop=True)
-
-
-def calc_personnel_change_adjustment(def_metrics_df: pd.DataFrame, team_changes_df: pd.DataFrame,
-                                      defender_metrics_df: pd.DataFrame, weight_cap: float = 0.30) -> pd.DataFrame:
-    """
-    Blends each changed defender's OWN grade (build_defender_individual_
-    metrics) into his new/old team's team-level defense grades
-    (def_metrics_df, build_defense_advanced_metrics) - the real fix for
-    the gap confirmed above: a defense that just lost its best pass rusher
-    keeps its OLD team-level pass-rush grade until enough real current-
-    season pbp accumulates (weeks 1-5ish), exactly the window this fixes.
-
-    Direction is symmetric, so a real two-player trade nets out on both
-    sides:
-      - ARRIVAL: the new team's relevant grade columns blend TOWARD the
-        player's own defender_impact_grade (gaining a great player raises
-        the relevant grades; gaining a replacement-level one barely moves
-        them).
-      - DEPARTURE: the old team's relevant grade columns blend toward the
-        INVERSE of the player's grade (100 - grade) - losing a great
-        player hurts those grades, losing a replacement-level one barely
-        moves them.
-
-    weight scales with how far the player's grade is from a neutral 50 (a
-    truly average changed starter barely moves anything), capped at
-    weight_cap (default 30%) for any single player so one offseason move
-    can meaningfully nudge a grade but never dominate it.
-
-    Only the *_grade columns listed in DEFENSE_POSITION_GRADE_MAP for that
-    player's position group are touched (a DB trade doesn't touch run-
-    defense grades, etc.) - the underlying raw stat columns (pass_epa_
-    allowed, etc.) are left alone, same as every other adjustment layer
-    in this file (mu_before_* pattern).
-
-    Real stated limitations (not fixed here): a changed defender with NO
-    row in defender_metrics_df (no countable sack/hit/TFL/INT/PD all
-    season - common for run-stuffing DL or zone-heavy DBs) is skipped
-    entirely rather than defaulted to a neutral 50, since "no data" and
-    "average" aren't the same thing. A player who changes BOTH position
-    group and team in the same move isn't specially handled - he's scored
-    under whatever position group his CURRENT roster row shows. A real
-    starter whose value doesn't show up in a countable stat gets zero
-    adjustment - a structural gap, not a bug.
-    """
-    if def_metrics_df is None or def_metrics_df.empty or team_changes_df is None or team_changes_df.empty:
-        return def_metrics_df
-
-    adjusted = def_metrics_df.copy()
-    grade_lookup = (
-        defender_metrics_df.set_index("gsis_id")["defender_impact_grade"].to_dict()
-        if defender_metrics_df is not None and not defender_metrics_df.empty else {}
-    )
-
-    for _, change in team_changes_df.iterrows():
-        player_grade = grade_lookup.get(change["gsis_id"])
-        if player_grade is None or pd.isna(player_grade):
-            continue  # no countable stat for this player this season - skip, don't guess
-
-        cols = DEFENSE_POSITION_GRADE_MAP.get(change["position"], [])
-        weight = min(abs(player_grade - 50) / 50 * weight_cap, weight_cap)
-        if weight <= 0 or not cols:
-            continue
-
-        for team, target_grade in ((change["new_team"], player_grade), (change["old_team"], 100 - player_grade)):
-            if team not in adjusted["defteam"].values:
-                continue
-            row_idx = adjusted.index[adjusted["defteam"] == team]
-            for col in cols:
-                if col not in adjusted.columns:
-                    continue
-                adjusted.loc[row_idx, col] = adjusted.loc[row_idx, col].apply(
-                    lambda v: round(v * (1 - weight) + target_grade * weight, 1) if pd.notna(v) else v
-                )
-
-    return adjusted
-
-
 def calc_coverage_quality_score(coverage_row: dict, coverage_profile_df: pd.DataFrame = None,
                                  percentile_threshold: float = 90.0) -> dict:
     """
@@ -2674,88 +2297,6 @@ def calc_box_quality_score(box_row: dict, box_profile_df: pd.DataFrame = None,
     }
 
 
-def build_player_rush_box_efficiency(player_gsis_id: str, season: int,
-                                      ftn_df: pd.DataFrame, pbp_df: pd.DataFrame,
-                                      min_plays_per_bucket: int = 14, current_team: str = None,
-                                      prior_ftn_df: pd.DataFrame = None,
-                                      prior_pbp_df: pd.DataFrame = None) -> dict:
-    """
-    Same approach as build_player_coverage_efficiency() (man/zone), applied
-    to box counts: this RB's REAL rushing-yards-per-carry against a light
-    box (<7 defenders) vs a stacked box (7+), joining ftn_df's
-    n_defense_box to pbp_df on (game_id, play_id) - same join fix used
-    everywhere else in this file for ftn/participation data. Same
-    cross-season, team-filtered top-up as the coverage version (a traded
-    player correctly gets nothing from a prior team's plays), and the same
-    min_plays_per_bucket safety net (NaN bucket if too small a sample).
-    """
-    def _get_player_plays(ftn_source_df, pbp_source_df):
-        merged = ftn_source_df.merge(
-            pbp_source_df[["game_id", "play_id", "defteam", "posteam",
-                            "rusher_player_id", "rushing_yards"]],
-            left_on=["nflverse_game_id", "nflverse_play_id"],
-            right_on=["game_id", "play_id"],
-            how="left",
-        )
-        return merged[
-            (merged["rusher_player_id"] == player_gsis_id) & merged["n_defense_box"].notna()
-        ].copy()
-
-    player_plays = _get_player_plays(ftn_df, pbp_df)
-    if not player_plays.empty:
-        player_plays["box_bucket"] = np.where(player_plays["n_defense_box"] >= 7, "stacked", "light")
-    else:
-        player_plays["box_bucket"] = pd.Series(dtype=object)
-
-    if current_team is not None and prior_ftn_df is not None and prior_pbp_df is not None:
-        light_n = len(player_plays[player_plays["box_bucket"] == "light"])
-        stacked_n = len(player_plays[player_plays["box_bucket"] == "stacked"])
-        if light_n < min_plays_per_bucket or stacked_n < min_plays_per_bucket:
-            prior_plays = _get_player_plays(prior_ftn_df, prior_pbp_df)
-            prior_plays = prior_plays[prior_plays["posteam"] == current_team].copy()
-            if not prior_plays.empty:
-                prior_plays["box_bucket"] = np.where(prior_plays["n_defense_box"] >= 7, "stacked", "light")
-            player_plays = pd.concat([player_plays, prior_plays])
-
-    def _bucket_avg(bucket):
-        sub = player_plays[player_plays["box_bucket"] == bucket]
-        n = len(sub)
-        if n < min_plays_per_bucket:
-            return np.nan, n
-        return round(sub["rushing_yards"].mean(), 2), n
-
-    light_avg, light_n = _bucket_avg("light")
-    stacked_avg, stacked_n = _bucket_avg("stacked")
-    overall_avg = round(player_plays["rushing_yards"].mean(), 2) if len(player_plays) > 0 else np.nan
-
-    return {
-        "light_box_ypc": light_avg, "stacked_box_ypc": stacked_avg,
-        "overall_ypc": overall_avg, "light_plays": light_n, "stacked_plays": stacked_n,
-    }
-
-
-def calc_box_adjusted_mu(base_mu: float, box_efficiency: dict, opp_stacked_pct: float,
-                          max_adjustment: float = 0.2) -> float:
-    """
-    Real mu adjustment (not just a quality_score side signal), same shape
-    as calc_coverage_adjusted_mu(): uses this RB's own real light-vs-stacked
-    box yards-per-carry split, weighted by THIS week's specific opponent's
-    stacked-box rate, capped at +/- max_adjustment. Falls back to base_mu
-    unadjusted if either bucket lacks a trustworthy sample.
-    """
-    light_ypc = box_efficiency.get("light_box_ypc")
-    stacked_ypc = box_efficiency.get("stacked_box_ypc")
-    overall_ypc = box_efficiency.get("overall_ypc")
-
-    if (pd.isna(light_ypc) or pd.isna(stacked_ypc) or pd.isna(overall_ypc)
-            or overall_ypc == 0 or pd.isna(opp_stacked_pct)):
-        return base_mu
-
-    expected_ypc_this_matchup = (opp_stacked_pct * stacked_ypc) + ((1 - opp_stacked_pct) * light_ypc)
-    multiplier = expected_ypc_this_matchup / overall_ypc
-    multiplier = max(1 - max_adjustment, min(1 + max_adjustment, multiplier))
-    return round(base_mu * multiplier, 2)
-
 
 # ---------------------------------------------------------------------------
 # 6c. GRADE-BASED MATCHUP CROSSWALK - the NFL equivalent of the MLB tool's
@@ -2814,36 +2355,16 @@ ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE = False
 # in one round, which caused a severe quality_score tier inversion never
 # individually attributed to PA specifically vs personnel vs the other
 # changes. Since then: the reweighting fix, mu/sigma shrinkage fix, quality_
-# score sample-size fix, and the coverage-adjustment casing/root-cause
-# fixes have all been tested and landed cleanly with PA still off. Testing
-# PA alone now, with personnel and both mu-adjustments still off, so any
-# change in results this round can be attributed to PA specifically.
-# GATED per real 2025 data: the box-count mu adjustment was found to be
-# net-harmful, not just weak - direction accuracy of 47% overall, and it
-# got WORSE (down to 42.5%) as the adjustment size grew, the opposite of
-# what a real signal should do. It also turned out to be the SOLE driver
-# of adjustment_direction_accuracy across the whole report (833 of 833
-# non-trivial adjustments were box, zero were coverage - see note on
-# min_plays_per_bucket below). Disabled from actually moving mu until
-# re-diagnosed; still computed and shown via mu_before_box_adj for
-# comparison.
-ENABLE_BOX_MU_ADJUSTMENT = False
-# GATED per real 2025 data (once the mechanism was finally debugged to
-# actually fire - two real bugs found and fixed: build_player_coverage_
-# efficiency was matching the wrong coverage-type strings, and upstream of
-# that, build_coverage_profile was producing man_pct/zone_pct as
-# permanently-null columns due to the same underlying value mismatch, so
-# the adjustment's own gate check never once passed all session): once
-# correctly firing (82.2% of eligible rows), direction accuracy came back
-# at 48.7% - a coinflip, essentially identical to box's 47%. Two
-# INDEPENDENT situational-split mechanisms (coverage type, box count) both
-# landing at coinflip accuracy on real, CORRECTLY FUNCTIONING code is
-# converging evidence about the underlying idea itself (a player's
-# situational split x opponent's situational tendency, turned into an
-# actual mu multiplier), not a remaining bug in either implementation.
-# Disabled from moving mu for the same reason as box; still computed and
-# shown via mu_before_coverage_adj for comparison.
-ENABLE_COVERAGE_MU_ADJUSTMENT = False  # TESTED LIVE (weeks 4-11, n=1027 fired rows) - mechanism confirmed working (v11 casing fix genuinely fires now, 78% of eligible rows), but the EFFECT is a coin flip: adjustment_direction_accuracy 51.0% (target 58-62%), abs_miss on adjusted rows got slightly WORSE (30.22->30.35). Same real-but-unhelpful verdict as box adjustment. Coverage as a GRADING INPUT (man/zone lean, dominant coverage, coverage-specific outliers feeding quality_score/grade_matchup_strength) is untouched and stays fully on - only this direct blunt man/zone mu-nudge is disabled. mu_before_coverage_adj still populated for comparison
+# REMOVED (confirmed net-neutral-to-harmful, tested live, not a pending
+# item): box-count mu-adjustment (ENABLE_BOX_MU_ADJUSTMENT) - direction
+# accuracy 47%, got WORSE as it was trusted more. Basic man/zone coverage
+# mu-adjustment (ENABLE_COVERAGE_MU_ADJUSTMENT) - direction accuracy 51%
+# (coin flip), abs_miss on adjusted rows got slightly worse. Defense
+# personnel-change adjustment (ENABLE_PERSONNEL_CHANGE_ADJUSTMENT) - fires
+# correctly but made no measurable difference to quality_score's actual
+# predictive power. Coverage and box tendency as GRADING INPUTS (feeding
+# quality_score/grade_matchup_strength) are untouched - only these three
+# direct mu/grade-nudge mechanisms were removed.
 
 # NEW, SEPARATE mechanism - full-coverage-type player split (Cover 0-9
 # individually, not just the coarser man/zone binary above). Built per
@@ -2855,21 +2376,6 @@ ENABLE_COVERAGE_MU_ADJUSTMENT = False  # TESTED LIVE (weeks 4-11, n=1027 fired r
 # a reliable real sample for (renormalized, not forced). Kept OFF by
 # default pending its own live test - untested, not yet proven either way.
 ENABLE_FULL_COVERAGE_MU_ADJUSTMENT = False
-
-# Defense-side personnel-change adjustment (detect_team_changes /
-# build_defender_individual_metrics / calc_personnel_change_adjustment,
-# see section 5f above). Built and unit-verified standalone in a prior
-# session but never wired into a live scan before now - kept OFF by
-# default pending its own isolated live test (weeks 1-5 specifically,
-# since that's the exact window it's meant to help; weeks 6+ already
-# lean on real current-season pbp and this should matter less there),
-# same one-change-at-a-time discipline as every other flag in this
-# section. When True, def_metrics_df's *_grade columns are adjusted
-# in-place inside build_weekly_slate right after def_pa_profile merges
-# in, before any of the three get_defense_grades() call sites read it -
-# so pass_yards/rec_yards/rush_yards quality_score all see it identically,
-# no separate wiring needed per prop type.
-ENABLE_PERSONNEL_CHANGE_ADJUSTMENT = True  # FLIPPED ON for its first real isolated live test - nothing else changed this round. Time-sensitive: this feature specifically targets weeks 1-5 of a new season, so it needs a real test+decision before 2026 week 1, unlike the other still-off flags which have no such deadline. Test weeks 1-5 (does it help, the window it's built for) AND weeks 6-18 (should stay flat - if it also moves there, something's leaking outside its intended window) as separate ranges, not combined
 
 
 PROP_METRIC_CROSSWALK = {
@@ -3241,13 +2747,13 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
     # week's own result would be data leakage, not a real projection.
     pbp_history_df = pbp_df[pbp_df["week"] < week]
 
-    # Prior-season pulls for the cross-season, team-filtered coverage/box
-    # efficiency fallbacks (build_player_coverage_efficiency,
-    # build_player_rush_box_efficiency) - lets players who DIDN'T change
-    # teams use last season's plays for a much better sample early in a
-    # new season, while still correctly excluding a traded player's
-    # old-team plays. Pulled here (moved above the longest-play tables
-    # below) so both can share the same prior_pbp_df pull.
+    # Prior-season pulls for the cross-season, team-filtered longest-play
+    # bridge (build_longest_play_by_game) and other prior-season fallbacks -
+    # lets players who DIDN'T change teams use last season's plays for a
+    # much better sample early in a new season, while still correctly
+    # excluding a traded player's old-team plays. Pulled here (moved above
+    # the longest-play tables below) so both can share the same
+    # prior_pbp_df pull.
     prior_participation_df = pull_participation([season - 1])
     prior_pbp_df = pull_pbp([season - 1])
     prior_ftn_df = pull_ftn_charting([season - 1])
@@ -3355,16 +2861,16 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
             on="defteam", how="left",
         )
 
-    # Personnel-change adjustment (see section 5f) - gated, off by default
-    # pending its own isolated live test. Applied last, after every other
-    # merge into def_metrics, so it nudges the FINAL grades every prop
-    # type's get_defense_grades() call reads, not an intermediate state.
-    team_changes = pd.DataFrame()
-    if ENABLE_PERSONNEL_CHANGE_ADJUSTMENT and not def_metrics.empty:
-        team_changes = detect_team_changes(season, week, rosters_df)
-        if not team_changes.empty:
-            defender_metrics = build_defender_individual_metrics(season, week, pbp_history_df, rosters_df)
-            def_metrics = calc_personnel_change_adjustment(def_metrics, team_changes, defender_metrics)
+    # NOTE: the defense personnel-change adjustment (trades/signings) that
+    # used to live here (ENABLE_PERSONNEL_CHANGE_ADJUSTMENT, plus
+    # detect_team_changes/build_defender_individual_metrics/
+    # calc_personnel_change_adjustment) was tested live (weeks 1-5, 2025,
+    # true isolated on/off comparison) and confirmed to genuinely move
+    # quality_score's defense-grade inputs (67% of rows) but with no
+    # measurable improvement to quality_score's actual predictive power
+    # (tier separation and quality-vs-miss correlation virtually identical
+    # on vs off) - removed entirely rather than left off, since it's a
+    # confirmed dead end, not a pending test.
 
     this_week_games = schedules_df[
         (schedules_df["season"] == season) & (schedules_df["week"] == week)
@@ -3455,23 +2961,15 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                                              qb_coverage_exploit_for_scoring] if pd.notna(v)]
             combined_structural_exploit = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
 
-            # ACTUAL mu adjustment (not just a quality_score side signal) using
-            # this QB's own real man/zone efficiency split from their play
-            # history, weighted by this specific opponent's man/zone tendency.
-            # GATED per ENABLE_COVERAGE_MU_ADJUSTMENT (see flag note above) -
-            # still computed below when the gate check passes, so mu_before_
-            # coverage_adj stays available for comparison, just not applied.
+            # NOTE: the basic man/zone-only coverage mu-adjustment that used to
+            # live here (ENABLE_COVERAGE_MU_ADJUSTMENT) was tested live (weeks
+            # 4-11, 2025, n=1027 fired rows) and confirmed a coin flip on
+            # direction accuracy (51.0%) with slightly worse abs_miss on the
+            # rows it touched - removed entirely rather than left off, since
+            # it's a confirmed dead end, not a pending test. Coverage as a
+            # GRADING INPUT (man/zone lean, dominant coverage feeding
+            # quality_score/grade_matchup_strength above) is untouched.
             adjusted_mu = mu
-            if ENABLE_COVERAGE_MU_ADJUSTMENT and pd.notna(mu) and opp_coverage_row:
-                man_pct = opp_coverage_row.get("man_pct")
-                zone_pct = opp_coverage_row.get("zone_pct")
-                if pd.notna(man_pct) and pd.notna(zone_pct):
-                    coverage_eff = build_player_coverage_efficiency(
-                        gsis_id, "passer", season, participation_df, pbp_history_df,
-                        current_team=team, prior_participation_df=prior_participation_df,
-                        prior_pbp_df=prior_pbp_df,
-                    )
-                    adjusted_mu = calc_coverage_adjusted_mu(mu, coverage_eff, man_pct, zone_pct)
 
             # NEW, SEPARATE full-coverage-type version - GATED per
             # ENABLE_FULL_COVERAGE_MU_ADJUSTMENT, off by default pending its
@@ -3644,19 +3142,13 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 box_info = calc_box_quality_score(opp_box_row, box_def_profile)
                 n_box_plays = opp_box_row.get("n_plays", 0) if opp_box_row else 0
 
-                # ACTUAL mu adjustment using this RB's own real light-vs-stacked
-                # box yards-per-carry split, weighted by this week's opponent's
-                # stacked-box rate - run-game equivalent of the QB/WR coverage
-                # adjustment above. GATED per ENABLE_BOX_MU_ADJUSTMENT (see flag
-                # note above) - still computed below so mu_before_box_adj stays
-                # available for comparison, just not applied to mu itself.
+                # NOTE: the box-count mu-adjustment that used to live here
+                # (ENABLE_BOX_MU_ADJUSTMENT) was tested live and confirmed to
+                # make accuracy WORSE the more it was trusted - removed
+                # entirely rather than left off, since it's a confirmed dead
+                # end, not a pending test. Box counts as a GRADING INPUT
+                # (feeding quality_score below) are untouched.
                 adjusted_rush_mu = mu
-                if ENABLE_BOX_MU_ADJUSTMENT and opp_box_row and pd.notna(box_info.get("box_stack_pct")):
-                    box_eff = build_player_rush_box_efficiency(
-                        gsis_id, season, ftn_df, pbp_history_df,
-                        current_team=rb_team, prior_ftn_df=prior_ftn_df, prior_pbp_df=prior_pbp_df,
-                    )
-                    adjusted_rush_mu = calc_box_adjusted_mu(mu, box_eff, box_info.get("box_stack_pct"))
 
                 # Run-concept exploit signal - premium data, only computed when
                 # a bundle was actually passed in AND the flag is on (see
@@ -3825,19 +3317,13 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                                                  alignment_exploit_for_scoring] if pd.notna(v)]
                 combined_structural_exploit = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
 
-                # ACTUAL mu adjustment using this receiver's own real man/zone
-                # efficiency split, weighted by this specific opponent's tendency.
-                # GATED per ENABLE_COVERAGE_MU_ADJUSTMENT (see flag note above).
+                # NOTE: the basic man/zone-only coverage mu-adjustment that used
+                # to live here (ENABLE_COVERAGE_MU_ADJUSTMENT) was tested live
+                # and confirmed a coin flip on direction accuracy with
+                # slightly worse abs_miss on the rows it touched - removed
+                # entirely rather than left off. Coverage as a GRADING INPUT
+                # (feeding quality_score below) is untouched.
                 adjusted_mu = mu
-                man_pct = opp_coverage_row.get("man_pct") if opp_coverage_row else None
-                zone_pct = opp_coverage_row.get("zone_pct") if opp_coverage_row else None
-                if ENABLE_COVERAGE_MU_ADJUSTMENT and pd.notna(man_pct) and pd.notna(zone_pct):
-                    coverage_eff = build_player_coverage_efficiency(
-                        gsis_id, "receiver", season, participation_df, pbp_history_df,
-                        current_team=team, prior_participation_df=prior_participation_df,
-                        prior_pbp_df=prior_pbp_df,
-                    )
-                    adjusted_mu = calc_coverage_adjusted_mu(mu, coverage_eff, man_pct, zone_pct)
 
                 # NEW, SEPARATE full-coverage-type version - GATED per
                 # ENABLE_FULL_COVERAGE_MU_ADJUSTMENT, off by default pending
