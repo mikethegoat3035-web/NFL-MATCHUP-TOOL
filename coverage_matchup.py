@@ -53,8 +53,12 @@ Cover 2 Man   5                     Thin league-wide - flag always
 """
 
 import csv
+import os
+import re
 from dataclasses import dataclass, field
 from statistics import mean, pstdev
+
+import numpy as np
 
 COVERAGE_FIELDS = ["COVER 0 %", "COVER 1 %", "COVER 2 %", "COVER 2 MAN %",
                    "COVER 3 %", "COVER 4 %", "COVER 6 %"]
@@ -417,12 +421,64 @@ def print_receiver_matchup_report(receiver_name, alignment, opponent_team_profil
 # FULL DATASET LOADER - loads all 70 files in one call
 # ---------------------------------------------------------------------------
 
-ALIGNMENTS = ("wide", "slot", "inline", "backfield")
-COVERAGE_SUFFIXES = {
-    "COVER 0 %": "cover0", "COVER 1 %": "cover1", "COVER 2 %": "cover2",
-    "COVER 2 MAN %": "cover2man", "COVER 3 %": "cover3",
-    "COVER 4 %": "cover4", "COVER 6 %": "cover6",
-}
+def _extract_coverage_suffix(normalized_filename_no_ext):
+    """Given a filename (no extension) already normalized to letters+digits
+    only, uppercased, finds which real coverage type it's for by checking
+    the END of the name - real exports here use several different
+    prefixes ('QB VS COVER 0', 'DEF BF VS 1', 'BACKFIELD VS  2MAN') and
+    even a couple of confirmed real typos ('BACKFIELS VS 1',
+    'BACKFILED VS 0', 'DEF BF VS O ' - a letter O standing in for a zero),
+    so matching the suffix is far more robust than requiring one exact
+    naming convention. 2MAN is checked before bare 2/COVER2 so it isn't
+    mis-matched as plain Cover 2."""
+    n = normalized_filename_no_ext
+    if n.endswith("2MAN"):
+        return "COVER 2 MAN %"
+    if n.endswith("VSO"):  # confirmed real typo: "DEF BF VS O .csv" means Cover 0
+        return "COVER 0 %"
+    if n.endswith("0"):
+        return "COVER 0 %"
+    if n.endswith("1"):
+        return "COVER 1 %"
+    if n.endswith("2"):
+        return "COVER 2 %"
+    if n.endswith("3"):
+        return "COVER 3 %"
+    if n.endswith("4"):
+        return "COVER 4 %"
+    if n.endswith("6"):
+        return "COVER 6 %"
+    return None
+
+
+def _normalize_filename(s):
+    """Strips everything except letters/digits, uppercases - so real
+    filename variance (spacing, case, a stray trailing space before the
+    extension) doesn't block matching. Same approach as rb_matchup.py's
+    _normalize_name, applied here for the same reason."""
+    return re.sub(r"[^A-Z0-9]", "", s.upper())
+
+
+def _scan_coverage_folder(dir_path):
+    """Scans one real folder (e.g. 'WIDE', 'DEF ALLOWED/VS QBS') and
+    returns {coverage_field: full_path} for every CSV whose filename
+    suffix matches a real coverage type. Silently skips any file that
+    doesn't match (e.g. a stray non-coverage file) rather than raising -
+    same graceful-gap philosophy as the rest of this module. Returns
+    an empty dict (not an error) if the folder doesn't exist, so a
+    partially-collected dataset (e.g. QBS done, RUSH not yet exported)
+    still loads whatever IS there."""
+    if not os.path.isdir(dir_path):
+        return {}
+    out = {}
+    for fname in os.listdir(dir_path):
+        if not fname.lower().endswith(".csv"):
+            continue
+        norm = _normalize_filename(fname[:-4])
+        coverage_field = _extract_coverage_suffix(norm)
+        if coverage_field:
+            out[coverage_field] = os.path.join(dir_path, fname)
+    return out
 
 
 @dataclass
@@ -441,65 +497,105 @@ class CoverageDataBundle:
     missing: list = field(default_factory=list)
 
 
-def load_full_dataset(data_dir=".", off_coverage_file="OFF_COVG_.csv", def_coverage_file="DEF_COVG__.csv"):
-    """Loads the complete 70-file coverage dataset in one call, using the
-    established naming convention from this session:
-      QB: VS_COVER_<N>.csv / def_allowed_cover<N>.csv
-      Receiver by alignment: <alignment>_vs_cover<N>.csv
-      Def-allowed by alignment: def_<alignment>_cover<N>.csv
-    Missing files are skipped (not every combo may be collected yet) and
-    logged in the returned bundle's .missing list instead of raising -
-    partial datasets are expected and handled gracefully throughout this
-    module (thin-sample / no-data paths already exist on every report)."""
-    import os
+# Real folder names, exactly as FantasyPoints' Data Suite export structure
+# organizes them (confirmed against an actual upload) - player-side and
+# defense-allowed-side folder names for each alignment plus QBs.
+ALIGNMENTS = ("wide", "slot", "inline", "backfield")
+ALIGNMENT_DIRS = {"wide": "WIDE", "slot": "SLOT", "inline": "INLINE", "backfield": "BACKFIELD"}
+ALIGNMENT_DEF_DIRS = {
+    "wide": os.path.join("DEF ALLOWED", "VS WIDE"),
+    "slot": os.path.join("DEF ALLOWED", "VS SLOT"),
+    "inline": os.path.join("DEF ALLOWED", "VS INLINE"),
+    "backfield": os.path.join("DEF ALLOWED", "VS BACKFIELD"),
+}
+QB_DIR = "QBS"
+QB_DEF_DIR = os.path.join("DEF ALLOWED", "VS QBS")
+COVG_DIR = "COVG%"
+
+
+def _find_covg_file(covg_dir, want_offense):
+    """The team-level Man/Zone/Cover-0-6 tendency files - 'OFF COVG%.csv'
+    (coverages this team's offense SEES) and 'DEF COVG %.csv' (coverages
+    this team's defense RUNS). Matched by normalized OFF/DEF prefix rather
+    than an exact filename, same robustness reasoning as everywhere else
+    in this loader."""
+    if not os.path.isdir(covg_dir):
+        return None
+    want_prefix = "OFF" if want_offense else "DEF"
+    for fname in os.listdir(covg_dir):
+        if not fname.lower().endswith(".csv"):
+            continue
+        norm = _normalize_filename(fname[:-4])
+        if norm.startswith(want_prefix) and "COVG" in norm:
+            return os.path.join(covg_dir, fname)
+    return None
+
+
+def load_full_dataset(data_dir="."):
+    """Loads the complete real dataset in one call, matching the ACTUAL
+    FantasyPoints Data Suite export folder structure (confirmed directly
+    against a real upload, replacing an earlier version of this function
+    that guessed at a flat-file naming convention that turned out not to
+    match reality at all):
+
+      data_dir/
+        COVG%/OFF COVG%.csv, DEF COVG %.csv
+        QBS/QB VS COVER <N>.csv                      (7 files)
+        DEF ALLOWED/VS QBS/DEF QB VS <N>.csv          (7 files)
+        WIDE|SLOT|INLINE|BACKFIELD/<alignment> VS <N>.csv       (7 each)
+        DEF ALLOWED/VS WIDE|SLOT|INLINE|BACKFIELD/DEF <align> VS <N>.csv (7 each)
+        RUSH METRICS/, RUSH METRICS ALLOWED/ - NOT loaded here, see
+        rb_matchup.py's load_full_rb_dataset() for those.
+
+    Filename matching is suffix-based and typo-tolerant (see
+    _extract_coverage_suffix) - real exports here have used several
+    different prefix conventions and at least two confirmed real typos,
+    none of which need to be manually renamed before loading.
+
+    Missing files/folders are skipped (not every combo may be collected
+    yet) and logged in the returned bundle's .missing list instead of
+    raising - partial datasets are expected and handled gracefully
+    throughout this module (thin-sample / no-data paths already exist on
+    every report)."""
     missing = []
 
-    def _try_path(path):
-        return path if os.path.exists(os.path.join(data_dir, path)) else None
+    off_file = _find_covg_file(os.path.join(data_dir, COVG_DIR), want_offense=True)
+    def_file = _find_covg_file(os.path.join(data_dir, COVG_DIR), want_offense=False)
+    off_profiles = {}
+    def_profiles = {}
+    if off_file:
+        off_profiles, _ = load_team_coverage_matrix(off_file)
+    else:
+        missing.append(f"Offense team coverage tendency (looked in '{os.path.join(data_dir, COVG_DIR)}')")
+    if def_file:
+        def_profiles, _ = load_team_coverage_matrix(def_file)
+    else:
+        missing.append(f"Defense team coverage tendency (looked in '{os.path.join(data_dir, COVG_DIR)}')")
 
-    off_profiles, _ = load_team_coverage_matrix(os.path.join(data_dir, off_coverage_file))
-    def_profiles, _ = load_team_coverage_matrix(os.path.join(data_dir, def_coverage_file))
-
-    qb_files = {}
-    qb_filename_map = {
-        "COVER 0 %": "VS_COVER_0.csv", "COVER 1 %": "VS_COVER_1.csv",
-        "COVER 2 %": "VS_COVER_2.csv", "COVER 2 MAN %": "VS_COVER_2MAN.csv",
-        "COVER 3 %": "VS_COVER_3.csv", "COVER 4 %": "VS_COVER_4.csv",
-        "COVER 6 %": "VS_COVER_6.csv",
-    }
-    for cov, fname in qb_filename_map.items():
-        if _try_path(fname):
-            qb_files[cov] = os.path.join(data_dir, fname)
-        else:
-            missing.append(f"QB vs {cov}")
+    qb_files = _scan_coverage_folder(os.path.join(data_dir, QB_DIR))
+    for cov in COVERAGE_FIELDS:
+        if cov not in qb_files:
+            missing.append(f"QB vs {cov} (looked in '{os.path.join(data_dir, QB_DIR)}')")
     qb_data = load_qb_vs_coverage(qb_files) if qb_files else {}
 
-    def_qb_files = {}
-    for cov, suffix in COVERAGE_SUFFIXES.items():
-        found = _try_path(f"def_allowed_{suffix}.csv")
-        if found:
-            def_qb_files[cov] = os.path.join(data_dir, found)
-        else:
-            missing.append(f"Def-allowed-to-QB {cov}")
+    def_qb_files = _scan_coverage_folder(os.path.join(data_dir, QB_DEF_DIR))
+    for cov in COVERAGE_FIELDS:
+        if cov not in def_qb_files:
+            missing.append(f"Def-allowed-to-QB {cov} (looked in '{os.path.join(data_dir, QB_DEF_DIR)}')")
     def_qb_data = load_def_allowed_to_qb(def_qb_files) if def_qb_files else {}
 
     receiver_by_alignment = {}
     def_allowed_by_alignment = {}
     for alignment in ALIGNMENTS:
-        align_key = "bf" if alignment == "backfield" else alignment
-        rec_files = {}
-        def_files = {}
-        for cov, suffix in COVERAGE_SUFFIXES.items():
-            rec_found = _try_path(f"{alignment}_vs_{suffix}.csv")
-            def_found = _try_path(f"def_{alignment}_{suffix}.csv")
-            if rec_found:
-                rec_files[cov] = os.path.join(data_dir, rec_found)
-            else:
-                missing.append(f"{alignment} receiver vs {cov}")
-            if def_found:
-                def_files[cov] = os.path.join(data_dir, def_found)
-            else:
-                missing.append(f"Def-allowed-{alignment} {cov}")
+        rec_dir = os.path.join(data_dir, ALIGNMENT_DIRS[alignment])
+        def_dir = os.path.join(data_dir, ALIGNMENT_DEF_DIRS[alignment])
+        rec_files = _scan_coverage_folder(rec_dir)
+        def_files = _scan_coverage_folder(def_dir)
+        for cov in COVERAGE_FIELDS:
+            if cov not in rec_files:
+                missing.append(f"{alignment} receiver vs {cov} (looked in '{rec_dir}')")
+            if cov not in def_files:
+                missing.append(f"Def-allowed-{alignment} {cov} (looked in '{def_dir}')")
         receiver_by_alignment[alignment] = load_receiver_vs_coverage(rec_files) if rec_files else {}
         def_allowed_by_alignment[alignment] = load_def_allowed_by_alignment(def_files) if def_files else {}
 
@@ -510,6 +606,195 @@ def load_full_dataset(data_dir=".", off_coverage_file="OFF_COVG_.csv", def_cover
         def_allowed_by_alignment=def_allowed_by_alignment,
         missing=missing,
     )
+
+
+# ---------------------------------------------------------------------------
+# LIVE-MODEL EXPLOIT-STRENGTH FUNCTIONS - the actual plug-in points
+# nfl_model_combined.py imports (calc_alignment_exploit_strength,
+# calc_qb_coverage_exploit_strength). Everything above this point already
+# existed (parsing, tiering, z-score outlier detection, the interactive
+# matchup-report builders) - these two were the missing final step
+# connecting that real infrastructure to the live quality_score pipeline.
+#
+# Same 0-1 "exploit_strength" semantics as calc_coverage_quality_score/
+# calc_box_quality_score in nfl_model_combined.py (higher = more favorable
+# matchup for the offensive player) so they combine consistently with the
+# rest of that file's structural_parts averaging.
+# ---------------------------------------------------------------------------
+
+TIER_SCORE = {"Elite": 1.0, "Above Avg": 0.75, "Average": 0.5, "Below Avg": 0.25, "Poor": 0.0}
+
+
+def _tier_to_score(tiers: dict, stat: str):
+    """Converts a row's tier label for one stat into a 0-1 numeric score.
+    Returns None if that stat wasn't tiered for this row (thin league-wide
+    sample, or the column wasn't numeric) - callers skip rather than
+    guess a default."""
+    if not tiers or stat not in tiers:
+        return None
+    return TIER_SCORE.get(tiers[stat])
+
+
+def _weighted_outlier_exploit(outliers, own_data_by_coverage, def_allowed_by_coverage,
+                               own_name, opp_team_name, own_stat, max_outliers=3,
+                               own_weight=0.4, def_weight=0.6):
+    """Shared real logic for both functions below: given an opponent's
+    real outlier coverages (z-score based, from TeamCoverageProfile.
+    outliers), combines - for each outlier coverage - how exploitable the
+    DEFENSE is (their allowed tier for own_stat, weighted more heavily,
+    since that's the new opponent-specific information this signal adds)
+    with how good the PLAYER himself has been in that specific coverage
+    (weighted less, since his overall quality is already captured
+    elsewhere in the pipeline via mu/role_verification - this adds a
+    narrower "does his own history support this specific coverage fit"
+    layer on top, not a replacement for it).
+
+    Weighted by each outlier's real z-score magnitude (a coverage a team
+    leans into at z=2.5 counts for more than one at z=1.05), not treated
+    as equally-weighted just for clearing the outlier threshold.
+
+    Returns (exploit_strength: float|nan, coverages_checked: list[str]).
+    Real gaps (no data for a coverage on either side) are skipped rather
+    than defaulted to a neutral score - "no data" and "average" aren't
+    the same thing."""
+    if not outliers:
+        return np.nan, []
+
+    weighted_scores = []
+    weights = []
+    checked = []
+    for coverage_field, z in outliers[:max_outliers]:
+        checked.append(coverage_field.replace(" %", ""))
+        parts = []
+        part_weights = []
+
+        def_row = def_allowed_by_coverage.get(coverage_field, {}).get(opp_team_name)
+        def_score = _tier_to_score(def_row.get("_tiers") if def_row else None, own_stat)
+        if def_score is not None:
+            parts.append(def_score)
+            part_weights.append(def_weight)
+
+        own_row = own_data_by_coverage.get(coverage_field, {}).get(own_name)
+        own_score = _tier_to_score(own_row.get("_tiers") if own_row else None, own_stat)
+        if own_score is not None:
+            parts.append(own_score)
+            part_weights.append(own_weight)
+
+        if not parts:
+            continue  # no real data on either side for this coverage - skip, don't guess
+        combined = sum(p * w for p, w in zip(parts, part_weights)) / sum(part_weights)
+        weighted_scores.append(combined)
+        weights.append(max(z, 0.01))
+
+    if not weighted_scores:
+        return np.nan, checked
+    exploit_strength = sum(s * w for s, w in zip(weighted_scores, weights)) / sum(weights)
+    return round(exploit_strength, 3), checked
+
+
+def calc_qb_coverage_exploit_strength(bundle: CoverageDataBundle, qb_name: str,
+                                       qb_team_abbrev: str, opponent_team_abbrev: str) -> dict:
+    """
+    Real per-QB signal: for each coverage this opponent's defense genuinely
+    leans into (real z-score outlier, not just locally highest), combines
+    how much that defense allows to QBs in that specific coverage (RATE
+    allowed, tiered against the real league distribution of defenses in
+    that coverage) with this QB's own real RATE in that same coverage from
+    his own game history - see _weighted_outlier_exploit for the exact
+    combination and weighting.
+
+    Team abbreviations (as used throughout nfl_model_combined.py) are
+    converted to the full names this module's data is keyed on via
+    TEAM_ABBREV_TO_FULL. Returns neutral/empty gracefully (exploit_strength
+    NaN) if the opponent isn't found or has no real outlier coverage this
+    season - never raises, matching this module's established graceful-
+    gap handling throughout.
+    """
+    opp_full = TEAM_ABBREV_TO_FULL.get((opponent_team_abbrev or "").upper())
+    opp_profile = bundle.def_coverage.get(opp_full) if opp_full else None
+    if opp_profile is None:
+        return {"exploit_strength": np.nan, "outlier_coverages_checked": []}
+
+    exploit_strength, checked = _weighted_outlier_exploit(
+        opp_profile.outliers, bundle.qb_vs_coverage, bundle.def_allowed_to_qb,
+        qb_name, opp_profile.team_name, own_stat="RATE",
+    )
+    return {"exploit_strength": exploit_strength, "outlier_coverages_checked": checked}
+
+
+def calc_alignment_exploit_strength(bundle: CoverageDataBundle, player_name: str, position: str,
+                                     player_team_abbrev: str, opponent_team_abbrev: str) -> dict:
+    """
+    Real per-receiver signal, same shape as calc_qb_coverage_exploit_
+    strength above, but first has to figure out which alignment
+    (Wide/Slot/Inline/Backfield) this player is actually used at, since
+    the caller (nfl_model_combined.py) doesn't pass one in.
+
+    REAL BUG CAUGHT+FIXED before this shipped: the obvious approach - read
+    the player's own WIDE/SLOT/INLINE/BACK RTE% columns off whichever
+    alignment file has him - is broken. Confirmed directly on real data
+    (Saquon Barkley): those RTE% columns are self-referential PER FILE,
+    not a real cross-alignment share - the WIDE file's own "WIDE RTE %"
+    column reads 100% simply because that file has already pre-filtered
+    to his wide-alignment routes, so it trivially says "100% of THESE
+    routes were wide." Every alignment file does the same thing for
+    itself, making the column useless for telling alignments apart.
+
+    Fixed by comparing real TGT volume ACROSS the 4 alignment files
+    instead - whichever alignment has the player's highest real target
+    count (summed across all 7 of that alignment's coverage files, since
+    volume is split by coverage faced) is his real dominant alignment.
+    alignment_fit_pct is then computed honestly as that alignment's share
+    of his total charted targets across all 4 alignments - not a raw
+    CSV column.
+
+    Uses FP/G (overall fantasy value per game) as the combination stat -
+    a fair general-quality measure available on every receiver row,
+    unlike RATE (QB-specific) or CR %/YPRR alone (miss the volume side).
+
+    Returns exploit_strength NaN (not a guess) if the player has no
+    recorded targets in ANY alignment file yet this season - a real gap,
+    not defaulted to neutral.
+    """
+    opp_full = TEAM_ABBREV_TO_FULL.get((opponent_team_abbrev or "").upper())
+    opp_profile = bundle.def_coverage.get(opp_full) if opp_full else None
+    if opp_profile is None:
+        return {"exploit_strength": np.nan, "dominant_alignment": None,
+                "alignment_fit_pct": None, "outlier_coverages_checked": []}
+
+    # Real target volume per alignment, summed across that alignment's
+    # own coverage-type files (a player's targets are split by which
+    # coverage he faced, so no single coverage file has his full count).
+    tgt_by_alignment = {}
+    for alignment in ALIGNMENTS:
+        total_tgt = 0
+        for coverage_field, rows in bundle.receiver_by_alignment.get(alignment, {}).items():
+            row = rows.get(player_name)
+            if row is not None:
+                total_tgt += int(_to_float(row.get("TGT")) or 0)
+        if total_tgt > 0:
+            tgt_by_alignment[alignment] = total_tgt
+
+    if not tgt_by_alignment:
+        return {"exploit_strength": np.nan, "dominant_alignment": None,
+                "alignment_fit_pct": None, "outlier_coverages_checked": []}
+
+    dominant_alignment = max(tgt_by_alignment, key=tgt_by_alignment.get)
+    total_across_all = sum(tgt_by_alignment.values())
+    alignment_fit_pct = round(100 * tgt_by_alignment[dominant_alignment] / total_across_all, 1)
+
+    exploit_strength, checked = _weighted_outlier_exploit(
+        opp_profile.outliers,
+        bundle.receiver_by_alignment.get(dominant_alignment, {}),
+        bundle.def_allowed_by_alignment.get(dominant_alignment, {}),
+        player_name, opp_profile.team_name, own_stat="FP/G",
+    )
+    return {
+        "exploit_strength": exploit_strength,
+        "dominant_alignment": dominant_alignment,
+        "alignment_fit_pct": alignment_fit_pct,
+        "outlier_coverages_checked": checked,
+    }
 
 
 def get_matchup(bundle: CoverageDataBundle, player_name, position, opponent_team,
