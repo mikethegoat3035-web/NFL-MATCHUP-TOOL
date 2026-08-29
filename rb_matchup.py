@@ -58,6 +58,7 @@ gap as "longest catch" on the WR/coverage side. Not built, not guessed.
 
 import csv
 import os
+import numpy as np
 import re
 from dataclasses import dataclass, field
 from statistics import mean, pstdev
@@ -376,6 +377,76 @@ def load_full_rb_dataset(data_dir=".", player_dir=None, def_dir=None):
     rb_data = load_rb_vs_concept(player_files) if player_files else {}
     def_data = load_def_allowed_rb_concept(def_files) if def_files else {}
     return RBDataBundle(rb_vs_concept=rb_data, def_allowed=def_data, missing=missing)
+
+
+TIER_SCORE = {"Elite": 1.0, "Above Avg": 0.75, "Average": 0.5, "Below Avg": 0.25, "Poor": 0.0}
+
+
+def calc_rb_concept_exploit_strength(bundle: RBDataBundle, rb_name: str,
+                                      opponent_team_abbrev: str) -> dict:
+    """
+    Real, aggregate RB matchup signal across ALL 6 real rush concepts,
+    weighted by how much this SPECIFIC back actually runs each one (his
+    own real _att share) - the real analog of coverage_matchup.py's
+    exploit-strength functions, but blended across concepts instead of
+    gated to outliers, since (per this module's own note above) concept
+    usage is an offensive play-call choice, not a defensive tendency
+    worth outlier-filtering the way coverage is.
+
+    For each concept: combines the defense's allowed tier (60%, the new
+    opponent-specific information) with the RB's own tier in that same
+    concept (40%) - same weighting philosophy as every coverage_matchup.py
+    exploit-strength function. Uses YPC as the combination stat (a fair,
+    always-present per-concept efficiency measure on both sides).
+
+    A concept this RB has never really run (0 real attempts) contributes
+    zero weight - not treated as a zero-value data point, genuinely
+    excluded, so a back who's purely an Inside/Outside Zone runner isn't
+    penalized or credited for concepts he's never actually used.
+
+    Returns exploit_strength NaN if this RB has no real attempts in ANY
+    concept yet, or the opponent isn't found - a real gap, not a guess.
+    """
+    opp_full = TEAM_ABBREV_TO_FULL.get((opponent_team_abbrev or "").upper())
+    if opp_full is None:
+        return {"exploit_strength": np.nan, "concepts_used": []}
+
+    concept_atts = {}
+    for concept, rows in bundle.rb_vs_concept.items():
+        row = rows.get(rb_name)
+        if row is not None:
+            att = row.get("_att", 0) or 0
+            if att > 0:
+                concept_atts[concept] = att
+
+    if not concept_atts:
+        return {"exploit_strength": np.nan, "concepts_used": []}
+
+    total_att = sum(concept_atts.values())
+    weighted_scores, weights = [], []
+    for concept, att in concept_atts.items():
+        own_row = bundle.rb_vs_concept.get(concept, {}).get(rb_name)
+        def_row = bundle.def_allowed.get(concept, {}).get(opp_full)
+        own_score = TIER_SCORE.get((own_row.get("_tiers") or {}).get("YPC")) if own_row else None
+        def_score = TIER_SCORE.get((def_row.get("_tiers") or {}).get("YPC")) if def_row else None
+
+        parts, part_weights = [], []
+        if def_score is not None:
+            parts.append(def_score)
+            part_weights.append(0.6)
+        if own_score is not None:
+            parts.append(own_score)
+            part_weights.append(0.4)
+        if not parts:
+            continue
+        combined = sum(p * w for p, w in zip(parts, part_weights)) / sum(part_weights)
+        weighted_scores.append(combined)
+        weights.append(att / total_att)
+
+    if not weighted_scores:
+        return {"exploit_strength": np.nan, "concepts_used": list(concept_atts.keys())}
+    exploit_strength = sum(s * w for s, w in zip(weighted_scores, weights)) / sum(weights)
+    return {"exploit_strength": round(exploit_strength, 3), "concepts_used": list(concept_atts.keys())}
 
 
 def get_rb_matchup(bundle: RBDataBundle, rb_name, opponent_team_full, rb_team_name=None):
