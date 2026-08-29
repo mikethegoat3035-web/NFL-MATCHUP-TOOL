@@ -285,6 +285,76 @@ def load_def_allowed_to_qb(file_paths: dict):
 
 
 # ---------------------------------------------------------------------------
+# QB scrambles - a real, separate signal from QB-vs-coverage above. QBs
+# don't have named rush concepts the way RBs do (Power/Zone/Counter) - a
+# scramble is inherently improvised, not a called play - so this is a
+# single flat comparison (QB's own real scramble production vs. how much
+# a defense allows on scrambles), not a coverage-type or concept-type
+# breakdown like everything else in this module. One real player-side
+# file, one real team-side file, loaded with the SAME real generic
+# tiering helper everything else here uses, just with a single pseudo-
+# key ("SCRAMBLE") instead of iterating over multiple coverage types.
+# ---------------------------------------------------------------------------
+
+def load_qb_scrambles(file_path: str):
+    """QB's own real scramble volume/production this season - ATT, YDS,
+    YACO, MTF, Success% etc., same tiering treatment as every other file
+    here. Returns {"SCRAMBLE": {qb_name: row}} - the single-key shape
+    keeps this compatible with the same _weighted_outlier_exploit-style
+    combination logic used for alignment/QB-coverage, just with exactly
+    one "coverage" to check instead of several."""
+    return _load_coverage_keyed_data({"SCRAMBLE": file_path}, key_column="Name")
+
+
+def load_def_allowed_qb_scrambles(file_path: str):
+    """What each DEFENSE allows on QB scrambles - same shape as above,
+    keyed by team name."""
+    return _load_coverage_keyed_data({"SCRAMBLE": file_path}, key_column="Name")
+
+
+def calc_qb_scramble_exploit_strength(qb_scrambles: dict, def_allowed_scrambles: dict,
+                                       qb_name: str, opponent_team_abbrev: str) -> dict:
+    """
+    Real QB-scramble matchup signal - no outlier-coverage gating needed
+    here (unlike calc_qb_coverage_exploit_strength above), since there's
+    only one real "situation" to check: does this defense generally give
+    up scramble yardage, and does this QB generally produce it. Combines
+    the defense's allowed tier (60%, the new opponent-specific
+    information) with the QB's own tier (40%, since his overall rushing
+    profile is already partly reflected elsewhere in the pipeline via
+    role_verification/mu) - same weighting philosophy as every other
+    exploit-strength function in this module.
+
+    Uses FP/G as the combination stat - available on both sides and
+    already the established general-quality stat this module uses
+    elsewhere (see calc_alignment_exploit_strength).
+
+    Returns exploit_strength NaN (not a guess) if either side has no real
+    data - a real gap, not defaulted to neutral.
+    """
+    opp_full = TEAM_ABBREV_TO_FULL.get((opponent_team_abbrev or "").upper())
+    if opp_full is None:
+        return {"exploit_strength": np.nan}
+
+    def_row = def_allowed_scrambles.get("SCRAMBLE", {}).get(opp_full)
+    def_score = _tier_to_score(def_row.get("_tiers") if def_row else None, "FP/G")
+
+    qb_row = qb_scrambles.get("SCRAMBLE", {}).get(qb_name)
+    qb_score = _tier_to_score(qb_row.get("_tiers") if qb_row else None, "FP/G")
+
+    parts, weights = [], []
+    if def_score is not None:
+        parts.append(def_score)
+        weights.append(0.6)
+    if qb_score is not None:
+        parts.append(qb_score)
+        weights.append(0.4)
+    if not parts:
+        return {"exploit_strength": np.nan}
+    return {"exploit_strength": round(sum(p * w for p, w in zip(parts, weights)) / sum(weights), 3)}
+
+
+# ---------------------------------------------------------------------------
 # Receiver (WR/TE) by alignment vs coverage
 # ---------------------------------------------------------------------------
 
@@ -494,6 +564,8 @@ class CoverageDataBundle:
     def_allowed_to_qb: dict     # coverage_field -> {team_name: row}
     receiver_by_alignment: dict # alignment -> coverage_field -> {player_name: row}
     def_allowed_by_alignment: dict  # alignment -> coverage_field -> {team_name: row}
+    qb_scrambles: dict = field(default_factory=dict)          # {"SCRAMBLE": {qb_name: row}}
+    def_allowed_qb_scrambles: dict = field(default_factory=dict)  # {"SCRAMBLE": {team_name: row}}
     missing: list = field(default_factory=list)
 
 
@@ -511,6 +583,7 @@ ALIGNMENT_DEF_DIRS = {
 QB_DIR = "QBS"
 QB_DEF_DIR = os.path.join("DEF ALLOWED", "VS QBS")
 COVG_DIR = "COVG%"
+QB_SCRAMBLE_DIR = "QB_SCRAMBLES"
 
 
 def _find_covg_file(covg_dir, want_offense):
@@ -529,6 +602,27 @@ def _find_covg_file(covg_dir, want_offense):
         if norm.startswith(want_prefix) and "COVG" in norm:
             return os.path.join(covg_dir, fname)
     return None
+
+
+def _find_qb_scramble_files(scramble_dir):
+    """Real, typo-tolerant finder for the two QB-scramble files - the
+    real files seen so far have used inconsistent naming/spelling (e.g.
+    'QB_SCAMBLES.csv' - a real missing letter, not a made-up example),
+    so this matches by normalized DEF-prefix presence rather than an
+    exact filename, same robustness approach as everywhere else in this
+    loader."""
+    if not os.path.isdir(scramble_dir):
+        return None, None
+    qb_file, def_file = None, None
+    for fname in os.listdir(scramble_dir):
+        if not fname.lower().endswith(".csv"):
+            continue
+        norm = _normalize_filename(fname[:-4])
+        if norm.startswith("DEF"):
+            def_file = os.path.join(scramble_dir, fname)
+        elif "SC" in norm:  # matches SCRAMBLE/SCAMBLE (real typo) either way
+            qb_file = os.path.join(scramble_dir, fname)
+    return qb_file, def_file
 
 
 def load_full_dataset(data_dir="."):
@@ -599,11 +693,21 @@ def load_full_dataset(data_dir="."):
         receiver_by_alignment[alignment] = load_receiver_vs_coverage(rec_files) if rec_files else {}
         def_allowed_by_alignment[alignment] = load_def_allowed_by_alignment(def_files) if def_files else {}
 
+    scramble_dir = os.path.join(data_dir, QB_SCRAMBLE_DIR)
+    qb_scramble_file, def_scramble_file = _find_qb_scramble_files(scramble_dir)
+    qb_scrambles = load_qb_scrambles(qb_scramble_file) if qb_scramble_file else {}
+    def_allowed_qb_scrambles = load_def_allowed_qb_scrambles(def_scramble_file) if def_scramble_file else {}
+    if not qb_scramble_file:
+        missing.append(f"QB scrambles (looked in '{scramble_dir}')")
+    if not def_scramble_file:
+        missing.append(f"Def-allowed QB scrambles (looked in '{scramble_dir}')")
+
     return CoverageDataBundle(
         off_coverage=off_profiles, def_coverage=def_profiles,
         qb_vs_coverage=qb_data, def_allowed_to_qb=def_qb_data,
         receiver_by_alignment=receiver_by_alignment,
         def_allowed_by_alignment=def_allowed_by_alignment,
+        qb_scrambles=qb_scrambles, def_allowed_qb_scrambles=def_allowed_qb_scrambles,
         missing=missing,
     )
 
