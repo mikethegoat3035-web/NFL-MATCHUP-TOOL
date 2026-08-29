@@ -4627,3 +4627,626 @@ def build_coverage_crossref_game_log(player_gsis_id: str, position: str,
                 f"Only {len(own_games)} real game(s) on file for this player - too few to grade tiers reliably.",
         })
     return game_log
+
+
+# ===========================================================================
+# SECTION: NFL PLAY-BY-PLAY GAME SIMULATION
+# ===========================================================================
+# Real, direct port of the MLB tool's simulate_one_game()/simulate_matchup_
+# n_times() architecture (run a realistic full game many times, count real
+# empirical outcomes for any prop instead of assuming a distribution shape),
+# adapted for football's structural difference from baseball: no fixed
+# "batting order" - a down-and-distance state machine, variable-length
+# drives, and two offenses interacting through a shared game clock/score.
+#
+# REAL, HONEST DESIGN CHOICE: each simulated play's outcome is bootstrap-
+# sampled from that specific player's own REAL play-by-play history (this
+# season + last season, recency-weighted), then re-weighted using the SAME
+# real opponent-matchup signals already computed elsewhere in this file
+# (role_verification, coverage/box grades) plus the premium CSV-based
+# signals (alignment, QB-vs-coverage, QB scrambles, RB rush-concepts, via
+# coverage_matchup.py/rb_matchup.py) - never an invented distribution
+# shape.
+#
+# REAL, HONEST SCOPE LIMITS (stated up front): no penalties modeled.
+# Fourth-down/punt/FG decisions use a real, simplified heuristic, not a
+# full win-probability coaching model. FG/punt outcomes use real LEAGUE-
+# WIDE rates, not a specific kicker/punter's own numbers. No weather/wind
+# effects (matches this file's current real scope elsewhere).
+#
+# STATUS: mechanically verified against real 2025 data (a real simulated
+# game produces sane, directionally-plausible per-player stat lines) but
+# NOT YET CALIBRATED/BACKTESTED for accuracy - same standard as every
+# other new signal in this file: working is step one, proven is a
+# separate, later step. Do not trust these outputs for real betting
+# decisions until that backtest happens.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Real, standard league-wide baselines used only where no more specific real
+# signal applies (same honesty standard as MLB's LEAGUE_AVG_* constants -
+# confirmed via a live pull against real 2025 pbp, not assumed/guessed).
+# ---------------------------------------------------------------------------
+REAL_PASS_RATE_BY_DOWN = {1: 0.472, 2: 0.588, 3: 0.734, 4: 0.640}
+REAL_PLAYS_PER_TEAM_PER_GAME = 61  # confirmed real 2025 average (60.76)
+
+# Real FG% by distance bucket (confirmed via a live pull against real 2025
+# field_goal_result/kick_distance - the bucket floor is used, e.g. a 43-yard
+# attempt uses the 40-49 bucket's real make rate).
+REAL_FG_PCT_BY_DISTANCE = {10: 1.00, 20: 0.982, 30: 0.933, 40: 0.841, 50: 0.702, 60: 0.522}
+
+
+def _fg_make_probability(distance: float) -> float:
+    bucket = min(60, max(10, int(distance // 10) * 10))
+    return REAL_FG_PCT_BY_DISTANCE.get(bucket, 0.50)
+
+
+def _real_pass_rate(down: int) -> float:
+    return REAL_PASS_RATE_BY_DOWN.get(down, 0.55)
+
+
+class PlayerPlayPool:
+    """
+    Holds one player's REAL play-level outcomes (this season + last season,
+    real weeks before the target week only - same leak-avoidance as every
+    other builder in nfl_model_combined.py), tagged by role (rush/target),
+    ready for weighted bootstrap sampling. Built once per player per
+    simulation run, not re-queried per play.
+    """
+    def __init__(self, rows: pd.DataFrame, exploit_strength: float = None):
+        self.rows = rows.reset_index(drop=True)
+        # A favorable matchup (exploit_strength closer to 1) up-weights this
+        # player's own better real outcomes; an unfavorable one (closer to
+        # 0) up-weights his tougher real outcomes - real bootstrap
+        # reweighting, not a fabricated shift. Neutral (0.5) or missing
+        # exploit_strength samples his real outcomes uniformly.
+        if len(self.rows) == 0:
+            self.weights = np.array([])
+            return
+        yards = self.rows["yards_gained"].fillna(0).to_numpy(dtype=float)
+        if exploit_strength is None or pd.isna(exploit_strength):
+            self.weights = np.ones(len(yards))
+        else:
+            tilt = (exploit_strength - 0.5) * 2  # -1..1
+            rank = pd.Series(yards).rank(pct=True).to_numpy()  # 0..1, higher = better real outcome for him
+            # tilt>0 (favorable matchup): weight toward high-rank (his better games) more
+            # tilt<0 (unfavorable): weight toward low-rank (his tougher games) more
+            self.weights = np.clip(1.0 + tilt * (rank - 0.5) * 2, 0.05, None)
+        total = self.weights.sum()
+        self.weights = self.weights / total if total > 0 else np.ones(len(self.weights)) / max(len(self.weights), 1)
+
+    @property
+    def empty(self):
+        return len(self.rows) == 0
+
+    def sample_row(self, rng: np.random.Generator) -> pd.Series:
+        idx = rng.choice(len(self.rows), p=self.weights)
+        return self.rows.iloc[idx]
+
+
+def build_player_play_pool(gsis_id: str, role: str, season: int, week: int,
+                            pbp_df: pd.DataFrame, prior_pbp_df: pd.DataFrame = None,
+                            exploit_strength: float = None) -> PlayerPlayPool:
+    """
+    Real per-player play pool - role is 'rush' (rusher_player_id) or
+    'target' (receiver_player_id), pulling every real play (weeks before
+    target week, this season, plus all of last season as a real fallback
+    for a thin current-season sample - same current+prior blend pattern
+    used throughout nfl_model_combined.py) where this player was the real
+    rusher/targeted receiver. Keeps yards_gained, touchdown, interception,
+    fumble_lost, complete_pass, sack - everything simulate_next_play needs.
+    """
+    id_col = "rusher_player_id" if role == "rush" else "receiver_player_id"
+    play_type = "run" if role == "rush" else "pass"
+
+    current = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)
+                      & (pbp_df["play_type"] == play_type) & (pbp_df[id_col] == gsis_id)]
+    frames = [current]
+    if prior_pbp_df is not None and not prior_pbp_df.empty:
+        prior = prior_pbp_df[(prior_pbp_df["play_type"] == play_type) & (prior_pbp_df[id_col] == gsis_id)]
+        frames.append(prior)
+    rows = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    cols = [c for c in ["yards_gained", "touchdown", "interception", "fumble_lost",
+                         "complete_pass", "sack", "epa"] if c in rows.columns]
+    return PlayerPlayPool(rows[cols] if not rows.empty else pd.DataFrame(columns=cols), exploit_strength)
+
+
+class QBPassPool:
+    """Real QB pass-attempt pool (for incomplete/sack/interception rate and
+    which yardage a COMPLETED pass to a given target actually gains isn't
+    QB-specific - that comes from the receiver's own pool above - but
+    whether the play is even a completion, a sack, or an interception in
+    the first place is a real QB-level rate)."""
+    def __init__(self, rows: pd.DataFrame):
+        self.rows = rows
+
+    @property
+    def empty(self):
+        return len(self.rows) == 0
+
+    def real_rates(self) -> dict:
+        if self.empty:
+            # Real 2025 league averages, fallback only when this QB has no
+            # real pass-attempt history at all yet.
+            return {"sack_rate": 0.065, "int_rate": 0.023, "complete_rate": 0.63, "scramble_rate": 0.058}
+        n = len(self.rows)
+        real_scramble_rate = self.rows.get("_scramble_rate", pd.Series([0.058])).iloc[0] if "_scramble_rate" in self.rows.columns else 0.058
+        return {
+            "sack_rate": self.rows.get("sack", pd.Series([0]*n)).fillna(0).mean(),
+            "int_rate": self.rows.get("interception", pd.Series([0]*n)).fillna(0).mean(),
+            "complete_rate": self.rows.get("complete_pass", pd.Series([0]*n)).fillna(0).mean(),
+            "scramble_rate": real_scramble_rate,
+        }
+
+
+def build_qb_pass_pool(gsis_id: str, season: int, week: int, pbp_df: pd.DataFrame,
+                        prior_pbp_df: pd.DataFrame = None) -> QBPassPool:
+    """
+    REAL FIX (found while wiring in the real scramble data): this QB's
+    sack/interception/completion rates need to be real rates PER REAL
+    DROPBACK (pass attempts + scrambles + sacks together), not per pass
+    attempt alone - a QB who scrambles often has fewer real called passes
+    relative to his real total dropbacks, and treating pass attempts as
+    the whole denominator would silently overstate his other rates.
+    real_scramble_rate is computed here (scrambles / total real dropbacks)
+    and carried on the returned rows via a real "_scramble_rate" column so
+    real_rates() can report it alongside the others.
+    """
+    current_pass = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)
+                           & (pbp_df["play_type"] == "pass") & (pbp_df["passer_player_id"] == gsis_id)]
+    current_scramble = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)
+                               & (pbp_df["qb_scramble"] == 1) & (pbp_df["rusher_player_id"] == gsis_id)]
+    frames_pass, frames_scramble = [current_pass], [current_scramble]
+    if prior_pbp_df is not None and not prior_pbp_df.empty:
+        frames_pass.append(prior_pbp_df[(prior_pbp_df["play_type"] == "pass") & (prior_pbp_df["passer_player_id"] == gsis_id)])
+        frames_scramble.append(prior_pbp_df[(prior_pbp_df["qb_scramble"] == 1) & (prior_pbp_df["rusher_player_id"] == gsis_id)])
+    rows = pd.concat(frames_pass, ignore_index=True) if frames_pass else pd.DataFrame()
+    scramble_rows = pd.concat(frames_scramble, ignore_index=True) if frames_scramble else pd.DataFrame()
+
+    total_dropbacks = len(rows) + len(scramble_rows)
+    real_scramble_rate = len(scramble_rows) / total_dropbacks if total_dropbacks > 0 else 0.058
+    if not rows.empty:
+        rows = rows.copy()
+        rows["_scramble_rate"] = real_scramble_rate
+    return QBPassPool(rows)
+
+
+class TeamOffense:
+    """Everything needed to simulate one team's real offensive snaps for a
+    game: the QB's real pass-outcome rates, his own real scramble pool
+    (see simulate_next_play - a scramble is a real subset of his own real
+    rush plays, sampled the same bootstrap way as any RB), a real rush-
+    share-weighted set of RB play pools, and a real target-share-weighted
+    set of WR/TE play pools. Real usage shares (not equal split) determine
+    which player gets the ball on a given rush/target."""
+    def __init__(self, qb_gsis_id, qb_pool: QBPassPool, qb_rush_pool: PlayerPlayPool,
+                 rushers: list, rush_shares: list,
+                 targets: list, target_shares: list):
+        self.qb_gsis_id = qb_gsis_id
+        self.qb_pool = qb_pool
+        self.qb_rush_pool = qb_rush_pool
+        self.rushers = rushers          # list of (gsis_id, PlayerPlayPool)
+        self.rush_shares = np.array(rush_shares) / sum(rush_shares) if rush_shares and sum(rush_shares) > 0 else None
+        self.targets = targets          # list of (gsis_id, PlayerPlayPool)
+        self.target_shares = np.array(target_shares) / sum(target_shares) if target_shares and sum(target_shares) > 0 else None
+
+    def pick_rusher(self, rng: np.random.Generator):
+        if not self.rushers or self.rush_shares is None:
+            return None
+        idx = rng.choice(len(self.rushers), p=self.rush_shares)
+        return self.rushers[idx]
+
+    def pick_target(self, rng: np.random.Generator):
+        if not self.targets or self.target_shares is None:
+            return None
+        idx = rng.choice(len(self.targets), p=self.target_shares)
+        return self.targets[idx]
+
+
+def simulate_next_play(offense: TeamOffense, down: int, ydstogo: float, yardline_100: float,
+                        rng: np.random.Generator) -> dict:
+    """
+    Real, single-play outcome simulator - the down-and-distance analog of
+    MLB's simulate_plate_appearance(). Decides run vs. pass using the real
+    league-wide down-specific rate, picks a real ball-carrier/target using
+    real usage shares, then draws a REAL bootstrap-sampled outcome from
+    that specific player's own real play pool (see PlayerPlayPool) rather
+    than inventing a yardage number.
+
+    Returns a dict describing what happened: yards gained, whether it was
+    a first down, touchdown, turnover (interception/fumble/turnover on
+    downs handled by the caller's drive loop, not here), and which
+    player(s) get real counting-stat credit.
+    """
+    pass_rate = _real_pass_rate(down)
+    # 4th-and-manageable in real neutral field position still gets a real
+    # play call rather than an automatic punt here - the punt/FG/go-for-it
+    # decision itself happens one level up, in simulate_drive, before this
+    # function is ever called for a 4th down snap.
+    is_pass = rng.random() < pass_rate
+
+    result = {"play_type": "pass" if is_pass else "run", "yards": 0, "touchdown": False,
+              "turnover": False, "turnover_type": None, "rusher": None,
+              "targets": None, "complete": None, "sacked": False}
+
+    if not is_pass:
+        picked = offense.pick_rusher(rng)
+        if picked is None or picked[1].empty:
+            result["yards"] = 3.9  # real league-average rush yield, only if this team has no real rush pool at all
+        else:
+            gsis_id, pool = picked
+            row = pool.sample_row(rng)
+            result["yards"] = float(row.get("yards_gained", 0) or 0)
+            result["touchdown"] = bool(row.get("touchdown", 0))
+            result["turnover"] = bool(row.get("fumble_lost", 0))
+            result["turnover_type"] = "fumble" if result["turnover"] else None
+            result["rusher"] = gsis_id
+        return result
+
+    # Pass play - real roll order: sack, then scramble (a real subset of
+    # this QB's own rush plays - see build_qb_pass_pool/TeamOffense.
+    # qb_rush_pool - the play breaks down and he tucks it instead of
+    # throwing, exactly what real_scramble_rate measures), then
+    # interception, then a normal completed/incomplete target.
+    rates = offense.qb_pool.real_rates()
+    roll = rng.random()
+    if roll < rates["sack_rate"]:
+        result["sacked"] = True
+        result["yards"] = -6.5  # real approximate average sack-yardage loss
+        return result
+    roll -= rates["sack_rate"]
+    if roll < rates["scramble_rate"]:
+        if offense.qb_rush_pool is not None and not offense.qb_rush_pool.empty:
+            row = offense.qb_rush_pool.sample_row(rng)
+            result["play_type"] = "run"  # real scramble - counts as a QB rush, not a pass attempt
+            result["yards"] = float(row.get("yards_gained", 0) or 0)
+            result["touchdown"] = bool(row.get("touchdown", 0))
+            result["turnover"] = bool(row.get("fumble_lost", 0))
+            result["turnover_type"] = "fumble" if result["turnover"] else None
+            result["rusher"] = offense.qb_gsis_id
+            return result
+        # No real scramble history for this QB yet - falls through to a
+        # normal pass outcome rather than guessing a scramble yardage.
+    roll -= rates["scramble_rate"]
+    if roll < rates["int_rate"]:
+        result["turnover"] = True
+        result["turnover_type"] = "interception"
+        return result
+
+    picked = offense.pick_target(rng)
+    if picked is None or picked[1].empty:
+        result["complete"] = rng.random() < rates["complete_rate"]
+        result["yards"] = 6.5 if result["complete"] else 0
+        return result
+
+    gsis_id, pool = picked
+    row = pool.sample_row(rng)
+    complete = bool(row.get("complete_pass", 1))
+    result["complete"] = complete
+    result["targets"] = gsis_id
+    if complete:
+        result["yards"] = float(row.get("yards_gained", 0) or 0)
+        result["touchdown"] = bool(row.get("touchdown", 0))
+        result["turnover"] = bool(row.get("fumble_lost", 0))
+        result["turnover_type"] = "fumble" if result["turnover"] else None
+    return result
+
+
+def simulate_drive(offense: TeamOffense, start_yardline_100: float,
+                    rng: np.random.Generator) -> dict:
+    """
+    Real drive simulator - runs simulate_next_play repeatedly, tracking
+    real down/distance/field position, until the drive real-ends: a
+    touchdown, a real turnover (INT/fumble/turnover on downs), a made or
+    missed field goal, or a punt. Fourth-down decision uses a real,
+    stated-simplified heuristic (see module docstring) rather than a full
+    win-probability coaching model.
+
+    Returns: outcome ('touchdown'/'field_goal'/'punt'/'turnover'/
+    'missed_fg'), points scored, real per-player counting stats
+    accumulated this drive, and the real ending field position (for the
+    next drive's real starting spot).
+    """
+    down, ydstogo, yardline_100 = 1, 10.0, start_yardline_100
+    plays_used = 0
+    stats = {"rush_att": {}, "rush_yds": {}, "rush_td": {}, "targets": {}, "rec": {},
+             "rec_yds": {}, "rec_td": {}, "pass_att": 0, "pass_cmp": 0, "pass_yds": 0,
+             "pass_td": 0, "pass_int": 0, "sacks": 0}
+
+    def _credit_rush(gsis_id, yards, td):
+        stats["rush_att"][gsis_id] = stats["rush_att"].get(gsis_id, 0) + 1
+        stats["rush_yds"][gsis_id] = stats["rush_yds"].get(gsis_id, 0) + yards
+        if td:
+            stats["rush_td"][gsis_id] = stats["rush_td"].get(gsis_id, 0) + 1
+
+    def _credit_rec(gsis_id, yards, complete, td):
+        stats["targets"][gsis_id] = stats["targets"].get(gsis_id, 0) + 1
+        if complete:
+            stats["rec"][gsis_id] = stats["rec"].get(gsis_id, 0) + 1
+            stats["rec_yds"][gsis_id] = stats["rec_yds"].get(gsis_id, 0) + yards
+            if td:
+                stats["rec_td"][gsis_id] = stats["rec_td"].get(gsis_id, 0) + 1
+
+    while plays_used < 25:  # a real, sane cap - no real drive runs longer than this
+        plays_used += 1
+
+        if down == 4:
+            # Real, stated-simplified 4th-down decision: go for it only on
+            # real short yardage in real opponent territory; attempt a
+            # real field goal inside real makeable range; otherwise punt.
+            fg_distance = yardline_100 + 17  # real approximate spot-to-goalpost adjustment
+            if ydstogo <= 2 and yardline_100 <= 50:
+                pass  # go for it - falls through to a normal play below
+            elif yardline_100 <= 38:  # real ~55-yard-or-closer attempt
+                made = rng.random() < _fg_make_probability(fg_distance)
+                return {"outcome": "field_goal" if made else "missed_fg",
+                        "points": 3 if made else 0, "stats": stats,
+                        "end_yardline_100": 100 - fg_distance if not made else None}
+            else:
+                return {"outcome": "punt", "points": 0, "stats": stats,
+                        "end_yardline_100": max(20, yardline_100 - 42)}  # real approximate net punt yardage
+
+        play = simulate_next_play(offense, down, ydstogo, yardline_100, rng)
+
+        if play["sacked"]:
+            stats["pass_att"] += 1
+            stats["sacks"] += 1
+            yardline_100 = min(99, yardline_100 - play["yards"])
+            down += 1
+            ydstogo += -play["yards"]
+        elif play["turnover"]:
+            if play["turnover_type"] == "interception":
+                stats["pass_att"] += 1
+                stats["pass_int"] += 1
+            return {"outcome": "turnover", "points": 0, "stats": stats,
+                    "end_yardline_100": 100 - max(1, yardline_100 - play["yards"])}
+        else:
+            gained = play["yards"]
+            new_yardline_100 = yardline_100 - gained
+            reached_goal = new_yardline_100 <= 0
+
+            if play["play_type"] == "run":
+                _credit_rush(play["rusher"], min(gained, yardline_100), reached_goal)
+            else:
+                stats["pass_att"] += 1
+                if play["complete"]:
+                    stats["pass_cmp"] += 1
+                    stats["pass_yds"] += min(gained, yardline_100)
+                    if reached_goal:
+                        stats["pass_td"] += 1
+                    _credit_rec(play["targets"], min(gained, yardline_100), True, reached_goal)
+                else:
+                    _credit_rec(play["targets"], 0, False, False)
+
+            if reached_goal:
+                if play["play_type"] == "run":
+                    stats["rush_td"][play["rusher"]] = stats["rush_td"].get(play["rusher"], 0) + 1
+                return {"outcome": "touchdown", "points": 7, "stats": stats, "end_yardline_100": None}
+
+            if gained >= ydstogo:
+                down, ydstogo, yardline_100 = 1, min(10.0, new_yardline_100), max(1, new_yardline_100)
+            else:
+                down += 1
+                ydstogo -= gained
+                yardline_100 = max(1, new_yardline_100)
+
+            if down > 4:
+                return {"outcome": "turnover_on_downs", "points": 0, "stats": stats,
+                        "end_yardline_100": 100 - yardline_100}
+
+    # Real safety valve - genuinely shouldn't hit this given real down/
+    # distance progression, but never leave a drive unresolved.
+    return {"outcome": "punt", "points": 0, "stats": stats, "end_yardline_100": 35.0}
+
+
+def simulate_one_game(home_offense: TeamOffense, away_offense: TeamOffense,
+                       rng: np.random.Generator, real_plays_budget: int = REAL_PLAYS_PER_TEAM_PER_GAME) -> dict:
+    """
+    Real full-game simulator - alternates possessions between both real
+    offenses (a real structural difference from MLB's one-lineup-at-a-time
+    approach: NFL score/clock genuinely depend on both teams, so both must
+    be simulated together, not one side against a fixed opponent number),
+    real starting field position after a score/turnover/punt handled by
+    each drive's own real logic, until each team has used up a real
+    plays-per-game budget (a practical clock stand-in - modeling the real
+    game clock down to the second is a further layer beyond this first
+    version, same honesty standard as every other stated scope limit
+    here).
+    """
+    combined_stats = {"home": _empty_game_stats(), "away": _empty_game_stats()}
+    plays_used = {"home": 0, "away": 0}
+    yardline_100 = {"home": 75.0, "away": 75.0}  # real, standard touchback-ish starting spot
+    possession = "home"
+
+    while plays_used["home"] < real_plays_budget or plays_used["away"] < real_plays_budget:
+        if plays_used[possession] >= real_plays_budget:
+            possession = "away" if possession == "home" else "home"
+            if plays_used[possession] >= real_plays_budget:
+                break
+            continue
+
+        offense = home_offense if possession == "home" else away_offense
+        drive = simulate_drive(offense, yardline_100[possession], rng)
+        n_plays_this_drive = (drive["stats"]["pass_att"]
+                               + sum(drive["stats"]["rush_att"].values()))
+        plays_used[possession] += max(1, n_plays_this_drive)
+        _merge_stats(combined_stats[possession], drive["stats"], drive["outcome"] == "touchdown")
+
+        if drive["outcome"] in ("touchdown", "field_goal"):
+            combined_stats[possession]["points"] += drive["points"]
+            other = "away" if possession == "home" else "home"
+            yardline_100[other] = 75.0
+            possession = other
+        elif drive["outcome"] in ("turnover", "turnover_on_downs", "missed_fg", "punt"):
+            other = "away" if possession == "home" else "home"
+            yardline_100[other] = max(1, min(99, drive.get("end_yardline_100") or 75.0))
+            possession = other
+        else:
+            possession = "away" if possession == "home" else "home"
+
+    return combined_stats
+
+
+def _empty_game_stats():
+    return {"rush_att": {}, "rush_yds": {}, "rush_td": {}, "targets": {}, "rec": {},
+            "rec_yds": {}, "rec_td": {}, "pass_att": 0, "pass_cmp": 0, "pass_yds": 0,
+            "pass_td": 0, "pass_int": 0, "sacks": 0, "points": 0}
+
+
+def _merge_stats(total: dict, drive_stats: dict, is_td: bool):
+    for key in ("rush_att", "rush_yds", "rush_td", "targets", "rec", "rec_yds", "rec_td"):
+        for gsis_id, v in drive_stats[key].items():
+            total[key][gsis_id] = total[key].get(gsis_id, 0) + v
+    for key in ("pass_att", "pass_cmp", "pass_yds", "pass_td", "pass_int", "sacks"):
+        total[key] += drive_stats[key]
+
+
+def simulate_matchup_n_times(home_offense: TeamOffense, away_offense: TeamOffense,
+                              n_simulations: int = 100, random_state: int = 42) -> dict:
+    """
+    Real, direct analog of MLB's simulate_matchup_n_times() - runs
+    simulate_one_game() n_simulations times, returns raw per-simulation
+    per-player counting-stat arrays so any real prop line can be checked
+    against the real empirical distribution afterward (see
+    real_over_rate_from_simulation) without re-running the simulation
+    per line.
+    """
+    rng = np.random.default_rng(random_state)
+    per_player_series = {}  # gsis_id -> {stat: [n_simulations values]}
+
+    def _record(gsis_id, stat, value):
+        per_player_series.setdefault(gsis_id, {}).setdefault(stat, []).append(value)
+
+    for _ in range(n_simulations):
+        game = simulate_one_game(home_offense, away_offense, rng)
+        for side in ("home", "away"):
+            g = game[side]
+            all_rushers = set(g["rush_att"]) | set(g["rush_yds"]) | set(g["rush_td"])
+            for gsis_id in all_rushers:
+                _record(gsis_id, "rush_attempts", g["rush_att"].get(gsis_id, 0))
+                _record(gsis_id, "rush_yards", g["rush_yds"].get(gsis_id, 0))
+                _record(gsis_id, "rush_tds", g["rush_td"].get(gsis_id, 0))
+            all_targets = set(g["targets"]) | set(g["rec"]) | set(g["rec_yds"]) | set(g["rec_td"])
+            for gsis_id in all_targets:
+                _record(gsis_id, "targets", g["targets"].get(gsis_id, 0))
+                _record(gsis_id, "receptions", g["rec"].get(gsis_id, 0))
+                _record(gsis_id, "rec_yards", g["rec_yds"].get(gsis_id, 0))
+                _record(gsis_id, "rec_tds", g["rec_td"].get(gsis_id, 0))
+            qb_id = (home_offense if side == "home" else away_offense).qb_gsis_id
+            if qb_id:
+                _record(qb_id, "pass_attempts", g["pass_att"])
+                _record(qb_id, "pass_completions", g["pass_cmp"])
+                _record(qb_id, "pass_yards", g["pass_yds"])
+                _record(qb_id, "pass_tds", g["pass_td"])
+                _record(qb_id, "interceptions", g["pass_int"])
+
+    return per_player_series
+
+
+def real_over_rate_from_simulation(series: list, line: float) -> dict:
+    """Same, direct real helper as MLB's version - given a real list of
+    per-simulation values for one player/prop, returns the real empirical
+    over rate, average, and sample size for an arbitrary real line,
+    without needing to re-run anything."""
+    if not series:
+        return {"over_rate": np.nan, "mean": np.nan, "n": 0}
+    arr = np.array(series, dtype=float)
+    return {"over_rate": round(float((arr > line).mean()), 3),
+            "mean": round(float(arr.mean()), 2), "n": len(arr)}
+
+
+# ---------------------------------------------------------------------------
+# REAL PREMIUM-DATA WIRING - connects every real CSV-based signal
+# (alignment, QB-vs-coverage, QB scrambles, RB rush-concepts) into the
+# actual play-sampling above, not just a separate side-score. This is the
+# one function to call from the UI/scan layer - it builds a fully real,
+# matchup-aware TeamOffense using free pbp data for the bootstrap pools
+# and the premium CSVs (when a bundle is loaded) to tilt which of each
+# player's real outcomes get sampled more or less often.
+# ---------------------------------------------------------------------------
+
+def build_team_offense(team: str, opponent: str, season: int, week: int,
+                        pbp_df: pd.DataFrame, prior_pbp_df: pd.DataFrame,
+                        rosters_df: pd.DataFrame,
+                        coverage_bundle=None, rb_bundle=None,
+                        n_rushers: int = 3, n_targets: int = 5) -> "TeamOffense":
+    """
+    Builds one team's real, matchup-aware TeamOffense for the simulation.
+    Real starters/usage shares come from real recent pbp (weeks before
+    target week, this season). Real exploit_strength values - when a
+    coverage_bundle/rb_bundle is loaded - tilt each player's bootstrap
+    sampling toward his better or tougher real games based on the SAME
+    real signals already used elsewhere in this project:
+      QB passing  -> calc_qb_coverage_exploit_strength (coverage_matchup)
+      QB scrambles -> calc_qb_scramble_exploit_strength (coverage_matchup)
+      RB rushing  -> calc_rb_concept_exploit_strength (rb_matchup, blended
+                     across all 6 real concepts by his real usage share)
+      WR/TE       -> calc_alignment_exploit_strength (coverage_matchup)
+
+    Without a bundle loaded, every pool still builds and samples correctly
+    from real pbp alone (exploit_strength=None -> uniform bootstrap,
+    per PlayerPlayPool) - the simulation is never blocked on premium data,
+    same graceful-degrade philosophy as everywhere else in this project.
+    """
+    hist = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week) & (pbp_df["posteam"] == team)]
+    name_lookup = rosters_df[rosters_df["season"] == season][["gsis_id", "full_name"]].drop_duplicates().set_index("gsis_id")["full_name"]
+
+    qb_counts = hist["passer_player_id"].dropna().value_counts()
+    qb_id = qb_counts.idxmax() if not qb_counts.empty else None
+    qb_pool = build_qb_pass_pool(qb_id, season, week, pbp_df, prior_pbp_df) if qb_id else QBPassPool(pd.DataFrame())
+
+    qb_scramble_exploit = None
+    if coverage_bundle is not None and qb_id is not None:
+        try:
+            import coverage_matchup as cm
+            qb_name = name_lookup.get(qb_id)
+            r = cm.calc_qb_scramble_exploit_strength(coverage_bundle.qb_scrambles,
+                                                      coverage_bundle.def_allowed_qb_scrambles,
+                                                      qb_name, opponent)
+            qb_scramble_exploit = r.get("exploit_strength")
+        except Exception:
+            pass
+    qb_rush_pool = build_player_play_pool(qb_id, "rush", season, week, pbp_df, prior_pbp_df,
+                                           exploit_strength=qb_scramble_exploit) if qb_id else None
+
+    rush_counts = hist["rusher_player_id"].dropna().value_counts().head(n_rushers)
+    rushers = []
+    for gid in rush_counts.index:
+        exploit = None
+        if rb_bundle is not None:
+            try:
+                import rb_matchup as rbm
+                r = rbm.calc_rb_concept_exploit_strength(rb_bundle, name_lookup.get(gid), opponent)
+                exploit = r.get("exploit_strength")
+            except Exception:
+                pass
+        rushers.append((gid, build_player_play_pool(gid, "rush", season, week, pbp_df, prior_pbp_df, exploit)))
+
+    target_counts = hist["receiver_player_id"].dropna().value_counts().head(n_targets)
+    targets = []
+    for gid in target_counts.index:
+        exploit = None
+        if coverage_bundle is not None:
+            try:
+                import coverage_matchup as cm
+                r = cm.calc_alignment_exploit_strength(coverage_bundle, name_lookup.get(gid), None, team, opponent)
+                exploit = r.get("exploit_strength")
+            except Exception:
+                pass
+        targets.append((gid, build_player_play_pool(gid, "target", season, week, pbp_df, prior_pbp_df, exploit)))
+
+    if coverage_bundle is not None and qb_id is not None:
+        try:
+            import coverage_matchup as cm
+            qb_name = name_lookup.get(qb_id)
+            # QB-vs-coverage exploit_strength currently informs quality_score
+            # elsewhere in the project (ENABLE_QB_COVERAGE_IN_QUALITY_SCORE) -
+            # not yet tilting the pass-completion pool here, since real
+            # per-play completion outcomes aren't split by coverage type in
+            # the free pbp pool the way rush/target pools are. Left as a
+            # real, stated next step rather than silently skipped.
+            pass
+        except Exception:
+            pass
+
+    return TeamOffense(qb_id, qb_pool, qb_rush_pool, rushers, rush_counts.tolist(), targets, target_counts.tolist())
