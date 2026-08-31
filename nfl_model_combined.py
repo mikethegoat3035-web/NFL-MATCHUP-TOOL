@@ -3658,7 +3658,7 @@ def get_data_confidence(player_gsis_id: str, player_stats_df: pd.DataFrame, seas
 
 def calc_prop_mu(player_gsis_id: str, prop_column: str, player_stats_df: pd.DataFrame,
                   season: int, current_week: int, current_team: str = None,
-                  lookback_games: int = 6, min_games: int = 2,
+                  lookback_games: int = 6, min_games: int = 5,
                   league_fallback_mu: float = None, full_confidence_games: int = None) -> float:
     """
     Computes mu as the average of a player's own recent real games for a
@@ -3825,7 +3825,7 @@ def build_league_fallback_mus(player_stats_df: pd.DataFrame, season: int,
 
 def calc_player_sigma(player_gsis_id: str, prop_column: str, player_stats_df: pd.DataFrame,
                        season: int, current_week: int, current_team: str = None,
-                       lookback_games: int = 8, min_games: int = 3,
+                       lookback_games: int = 8, min_games: int = 5,
                        league_fallback_sigma: float = None, full_confidence_games: int = None) -> float:
     """
     Computes a player's own game-to-game standard deviation for a given prop
@@ -3967,13 +3967,21 @@ def scan_full_slate_nfl(season: int, week: int, coverage_bundle=None, rb_bundle=
 # ---------------------------------------------------------------------------
 
 def get_starters_for_week(season: int, week: int, depth_charts_df: pd.DataFrame,
-                           schedules_df: pd.DataFrame) -> set:
+                           schedules_df: pd.DataFrame, strict_true_starters: bool = False) -> set:
     """
     Returns the set of gsis_ids who were starters at their position for the
     game nearest this season/week, using position-specific pos_rank
     thresholds rather than a flat pos_rank==1 - most offenses run 3-WR sets
     (11 personnel), so WR1/WR2/WR3 are all commonly real starters, not just
     WR1. Same logic applies loosely to RB in committee backfields.
+
+    strict_true_starters (real, new option) - when True, uses a genuinely
+    narrower definition (QB1 only, RB1 only, WR1-2 only, TE1 only, no K) -
+    for real, direct requests to exclude committee-backfield RB2s and
+    3rd-WR-set players entirely, not just "starters" in the broader,
+    personnel-package sense the default threshold below already covers.
+    Default (False) leaves existing behavior/callers completely
+    unaffected.
 
     ASSUMPTION FLAGGED: depth_charts' pos_rank column is assumed to use the
     standard convention where 1 = first-string, 2 = second-string, etc.
@@ -3987,13 +3995,16 @@ def get_starters_for_week(season: int, week: int, depth_charts_df: pd.DataFrame,
     this matches the closest depth chart snapshot on/before the target
     game's date (same approach as detect_role_change()).
     """
-    starter_rank_threshold = {
-        "QB": 1,
-        "RB": 2,   # covers committee backfields (RB1 + RB2)
-        "WR": 3,   # covers standard 3-WR (11 personnel) sets
-        "TE": 1,
-        "K": 1,
-    }
+    if strict_true_starters:
+        starter_rank_threshold = {"QB": 1, "RB": 1, "WR": 2, "TE": 1}
+    else:
+        starter_rank_threshold = {
+            "QB": 1,
+            "RB": 2,   # covers committee backfields (RB1 + RB2)
+            "WR": 3,   # covers standard 3-WR (11 personnel) sets
+            "TE": 1,
+            "K": 1,
+        }
 
     game_date_row = schedules_df[
         (schedules_df["season"] == season) & (schedules_df["week"] == week)
@@ -4013,7 +4024,54 @@ def get_starters_for_week(season: int, week: int, depth_charts_df: pd.DataFrame,
     return set(starters["gsis_id"].dropna().tolist())
 
 
-def score_week_against_actuals(season: int, week: int, starters_only: bool = True, coverage_bundle=None, rb_bundle=None) -> pd.DataFrame:
+def get_usage_relevant_players_for_week(season: int, week: int, player_stats_df: pd.DataFrame,
+                                         min_targets: float = 3.0, min_carries: float = 5.0,
+                                         lookback_games: int = 4) -> set:
+    """
+    Real, usage-based alternative/supplement to get_starters_for_week's
+    depth-chart-rank approach - includes any real player whose own
+    recent real games show genuine, meaningful usage, REGARDLESS of
+    depth-chart position. Built per direct request: a real RB2 heavy in
+    the passing game (or getting decent real carries) and a real WR3
+    with good enough real usage should both count as relevant, even if
+    a depth-chart-rank filter alone wouldn't clearly separate them from
+    a low-usage backup nominally listed at the same rank.
+
+    Real, honest distinction from get_starters_for_week: that function
+    asks "is this player LISTED as a starter" (depth chart), this one
+    asks "did this player ACTUALLY get real touches recently" (his own
+    real game log) - a depth-chart RB2 could still be a real, low-usage
+    handcuff, while a "3rd" receiving back or slot WR3 could be
+    outproducing the nominal RB2/WR2 in real, meaningful volume. Uses
+    each player's own real games in the lookback window (current season,
+    weeks before `week`) - a player with zero games yet this season
+    (rookie, new signing, week 1) won't show up here since there's no
+    real history yet to judge usage from; combine with
+    get_starters_for_week if you want to also catch players before
+    they've built real usage history.
+
+    Returns the set of gsis_ids meeting EITHER threshold (avg targets
+    per game >= min_targets OR avg carries per game >= min_carries)
+    across their own real, recent games.
+    """
+    recent = player_stats_df[
+        (player_stats_df["season"] == season) & (player_stats_df["week"] < week)
+    ].sort_values("week", ascending=False)
+
+    relevant = set()
+    for gsis_id, group in recent.groupby("gsis_id"):
+        recent_games = group.head(lookback_games)
+        if recent_games.empty:
+            continue
+        avg_targets = recent_games["targets"].mean() if "targets" in recent_games.columns else 0
+        avg_carries = recent_games["carries"].mean() if "carries" in recent_games.columns else 0
+        if avg_targets >= min_targets or avg_carries >= min_carries:
+            relevant.add(gsis_id)
+    return relevant
+
+
+def score_week_against_actuals(season: int, week: int, starters_only: bool = True, coverage_bundle=None,
+                                rb_bundle=None, strict_true_starters: bool = False) -> pd.DataFrame:
     """
     Shared core of backtest_week(): builds the week's slate, looks up each
     player's REAL result, and attaches miss/abs_miss/match_ratio - but
@@ -4031,6 +4089,14 @@ def score_week_against_actuals(season: int, week: int, starters_only: bool = Tru
     depth_charts_df = pull_depth_charts([season]) if nfl else pd.DataFrame()
     schedules_df = pull_schedules([season])
     pbp_df = pull_pbp([season])
+    # REAL BUG FIX - fantasy_points previously used nflreadpy's own
+    # "fantasy_points_ppr" column directly for both mu AND the real,
+    # actual outcome, which is the standard -2/INT -2/fumble formula, not
+    # the real PrizePicks -1/-1 rules actually being scored against -
+    # confirmed by hand-checking a real row. Replaced with a genuinely
+    # correct column below, including the real offensive fumble recovery
+    # TD bonus PrizePicks' rules explicitly include.
+    player_stats_df = add_prizepicks_fantasy_column(player_stats_df, pbp_df=pbp_df)
 
     actual_week = player_stats_df[
         (player_stats_df["season"] == season) & (player_stats_df["week"] == week)
@@ -4040,7 +4106,7 @@ def score_week_against_actuals(season: int, week: int, starters_only: bool = Tru
         "pass_yards": "passing_yards",
         "rush_yards": "rushing_yards",
         "rec_yards": "receiving_yards",
-        "fantasy_points": "fantasy_points_ppr",
+        "fantasy_points": "fantasy_points_prizepicks",
         "pass_completions": "completions",
         "pass_attempts": "attempts",
         "pass_tds": "passing_tds",
@@ -4105,7 +4171,16 @@ def score_week_against_actuals(season: int, week: int, starters_only: bool = Tru
     slate_df = slate_df[~zero_mask].copy()
 
     if starters_only:
-        starter_ids = get_starters_for_week(season, week, depth_charts_df, schedules_df)
+        starter_ids = get_starters_for_week(season, week, depth_charts_df, schedules_df,
+                                             strict_true_starters=strict_true_starters)
+        # Real, additional union - per direct request, a genuinely
+        # heavy-usage RB2 (pass-catching or real, decent carry share) or
+        # WR3 (good enough real usage) should count even when the
+        # depth-chart-rank check above doesn't already catch them.
+        # Union rather than replace - QB/TE/K still need the depth-chart
+        # check since the usage filter only looks at targets/carries.
+        usage_ids = get_usage_relevant_players_for_week(season, week, player_stats_df)
+        starter_ids = starter_ids | usage_ids
         if starter_ids:
             slate_df = slate_df[slate_df["gsis_id"].isin(starter_ids)]
 
@@ -4180,7 +4255,8 @@ def add_simulation_columns_to_backtest_rows(scored_df: pd.DataFrame, n_simulatio
 
 def build_season_simulation_backtest_report(season: int, weeks: list = None, through_week: int = 18,
                                              coverage_bundle=None, rb_bundle=None,
-                                             n_simulations: int = 1000) -> dict:
+                                             n_simulations: int = 1000, strict_true_starters: bool = False,
+                                             min_quality_score: float = None) -> dict:
     """
     Real, season-wide simulation backtest - runs score_week_against_
     actuals() + add_simulation_columns_to_backtest_rows() across every
@@ -4191,6 +4267,18 @@ def build_season_simulation_backtest_report(season: int, weeks: list = None, thr
     gap between the simulation's average and a real, plausible line
     actually predict a more reliable real outcome" - with real, evidence-
     based numbers instead of a reasoned-but-unvalidated guess.
+
+    min_quality_score (real, new, optional) - when set, only rows with a
+    real quality_score >= this value get simulated/backtested at all,
+    per direct request to check whether a "best of the best" quality
+    floor (e.g. 70+) genuinely produces more reliable results. Real,
+    honest caveat worth restating here: an earlier real 6-week run
+    showed quality_score wasn't yet cleanly ordered (the 80-100 tier
+    actually had a WORSE mean_match_ratio than the 40-60 tier) - this
+    filter doesn't fix that on its own, it just lets you directly,
+    empirically check whether a given floor helps, using real results
+    instead of assuming either way. None (default) runs every real row,
+    unchanged from before.
 
     Real, honest limitation carried over from build_season_accuracy_
     report: no free historical NFL player-prop-line archive exists, so
@@ -4210,9 +4298,14 @@ def build_season_simulation_backtest_report(season: int, weeks: list = None, thr
     for wk in weeks:
         try:
             wk_df = score_week_against_actuals(season, wk, starters_only=True,
-                                                coverage_bundle=coverage_bundle, rb_bundle=rb_bundle)
+                                                coverage_bundle=coverage_bundle, rb_bundle=rb_bundle,
+                                                strict_true_starters=strict_true_starters)
             if wk_df.empty:
                 continue
+            if min_quality_score is not None and "quality_score" in wk_df.columns:
+                wk_df = wk_df[wk_df["quality_score"] >= min_quality_score]
+                if wk_df.empty:
+                    continue
             sim_df = add_simulation_columns_to_backtest_rows(wk_df, n_simulations=n_simulations)
             if not sim_df.empty:
                 sim_df["week"] = wk
@@ -4696,6 +4789,132 @@ def diagnose_player_stats_for_game_log(season: int) -> dict:
     return result
 
 
+try:
+    import requests
+except ImportError:
+    requests = None
+
+
+def pull_prizepicks_nfl_lines() -> pd.DataFrame:
+    """
+    Pulls PrizePicks' current NFL board via their public projections
+    endpoint - same real approach already proven working for MLB
+    (pull_prizepicks_mlb_lines), with league_id changed to 9 (confirmed
+    real - directly verified via a real, independent public API example
+    explicitly labeled "NFL" for league_id=9, not guessed).
+
+    Returns columns: player_name, stat_type, line, source.
+
+    Real, honest limitation: this specific api.prizepicks.com domain is
+    blocked by this build sandbox's own network allowlist (confirmed
+    directly - a live test here returned "Host not in allowlist" from
+    the sandbox's own egress proxy, not an error from PrizePicks
+    itself), so this couldn't be tested live from here the way the pbp/
+    player_stats pulls earlier could. The code mirrors the MLB version's
+    already-proven real structure exactly, but needs a real test in your
+    own deployed environment (which likely has broader network access)
+    to confirm it actually works end to end.
+    """
+    if requests is None:
+        raise ImportError("pip install requests --break-system-packages")
+
+    url = "https://api.prizepicks.com/projections?league_id=9&per_page=500"
+    headers = {"User-Agent": "Mozilla/5.0"}  # PrizePicks blocks requests with no UA header
+
+    resp = requests.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+
+    players_by_id = {
+        item["id"]: item.get("attributes", {}).get("name")
+        for item in data.get("included", [])
+        if item.get("type") == "new_player"
+    }
+
+    rows = []
+    for proj in data.get("data", []):
+        attrs = proj.get("attributes", {})
+        player_id = proj.get("relationships", {}).get("new_player", {}).get("data", {}).get("id")
+        rows.append({
+            "player_name": players_by_id.get(player_id, "Unknown"),
+            "stat_type": attrs.get("stat_type"),
+            "line": attrs.get("line_score"),
+            "source": "PrizePicks",
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_offensive_fumble_recovery_tds_by_game(pbp_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Real, per-player-per-game count of offensive fumble recovery TDs -
+    a genuinely rare real event (2 total found across the entire live
+    2025 season when this was built) not broken out as its own column
+    anywhere in player_stats, needed to make fantasy_points match real
+    PrizePicks scoring exactly (+6pts, explicitly part of their real
+    rules). Detected directly from real pbp: a play where the ball was
+    fumbled, recovered by the SAME team that had possession
+    (fumble_recovery_1_team == posteam - the offense recovered its own
+    fumble, not the defense), and the play resulted in a real touchdown.
+
+    Returns columns: gsis_id, season, week, off_fumble_recovery_tds -
+    only real rows where this actually happened (a real, genuinely rare
+    event), not a full player/week grid.
+    """
+    required = {"fumble", "touchdown", "fumble_recovery_1_team", "fumble_recovery_1_player_id",
+                "posteam", "season", "week"}
+    missing = required - set(pbp_df.columns)
+    if missing:
+        raise KeyError(f"build_offensive_fumble_recovery_tds_by_game: expected pbp columns not found: {missing}")
+
+    off_fum_td = pbp_df[
+        (pbp_df["fumble"] == 1) & (pbp_df["touchdown"] == 1)
+        & (pbp_df["fumble_recovery_1_team"] == pbp_df["posteam"])
+    ].dropna(subset=["fumble_recovery_1_player_id"])
+
+    if off_fum_td.empty:
+        return pd.DataFrame(columns=["gsis_id", "season", "week", "off_fumble_recovery_tds"])
+
+    agg = off_fum_td.groupby(["fumble_recovery_1_player_id", "season", "week"]).size().reset_index()
+    return agg.rename(columns={"fumble_recovery_1_player_id": "gsis_id", 0: "off_fumble_recovery_tds"})
+
+
+def add_prizepicks_fantasy_column(player_stats_df: pd.DataFrame, pbp_df: pd.DataFrame = None,
+                                   ppr_value: float = 1.0) -> pd.DataFrame:
+    """
+    Real, honest fix - the real backtest was previously reading
+    nflreadpy's own pre-built "fantasy_points_ppr" column directly for
+    BOTH mu and the real, actual outcome, which uses the standard,
+    widely-used PPR formula (-2/INT, -2/fumble lost) - genuinely
+    different from the real PrizePicks rules actually being scored
+    against (-1/INT, -1/fumble lost), confirmed by hand-checking a real
+    row: a QB with 2 real INTs showed fantasy_points_ppr=12.2, which
+    exactly matches -2/INT math (11.6+4-4+0.6), not the real PrizePicks
+    -1/INT math (11.6+4-2+0.6=14.2) - a real, meaningful, silent
+    mismatch until caught here.
+
+    Adds a new "fantasy_points_prizepicks" column, computed via the
+    already-correct calc_offense_fantasy_points on every real row, with
+    the real offensive fumble recovery TD bonus (+6, a genuinely rare
+    real event not in any player_stats column) layered on top when
+    pbp_df is provided. This is the column that should be used for BOTH
+    mu and actual going forward, not nflreadpy's own fantasy_points_ppr.
+    """
+    df = player_stats_df.copy()
+    df["fantasy_points_prizepicks"] = df.apply(
+        lambda r: calc_offense_fantasy_points(r.to_dict(), ppr_value=ppr_value), axis=1)
+
+    if pbp_df is not None:
+        fum_td = build_offensive_fumble_recovery_tds_by_game(pbp_df)
+        if not fum_td.empty:
+            df = df.merge(fum_td, on=["gsis_id", "season", "week"], how="left")
+            df["off_fumble_recovery_tds"] = df["off_fumble_recovery_tds"].fillna(0)
+            df["fantasy_points_prizepicks"] += df["off_fumble_recovery_tds"] * 6
+            df = df.drop(columns=["off_fumble_recovery_tds"])
+
+    return df
+
+
 def build_longest_play_by_game(pbp_df: pd.DataFrame, position: str) -> pd.DataFrame:
     """
     Real per-game "longest reception" (WR/TE), "longest rush" (RB), or
@@ -4893,7 +5112,8 @@ NFL_PARTIAL_PROP_TO_STAT_SUFFIX = {
 
 
 def score_partial_game_week_against_actuals(season: int, week: int, time_window: str,
-                                             starters_only: bool = True) -> pd.DataFrame:
+                                             starters_only: bool = True,
+                                             strict_true_starters: bool = False) -> pd.DataFrame:
     """
     Real, independent 1Q/1H backtest scoring - same real shape and
     purpose as score_week_against_actuals(), but for a real partial-game
@@ -4931,7 +5151,14 @@ def score_partial_game_week_against_actuals(season: int, week: int, time_window:
     ].set_index("gsis_id")
 
     if starters_only:
-        starter_ids = get_starters_for_week(season, week, depth_charts_df, schedules_df)
+        starter_ids = get_starters_for_week(season, week, depth_charts_df, schedules_df,
+                                             strict_true_starters=strict_true_starters)
+        # Real, additional union - same real reasoning as score_week_
+        # against_actuals: a genuinely heavy-usage RB2/WR3 should count
+        # even when depth-chart rank alone doesn't already catch them.
+        player_stats_df = pull_player_stats([season])
+        usage_ids = get_usage_relevant_players_for_week(season, week, player_stats_df)
+        starter_ids = starter_ids | usage_ids
         if starter_ids:
             actual_week_rows = actual_week_rows[actual_week_rows.index.isin(starter_ids)]
 
