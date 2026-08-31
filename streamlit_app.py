@@ -11,24 +11,23 @@ import numpy as np
 from datetime import datetime
 from nfl_model_combined import (
     scan_full_slate_nfl, rescore_quality_mu_row_nfl, backtest_week, build_season_accuracy_report,
-    build_season_simulation_backtest_report,
+    build_season_simulation_backtest_report, build_combined_readiness_and_simulation_report,
     score_partial_game_week_against_actuals, add_simulation_columns_to_backtest_rows,
     diagnose_participation_data, get_player_matchup_explanation, diagnose_injuries_data,
     diagnose_alignment_data, pull_player_stats, pull_schedules, pull_pbp,
     build_coverage_crossref_game_log, diagnose_player_stats_for_game_log,
     build_longest_play_by_game, build_week_games_list,
+    # Real, merged in from coverage_matchup.py and rb_matchup.py (per direct
+    # request, single-file consolidation matching the MLB tool's structure) -
+    # both files' real content now lives directly inside nfl_model_combined.py.
+    load_full_dataset, get_matchup, TEAM_ABBREV_TO_FULL, COVERAGE_FIELDS,
+    _same_team, check_alignment_fit, ALIGNMENT_RTE_COLUMNS, ALIGNMENTS,
+    load_full_rb_dataset, get_rb_matchup, CONCEPT_FILES as RB_CONCEPT_FILES,
+    CRUCIAL_RB_STATS,
 )
 from draft_rankings import (
     build_yahoo_style_rankings, detect_risers, build_league_settings,
     build_snake_draft_targets, compute_blended_rankings, build_draft_rankings_backtest,
-)
-from coverage_matchup import (
-    load_full_dataset, get_matchup, TEAM_ABBREV_TO_FULL, COVERAGE_FIELDS,
-    _same_team, check_alignment_fit, ALIGNMENT_RTE_COLUMNS, ALIGNMENTS,
-)
-from rb_matchup import (
-    load_full_rb_dataset, get_rb_matchup, CONCEPT_FILES as RB_CONCEPT_FILES,
-    CRUCIAL_RB_STATS,
 )
 
 st.set_page_config(page_title="NFL Matchup Tool", layout="wide", page_icon="🏈")
@@ -4680,90 +4679,128 @@ if mode == "Season Backtest":
         report_end_week = st.number_input(
             "Report end week", min_value=2, max_value=18, value=6, step=1,
         )
-    if st.button("Run Readiness Report for this week range", type="secondary"):
-        if report_end_week < report_start_week:
-            st.error("End week must be >= start week.")
-        else:
-            weeks_to_run = list(range(report_start_week, report_end_week + 1))
-            with st.spinner(f"Scoring weeks {report_start_week}-{report_end_week} of {bt_season} against real results..."):
-                try:
-                    st.session_state.season_report = build_season_accuracy_report(
-                        bt_season, weeks=weeks_to_run,
-                        coverage_bundle=st.session_state.get("coverage_bundle"),
-                        rb_bundle=st.session_state.get("rb_bundle"),
-                    )
-                    st.session_state.season_report["season"] = bt_season
-                    st.session_state.backtest_mode = True
-                    st.session_state.show_season_report = True
-                    n_rows = len(st.session_state.season_report["raw"])
-                    st.success(f"Scored {n_rows} rows across weeks {report_start_week}-{report_end_week} of {bt_season}.")
-                except Exception as e:
-                    st.error(f"Season readiness report failed: {e}")
-                    st.session_state.season_report = None
-
-    st.divider()
-    st.subheader("Real, 1000-sample simulation backtest (does the sim's gap actually predict real outcomes?)")
+    st.subheader("Real, combined backtest - readiness + 1000-sample simulation, one real pass")
     st.caption(
-        "For every real, completed week in this range, runs a real 1000-sample Monte "
-        "Carlo per player-prop (negative binomial for count props like receptions/TDs, "
-        "normal for continuous props like yardage - both matched to the model's own "
-        "real mu AND sigma), then checks the real, actual outcome against it. Same "
-        "real, honest limitation as the readiness report above - no free historical "
-        "NFL player-prop-line archive exists, so the hypothetical line is the "
-        "simulation's own real average (floored to a genuine .5), not an actual "
-        "historical book line."
+        "Runs the real, expensive scoring step ONCE per week and builds both reports "
+        "from the same shared results - per direct request, since the readiness "
+        "check and the simulation backtest genuinely need each other and were "
+        "previously two separate buttons silently re-scoring the same real weeks "
+        "twice. Includes a real 1000-sample Monte Carlo per player-prop (negative "
+        "binomial for count props, normal for continuous props, both matched to the "
+        "model's own real mu AND sigma). Same real, honest limitation throughout: no "
+        "free historical NFL player-prop-line archive exists, so the simulation's "
+        "hypothetical line is the model's own real average (floored to a genuine "
+        ".5), not an actual historical book line."
     )
     st.caption(
-        "Real, honest note on which signals are actually feeding mu here: this uses "
+        "Real, honest note on which signals are actually feeding mu: this uses "
         "whatever ENABLE_*_IN_QUALITY_SCORE flags are currently on elsewhere in the "
         "model - alignment vs coverage is currently on, QB-vs-coverage and RB run-"
         "concepts are currently off (still working through their own one-at-a-time "
-        "rollout, documented near those flags). This backtest reflects real, current "
-        "mu exactly as the live scanner produces it - it won't retroactively include "
-        "a signal that's switched off, and turning one on will change these results "
-        "the next time this runs."
+        "rollout). Won't retroactively include a signal that's switched off."
     )
-    sim_n = st.number_input("Simulations per prop", min_value=100, max_value=5000, value=1000, step=100,
-                             key="nfl_sim_n_simulations")
-    if st.button("Run simulation backtest for this week range", type="secondary"):
+    st.markdown("**Real toggles for QB-vs-coverage / RB run-concepts (per direct request - no more manual code edits needed)**")
+    st.caption(
+        "Both require your own real, premium FantasyPoints CSV data "
+        "(coverage_bundle/rb_bundle) to actually do anything - if that data "
+        "isn't loaded, flipping these on won't error, but won't change the "
+        "real results either, since there's nothing for the signal to compute "
+        "from. Run this same week range once with a toggle off and once on, "
+        "then compare the by_quality_tier_by_prop table for the relevant real "
+        "props (pass_yards/pass_completions/pass_attempts for QB-coverage, "
+        "rush_yards/rush_attempts for RB run-concepts) - that's the real, "
+        "direct evidence for whether a signal genuinely helps."
+    )
+    toggle_col1, toggle_col2 = st.columns(2)
+    with toggle_col1:
+        toggle_qb_coverage = st.checkbox(
+            "Enable QB-vs-coverage in quality_score", value=False, key="nfl_toggle_qb_coverage",
+        )
+    with toggle_col2:
+        toggle_run_concept = st.checkbox(
+            "Enable RB run-concepts in quality_score", value=False, key="nfl_toggle_run_concept",
+        )
+    combo_col1, combo_col2 = st.columns(2)
+    with combo_col1:
+        sim_n = st.number_input("Simulations per prop", min_value=100, max_value=5000, value=1000, step=100,
+                                 key="nfl_sim_n_simulations")
+    with combo_col2:
+        combined_min_quality = st.number_input(
+            "Minimum quality_score to backtest (0 = all rows)", min_value=0, max_value=100, value=0, step=5,
+            key="nfl_combined_min_quality",
+            help="Per direct request - only simulate/backtest rows at or above this "
+                 "quality_score, to directly check whether a 'best of best' floor "
+                 "genuinely produces more reliable results. 0 runs every real row, "
+                 "unchanged from the default.",
+        )
+    if st.button("Run combined backtest for this week range", type="secondary"):
         if report_end_week < report_start_week:
             st.error("End week must be >= start week.")
         else:
+            # Real, runtime toggle - sets the module's own real global flags
+            # directly (confirmed this actually works - functions inside
+            # nfl_model_combined.py read these as their own module's global,
+            # so a change made here is genuinely seen by them, not just a
+            # local copy). Reset to their real, current defaults after the
+            # run either way, so this doesn't silently leave a flag flipped
+            # for anything else that runs later in the same session.
+            import nfl_model_combined as _nfl_module
+            _prior_qb_coverage = _nfl_module.ENABLE_QB_COVERAGE_IN_QUALITY_SCORE
+            _prior_run_concept = _nfl_module.ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE
+            _nfl_module.ENABLE_QB_COVERAGE_IN_QUALITY_SCORE = toggle_qb_coverage
+            _nfl_module.ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE = toggle_run_concept
             weeks_to_run = list(range(report_start_week, report_end_week + 1))
-            with st.spinner(f"Running {sim_n}-sample simulations across weeks "
-                             f"{report_start_week}-{report_end_week} of {bt_season}..."):
+            with st.spinner(f"Scoring + simulating weeks {report_start_week}-{report_end_week} "
+                             f"of {bt_season} against real results..."):
                 try:
-                    st.session_state.sim_backtest_report = build_season_simulation_backtest_report(
+                    st.session_state.combined_report = build_combined_readiness_and_simulation_report(
                         bt_season, weeks=weeks_to_run,
                         coverage_bundle=st.session_state.get("coverage_bundle"),
                         rb_bundle=st.session_state.get("rb_bundle"),
                         n_simulations=int(sim_n),
+                        min_quality_score=combined_min_quality if combined_min_quality > 0 else None,
                     )
-                    n_rows = len(st.session_state.sim_backtest_report["raw"])
-                    st.success(f"Simulated and scored {n_rows} real rows across weeks "
-                               f"{report_start_week}-{report_end_week} of {bt_season}.")
+                    n_rows = len(st.session_state.combined_report["raw"])
+                    st.session_state.backtest_mode = True
+                    st.success(f"Scored {n_rows} real rows across weeks {report_start_week}-"
+                               f"{report_end_week} of {bt_season}.")
                 except Exception as e:
-                    st.error(f"Simulation backtest failed: {e}")
-                    st.session_state.sim_backtest_report = None
+                    st.error(f"Combined backtest failed: {e}")
+                    st.session_state.combined_report = None
+                finally:
+                    # Real, guaranteed reset - runs whether the backtest
+                    # succeeded or failed, so a toggle used for one real test
+                    # never silently stays flipped for anything that runs
+                    # later in the same session.
+                    _nfl_module.ENABLE_QB_COVERAGE_IN_QUALITY_SCORE = _prior_qb_coverage
+                    _nfl_module.ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE = _prior_run_concept
 
-    if st.session_state.get("sim_backtest_report") is not None and not st.session_state.sim_backtest_report["raw"].empty:
-        sim_report = st.session_state.sim_backtest_report
-        st.markdown("**Real hit-rate by prop_type and gap-pct bucket**")
-        st.dataframe(sim_report["bucket_summary"], width='stretch')
+    if st.session_state.get("combined_report") is not None and not st.session_state.combined_report["raw"].empty:
+        creport = st.session_state.combined_report
+        st.markdown("**Readiness: real accuracy (|mu - actual|) by quality_score tier, all props**")
+        st.dataframe(creport["by_quality_tier"], width='stretch')
+        st.markdown("**Readiness: same tier breakdown, split by prop_type**")
+        st.dataframe(creport["by_quality_tier_by_prop"], width='stretch')
         st.caption(
-            "Split by prop_type from the start, not lumped together - different NFL "
-            "props (receptions vs rush yards vs rush TDs) likely need genuinely "
-            "different real gap-pct thresholds, the same real lesson already learned "
-            "building MLB's hitter-vs-pitcher backtest split. Needs a real, decent "
-            "sample per bucket before trusting it."
+            "The real, direct 'is quality_score actually meaningful' check - if the "
+            "80-100 tier's mean_abs_miss/mean_match_ratio isn't meaningfully better "
+            "than the <40 tier's, quality_score isn't earning its keep yet for that "
+            "prop, even if it looks fine when every prop is pooled together."
         )
-        if not sim_report["quality_tier_summary"].empty:
-            st.markdown("**Real accuracy (|mu - actual|) by quality_score tier**")
-            st.dataframe(sim_report["quality_tier_summary"], width='stretch')
+        st.markdown("**Readiness: mean absolute miss by prop_type**")
+        st.dataframe(creport["by_prop_type"], width='stretch')
+        if not pd.isna(creport["adjustment_direction_accuracy"]):
+            st.metric("Coverage/box-count adjustment direction accuracy",
+                      f"{creport['adjustment_direction_accuracy']*100:.1f}%",
+                      help="Should clear 50% by a real margin - if it doesn't, the "
+                           "adjustment isn't adding signal as currently weighted.")
+        if not creport["bucket_summary"].empty:
+            st.markdown("**Simulation: real hit-rate by prop_type and gap-pct bucket**")
+            st.dataframe(creport["bucket_summary"], width='stretch')
             st.caption(
-                "The real, direct 'is quality_score actually meaningful' check - if the "
-                "80-100 tier's mean_abs_miss isn't meaningfully lower than the <40 "
-                "tier's, quality_score isn't earning its keep as currently weighted."
+                "Split by prop_type from the start - different NFL props likely need "
+                "genuinely different real gap-pct thresholds. Needs a real, decent "
+                "sample per bucket before trusting it."
             )
 
     st.divider()
@@ -4830,3 +4867,4 @@ if mode == "Season Backtest":
         pmiss_summary["mean_abs_miss"] = round(pmiss_summary["mean_abs_miss"], 2)
         st.markdown("**Real mu accuracy by 1Q/1H prop_type**")
         st.dataframe(pmiss_summary, width='stretch')
+
