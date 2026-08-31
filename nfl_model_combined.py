@@ -25,32 +25,23 @@ can safely join/filter on `gsis_id` consistently across all tables.
 import pandas as pd
 import numpy as np
 import functools
+import csv
+import os
+import re
+from dataclasses import dataclass, field
+from statistics import mean, pstdev
 
 try:
     import nflreadpy as nfl
 except ImportError:
     nfl = None  # allows this file to be imported/tested without the package present
 
-try:
-    from coverage_matchup import (
-        calc_alignment_exploit_strength, calc_qb_coverage_exploit_strength,
-        TEAM_ABBREV_TO_FULL as ALIGNMENT_TEAM_MAP,
-    )
-except ImportError:
-    # Premium alignment module not present in this deploy - both signals
-    # degrade to fully absent (their flags are also off by default, so
-    # this only matters if someone flips a flag on without the file
-    # actually being deployed alongside this one).
-    calc_alignment_exploit_strength = None
-    calc_qb_coverage_exploit_strength = None
-    ALIGNMENT_TEAM_MAP = {}
-
-try:
-    from rb_matchup import calc_run_concept_exploit_strength
-except ImportError:
-    # Same graceful-absence treatment as the alignment import above -
-    # ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE is off by default.
-    calc_run_concept_exploit_strength = None
+# Real, single-file consolidation (per direct request, matching the MLB
+# tool's single prop_model_combined.py structure) - coverage_matchup.py
+# and rb_matchup.py's real content now lives directly below in this same
+# file, so calc_alignment_exploit_strength, calc_qb_coverage_exploit_
+# strength, and calc_rb_concept_exploit_strength are natively defined
+# here, no conditional import needed or possible to silently fail.
 
 
 # ---------------------------------------------------------------------------
@@ -2436,7 +2427,7 @@ ENABLE_ALIGNMENT_IN_QUALITY_SCORE = True
 ENABLE_QB_COVERAGE_IN_QUALITY_SCORE = False
 
 # RB run-concept exploit signal, sourced from rb_matchup.py's premium
-# FantasyPoints dataset (calc_run_concept_exploit_strength). STAYS OFF
+# FantasyPoints dataset (calc_rb_concept_exploit_strength). STAYS OFF
 # until alignment AND QB coverage are each confirmed clean - thinnest
 # real samples of the three (Counter/Power/Pull Lead), tested last on
 # purpose. Round 3.
@@ -3244,7 +3235,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
 
                 # Run-concept exploit signal - premium data, only computed when
                 # a bundle was actually passed in AND the flag is on (see
-                # calc_run_concept_exploit_strength in rb_matchup.py for the
+                # calc_rb_concept_exploit_strength in rb_matchup.py for the
                 # real logic). GATED same as every other premium/isolated
                 # signal - off by default pending its own live test. Position
                 # check mirrors rush_pool's own RB/QB filter (QBs rarely have
@@ -3252,8 +3243,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 # degrade to NaN for most QB rush_yards rows).
                 run_concept_info = {"exploit_strength": np.nan, "concepts_checked": []}
                 if (ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE and rb_bundle is not None
-                        and calc_run_concept_exploit_strength is not None and rb_opponent is not None):
-                    run_concept_info = calc_run_concept_exploit_strength(
+                        and calc_rb_concept_exploit_strength is not None and rb_opponent is not None):
+                    run_concept_info = calc_rb_concept_exploit_strength(
                         rb_bundle, rb.get("full_name"), rb_team, rb_opponent,
                     )
                 run_concept_exploit_for_scoring = run_concept_info.get("exploit_strength") if ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE else np.nan
@@ -3718,6 +3709,7 @@ def calc_prop_mu(player_gsis_id: str, prop_column: str, player_stats_df: pd.Data
     ].sort_values("week", ascending=False).head(lookback_games)
 
     combined = current_season_history
+    team_changed = False
     if len(combined) < min_games:
         # Not enough current-season games (Week 1-2, or right after a trade) -
         # bridge with the end of the prior season, but ONLY if it was with the
@@ -3733,6 +3725,33 @@ def calc_prop_mu(player_gsis_id: str, prop_column: str, player_stats_df: pd.Data
             "week", ascending=False
         ).head(lookback_games)
         combined = pd.concat([current_season_history, prior_season_history])
+
+        # REAL BUG FIX (confirmed live - a real, multi-year veteran who
+        # changed teams in the offseason, e.g. Mike Evans TB->SF for 2026,
+        # verified directly against real, live 2026 roster data): if the
+        # SAME-team bridge above still doesn't clear min_games, the player
+        # isn't a genuine unknown (rookie, practice-squad call-up) - he has
+        # real, recent, relevant skill-level history, just with a
+        # DIFFERENT team. The old behavior threw that away entirely and
+        # fell through to a fully generic league-average number, treating
+        # a real Pro Bowler exactly like a total unknown for no reason
+        # connected to his actual talent. Now bridges with his real
+        # any-team prior-season history instead - genuine signal about
+        # who he is as a player - but flags team_changed=True so real,
+        # extra shrinkage (below) can still account for the honest
+        # uncertainty a new team's scheme/role genuinely introduces,
+        # rather than either extreme (full trust or total exclusion).
+        if len(combined) < min_games and current_team is not None:
+            any_team_query = (
+                (player_stats_df["gsis_id"] == player_gsis_id)
+                & (player_stats_df["season"] == season - 1)
+            )
+            any_team_history = player_stats_df[any_team_query].sort_values(
+                "week", ascending=False
+            ).head(lookback_games)
+            if not any_team_history.empty:
+                combined = pd.concat([current_season_history, any_team_history])
+                team_changed = True
 
     if len(combined) < min_games:
         return league_fallback_mu if league_fallback_mu is not None else np.nan
@@ -3783,6 +3802,15 @@ def calc_prop_mu(player_gsis_id: str, prop_column: str, player_stats_df: pd.Data
     # overridden with something smaller.
     effective_full_confidence = full_confidence_games if full_confidence_games is not None else lookback_games
     weight_own = min(games_n / effective_full_confidence, 1.0)
+    # Real, extra discount when team_changed - his own history is real,
+    # relevant skill-level signal (kept, not thrown away), but a genuine,
+    # honest uncertainty exists about role/volume/scheme fit on a new
+    # team that a same-team sample wouldn't carry. Halves the trust his
+    # own average would otherwise get, shifting weight toward the more
+    # conservative league_fallback_mu - a real middle ground between
+    # blind full trust and the old behavior's total exclusion.
+    if team_changed:
+        weight_own *= 0.5
     shrunk_mu = (weight_own * own_avg) + ((1 - weight_own) * league_fallback_mu)
     return round(shrunk_mu, 2)
 
@@ -3855,6 +3883,7 @@ def calc_player_sigma(player_gsis_id: str, prop_column: str, player_stats_df: pd
     ].sort_values("week", ascending=False).head(lookback_games)
 
     combined = current_season_history
+    team_changed = False
     if len(combined) < min_games:
         prior_season_query = (
             (player_stats_df["gsis_id"] == player_gsis_id)
@@ -3866,6 +3895,24 @@ def calc_player_sigma(player_gsis_id: str, prop_column: str, player_stats_df: pd
             "week", ascending=False
         ).head(lookback_games)
         combined = pd.concat([current_season_history, prior_season_history])
+
+        # Same real fix as calc_prop_mu - a real, multi-year veteran who
+        # changed teams (verified live against Mike Evans TB->SF for
+        # 2026) still has real, relevant skill-level history, just with
+        # a different team - bridges with any-team history rather than
+        # falling straight through to a fully generic fallback, with
+        # team_changed flagged so extra real shrinkage still applies below.
+        if len(combined) < min_games and current_team is not None:
+            any_team_query = (
+                (player_stats_df["gsis_id"] == player_gsis_id)
+                & (player_stats_df["season"] == season - 1)
+            )
+            any_team_history = player_stats_df[any_team_query].sort_values(
+                "week", ascending=False
+            ).head(lookback_games)
+            if not any_team_history.empty:
+                combined = pd.concat([current_season_history, any_team_history])
+                team_changed = True
 
     if len(combined) < min_games:
         return league_fallback_sigma if league_fallback_sigma is not None else np.nan
@@ -3881,6 +3928,10 @@ def calc_player_sigma(player_gsis_id: str, prop_column: str, player_stats_df: pd
     # Same lookback_games/full_confidence_games ceiling fix as calc_prop_mu.
     effective_full_confidence = full_confidence_games if full_confidence_games is not None else lookback_games
     weight_own = min(games_n / effective_full_confidence, 1.0)
+    # Same real, extra team-change discount as calc_prop_mu - see that
+    # function's docstring for the full real-data justification.
+    if team_changed:
+        weight_own *= 0.5
     shrunk_sigma = (weight_own * own_sigma) + ((1 - weight_own) * league_fallback_sigma)
     return round(shrunk_sigma, 3)
 
@@ -4714,6 +4765,151 @@ def build_season_accuracy_report(season: int, weeks: list = None, through_week: 
         "by_quality_tier_by_prop": by_quality_tier_by_prop,
         "adjustment_direction_accuracy": adjustment_direction_accuracy,
         "role_verification_check": role_verification_check,
+    }
+
+
+def build_combined_readiness_and_simulation_report(season: int, weeks: list = None, through_week: int = 18,
+                                                     coverage_bundle=None, rb_bundle=None,
+                                                     n_simulations: int = 1000, min_quality_score: float = None,
+                                                     strict_true_starters: bool = False) -> dict:
+    """
+    Real, combined report - per direct request, runs score_week_against_
+    actuals() ONCE per real week and builds BOTH the readiness
+    diagnostics (quality_score accuracy, by_prop_type, adjustment
+    direction, role verification) AND the 1000-sample simulation backtest
+    (gap_pct buckets, real hit-rate) from that SAME shared set of scored
+    rows - not two separate report functions each re-running the same
+    expensive real scoring step for the same week range.
+
+    Real, honest reason this matters beyond convenience: score_week_
+    against_actuals is the genuinely slow part (confirmed ~90-100+
+    real seconds per week during this build's own testing) - running the
+    readiness report and the simulation backtest as two separate button
+    clicks over the same weeks silently doubles that real cost for no
+    reason, since both were computing mu/sigma/actual from scratch
+    independently. This combines them into one real pass.
+
+    Returns a dict with both reports' real keys merged together:
+    raw, by_prop_type, by_position, by_quality_tier, by_quality_tier_by_prop,
+    adjustment_direction_accuracy, role_verification_check (readiness side),
+    plus bucket_summary, quality_tier_summary (simulation side) - built
+    from the same underlying real rows, not recomputed separately.
+    """
+    if weeks is None:
+        weeks = get_completed_weeks_with_data(season, through_week)
+
+    week_results = []
+    for wk in weeks:
+        try:
+            wk_df = score_week_against_actuals(season, wk, starters_only=True, coverage_bundle=coverage_bundle,
+                                                rb_bundle=rb_bundle, strict_true_starters=strict_true_starters)
+            if not wk_df.empty:
+                week_results.append(wk_df)
+        except Exception as e:
+            print(f"Skipping week {wk}: {e}")
+            continue
+
+    if not week_results:
+        return {"raw": pd.DataFrame(), "by_prop_type": pd.DataFrame(), "by_position": pd.DataFrame(),
+                "by_quality_tier": pd.DataFrame(), "by_quality_tier_by_prop": pd.DataFrame(),
+                "adjustment_direction_accuracy": np.nan, "role_verification_check": pd.DataFrame(),
+                "bucket_summary": pd.DataFrame(), "quality_tier_summary": pd.DataFrame(),
+                "sim_raw": pd.DataFrame()}
+
+    raw = pd.concat(week_results, ignore_index=True)
+
+    # --- Readiness diagnostics (same real logic as build_season_accuracy_report) ---
+    by_prop_type = raw.groupby("prop_type").agg(
+        mean_abs_miss=("abs_miss", "mean"), mean_bias=("miss", "mean"), n=("abs_miss", "count"),
+    ).reset_index().sort_values("mean_abs_miss")
+
+    by_position = raw.groupby("position").agg(
+        mean_abs_miss=("abs_miss", "mean"), mean_bias=("miss", "mean"), n=("abs_miss", "count"),
+    ).reset_index().sort_values("mean_abs_miss")
+
+    by_quality_tier = pd.DataFrame()
+    by_quality_tier_by_prop = pd.DataFrame()
+    if "quality_score" in raw.columns:
+        tier_df = raw.dropna(subset=["quality_score"]).copy()
+        tier_df["quality_tier"] = pd.cut(
+            tier_df["quality_score"], bins=[-0.1, 40, 60, 80, 100],
+            labels=["<40", "40-60", "60-80", "80-100"],
+        )
+        by_quality_tier = tier_df.groupby("quality_tier", observed=True).agg(
+            mean_abs_miss=("abs_miss", "mean"), mean_match_ratio=("match_ratio", "mean"),
+            n=("abs_miss", "count"),
+        ).reset_index()
+        by_quality_tier_by_prop = tier_df.groupby(
+            ["prop_type", "quality_tier"], observed=True
+        ).agg(
+            mean_abs_miss=("abs_miss", "mean"), mean_match_ratio=("match_ratio", "mean"),
+            n=("abs_miss", "count"),
+        ).reset_index()
+
+    before_col = None
+    if "mu_before_coverage_adj" in raw.columns or "mu_before_box_adj" in raw.columns:
+        raw["mu_before_adjustment"] = raw.get("mu_before_coverage_adj")
+        if "mu_before_box_adj" in raw.columns:
+            raw["mu_before_adjustment"] = raw["mu_before_adjustment"].fillna(raw["mu_before_box_adj"])
+        before_col = "mu_before_adjustment"
+
+    adjustment_direction_accuracy = np.nan
+    if before_col is not None:
+        adj = raw.dropna(subset=[before_col, "mu", "actual"]).copy()
+        adj = adj[adj["mu"] != adj[before_col]]
+        if not adj.empty:
+            adj_direction = np.sign(adj["mu"] - adj[before_col])
+            actual_direction = np.sign(adj["actual"] - adj[before_col])
+            valid = actual_direction != 0
+            if valid.any():
+                adjustment_direction_accuracy = round(
+                    (adj_direction[valid] == actual_direction[valid]).mean(), 3
+                )
+
+    role_verification_check = pd.DataFrame()
+    if "role_verification_score" in raw.columns:
+        rv = raw.dropna(subset=["role_verification_score"]).copy()
+        rv["role_bucket"] = np.where(rv["role_verification_score"] >= 0.5, "role >= 0.5 (steady/growing)",
+                                      "role < 0.5 (fading)")
+        role_verification_check = rv.groupby("role_bucket").agg(
+            mean_abs_miss=("abs_miss", "mean"), n=("abs_miss", "count"),
+        ).reset_index()
+
+    # --- Simulation backtest (same real rows, filtered by min_quality_score if set) ---
+    sim_input = raw
+    if min_quality_score is not None and "quality_score" in raw.columns:
+        sim_input = raw[raw["quality_score"] >= min_quality_score]
+
+    sim_raw = add_simulation_columns_to_backtest_rows(sim_input, n_simulations=n_simulations) if not sim_input.empty else pd.DataFrame()
+
+    bucket_summary = pd.DataFrame()
+    quality_tier_summary = pd.DataFrame()
+    if not sim_raw.empty:
+        bins = [0, 5, 10, 15, 20, 30, 1000]
+        labels = ["0-5%", "5-10%", "10-15%", "15-20%", "20-30%", "30%+"]
+        sim_raw["gap_bucket"] = pd.cut(sim_raw["gap_pct"], bins=bins, labels=labels, right=False)
+        bucket_summary = sim_raw.groupby(["prop_type", "gap_bucket"], observed=True).agg(
+            n=("real_cleared_line", "size"), real_hit_rate=("real_cleared_line", "mean"),
+        ).reset_index()
+        bucket_summary["real_hit_rate"] = round(bucket_summary["real_hit_rate"] * 100, 1)
+
+        if "quality_score" in sim_raw.columns:
+            q_bins = [0, 40, 60, 80, 101]
+            q_labels = ["<40", "40-60", "60-80", "80-100"]
+            sim_raw["quality_tier"] = pd.cut(sim_raw["quality_score"], bins=q_bins, labels=q_labels, right=False)
+            agg_kwargs = {"n": ("abs_miss", "size"), "mean_abs_miss": ("abs_miss", "mean")}
+            if "match_ratio" in sim_raw.columns:
+                agg_kwargs["mean_match_ratio"] = ("match_ratio", "mean")
+            quality_tier_summary = sim_raw.groupby("quality_tier", observed=True).agg(**agg_kwargs).reset_index()
+            quality_tier_summary["mean_abs_miss"] = round(quality_tier_summary["mean_abs_miss"], 2)
+
+    return {
+        "raw": raw, "by_prop_type": by_prop_type, "by_position": by_position,
+        "by_quality_tier": by_quality_tier, "by_quality_tier_by_prop": by_quality_tier_by_prop,
+        "adjustment_direction_accuracy": adjustment_direction_accuracy,
+        "role_verification_check": role_verification_check,
+        "bucket_summary": bucket_summary, "quality_tier_summary": quality_tier_summary,
+        "sim_raw": sim_raw,
     }
 
 
@@ -5929,3 +6125,1517 @@ def build_team_offense(team: str, opponent: str, season: int, week: int,
             pass
 
     return TeamOffense(qb_id, qb_pool, qb_rush_pool, rushers, rush_counts.tolist(), targets, target_counts.tolist())
+
+
+# ===========================================================================
+# Real, merged content from coverage_matchup.py (per direct request, single-
+# file consolidation matching the MLB tool's structure) - premium
+# FantasyPoints alignment-vs-coverage and QB-vs-coverage data handling.
+# Real note: _compute_field_tiers, _read_fp_csv, _same_team, _to_float, and
+# TEAM_ABBREV_TO_FULL below are THIS file's real, original versions -
+# rb_matchup's own versions of the same names were renamed with an "_rb"
+# suffix below to avoid a real, silent collision (confirmed different
+# implementations, not just duplicates, before merging).
+# ===========================================================================
+
+"""
+NFL PREMIUM TOOL - Coverage Matchup Module
+=============================================
+Built from FantasyPoints.com Data Suite manual exports (paid subscription,
+no public API - confirmed via DevTools investigation; see project notes).
+
+WHAT THIS DOES
+---------------
+1. Loads team-level coverage tendency data (Man/Zone/Cover 0-6 % usage)
+   for both offense (coverages seen) and defense (coverages used).
+2. Flags each team's REAL statistical outlier coverage(s) using z-scores
+   against league average - not raw rank (Cover 3 is the default shell
+   for nearly every team and ranking on it tells you nothing; z-score
+   answers "is this meaningfully different from league norm").
+3. Loads the FULL column set from QB-vs-coverage season splits (7 files:
+   Cover 0/1/2/2Man/3/4/6) and defense-allowed-to-QBs splits (same 7),
+   including fantasy-relevant columns (FP/DB, FP/OPP, FP/G, FP) for
+   later fantasy-relevance use, not just a curated subset.
+4. Tiers every numeric stat (Elite/Above Avg/Average/Below Avg/Poor)
+   against the real distribution of QBs who've faced that specific
+   coverage - not a global season benchmark, not arbitrary cutoffs.
+5. Builds a full matchup report combining all of the above, with
+   automatic thin-sample warnings based on real league ATT distributions.
+
+DUPLICATE COLUMN HANDLING (important - real bug caught and fixed)
+---------------------------------------------------------------------
+The QB-vs-coverage CSVs have "YDS" and "TD" appear TWICE - once under
+Passing (right after CMP%/YPA) and once under Scrambles (right after the
+SCRM column). A naive dict(zip(header,row)) silently drops the first
+occurrence. This module explicitly renames the scramble pair to
+"SCRM_YDS" / "SCRM_TD" during parsing so no data is lost.
+
+WHY Z-SCORES, NOT RAW RANK OR FIXED CUTOFFS
+-----------------------------------------------
+Confirmed on real 2025 data: Seattle's Cover 6 rate (17.7%) is +1.62 SD
+above league average (3rd of 32) - a real, usable signal. Their Cover 4
+rate, despite ranking 13th of 32, is only +0.23 SD above average -
+statistical noise, not a real tendency. Same logic applies to tiering a
+QB's performance vs a coverage: judged against the real distribution of
+every QB who's actually faced that coverage this season, not a flat
+"70% completion = good" guess.
+
+SAMPLE SIZE THRESHOLDS (confirmed from real 2025 QB-vs-coverage data)
+------------------------------------------------------------------------
+Coverage      Median ATT (league)   Treat as
+Cover 3       62                    Solid
+Cover 1       37                    Solid
+Cover 2       32                    Solid
+Cover 4       28                    Usable, lean cautious under ~15
+Cover 6       19                    Usable, lean cautious under ~10
+Cover 0       7                     Thin league-wide - flag always
+Cover 2 Man   5                     Thin league-wide - flag always
+"""
+
+
+
+COVERAGE_FIELDS = ["COVER 0 %", "COVER 1 %", "COVER 2 %", "COVER 2 MAN %",
+                   "COVER 3 %", "COVER 4 %", "COVER 6 %"]
+
+ALWAYS_THIN_COVERAGES = {"COVER 0 %", "COVER 2 MAN %"}
+
+THIN_SAMPLE_ATT_THRESHOLD = {
+    "COVER 0 %": 5, "COVER 1 %": 15, "COVER 2 %": 15, "COVER 2 MAN %": 5,
+    "COVER 3 %": 20, "COVER 4 %": 15, "COVER 6 %": 10,
+}
+
+OUTLIER_Z_THRESHOLD = 1.0
+
+# Stats where a HIGHER number is worse for the QB (need to flip tiering direction)
+INVERSE_STATS = {"INT", "SACK", "SACK %", "SK YDS", "DROP %", "DROP YDS",
+                  "DRP", "DRP %",  # real column names confirmed from actual
+                  # WR/TE exports - "DROP %" above never matched real data at
+                  # all, meaning drop rate tiering direction was silently
+                  # wrong (higher drops looked "better") until this fix
+                  "PRESS %", "PRESS SK %", "TTSK", "QB SK", "QBP", "BAT", "SPK"}
+
+# Non-numeric / identifier columns - never tier these
+NON_STAT_COLUMNS = {"Rank", "Name", "Team", "Team Name", "POS", "G", "Season",
+                     "Location", "_thin_sample", "_att"}
+
+TEAM_ABBREV_TO_FULL = {
+    "ARI": "Arizona Cardinals", "ATL": "Atlanta Falcons", "BAL": "Baltimore Ravens",
+    "BUF": "Buffalo Bills", "CAR": "Carolina Panthers", "CHI": "Chicago Bears",
+    "CIN": "Cincinnati Bengals", "CLE": "Cleveland Browns", "DAL": "Dallas Cowboys",
+    "DEN": "Denver Broncos", "DET": "Detroit Lions", "GB": "Green Bay Packers",
+    "HOU": "Houston Texans", "IND": "Indianapolis Colts", "JAX": "Jacksonville Jaguars",
+    "JAC": "Jacksonville Jaguars", "KC": "Kansas City Chiefs", "LV": "Las Vegas Raiders",
+    "LAC": "Los Angeles Chargers", "LA": "Los Angeles Rams", "LAR": "Los Angeles Rams",
+    "MIA": "Miami Dolphins", "MIN": "Minnesota Vikings", "NE": "New England Patriots",
+    "NO": "New Orleans Saints", "NYG": "New York Giants", "NYJ": "New York Jets",
+    "PHI": "Philadelphia Eagles", "PIT": "Pittsburgh Steelers", "SEA": "Seattle Seahawks",
+    "SF": "San Francisco 49ers", "TB": "Tampa Bay Buccaneers", "TEN": "Tennessee Titans",
+    "WAS": "Washington Commanders",
+}
+
+
+def _same_team(abbrev_or_name, full_name):
+    if not abbrev_or_name:
+        return False
+    if abbrev_or_name == full_name:
+        return True
+    return TEAM_ABBREV_TO_FULL.get(abbrev_or_name.upper()) == full_name
+
+
+# ---------------------------------------------------------------------------
+# CSV parsing (handles FantasyPoints' 2-header-row format + duplicate columns)
+# ---------------------------------------------------------------------------
+
+def _dedupe_header(header):
+    """Renames known duplicate columns so no data is silently lost.
+    Currently handles the Passing-vs-Scrambles YDS/TD collision confirmed
+    in the QB-vs-coverage export format. Any other duplicate gets a
+    generic _2/_3 suffix as a safety net."""
+    out = []
+    seen = {}
+    for i, col in enumerate(header):
+        if col in ("YDS", "TD") and i > 0 and (header[i-1] == "SCRM" or (i > 1 and header[i-2] == "SCRM")):
+            newcol = f"SCRM_{col}"
+        elif col in seen:
+            seen[col] += 1
+            newcol = f"{col}_{seen[col]}"
+        else:
+            newcol = col
+        seen[newcol] = seen.get(newcol, 0)
+        out.append(newcol)
+    return out
+
+
+def _read_fp_csv(path):
+    """FantasyPoints exports have 2 header rows (grouping row + real header).
+    Real header always starts with 'Rank'. Handles BOM safely, dedupes
+    duplicate column names."""
+    with open(path, encoding='utf-8-sig') as f:
+        lines = f.readlines()
+    header_idx = next(i for i, l in enumerate(lines) if l.lstrip('\ufeff').startswith('"Rank"'))
+    reader = csv.reader(lines[header_idx:])
+    rows = list(reader)
+    raw_header, data = rows[0], [r for r in rows[1:] if r and r[0]]
+    header = _dedupe_header(raw_header)
+    return header, data
+
+
+def _to_float(val):
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Team coverage matrix (offense-seen / defense-used)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TeamCoverageProfile:
+    team_name: str
+    rates: dict
+    z_scores: dict = field(default_factory=dict)
+    outliers: list = field(default_factory=list)
+
+
+def load_team_coverage_matrix(csv_path):
+    header, data = _read_fp_csv(csv_path)
+    profiles = {}
+    for row in data:
+        d = dict(zip(header, row))
+        team = d["Name"]
+        rates = {f: (_to_float(d.get(f)) or 0.0) for f in COVERAGE_FIELDS}
+        profiles[team] = TeamCoverageProfile(team_name=team, rates=rates)
+
+    league_stats = {}
+    for f in COVERAGE_FIELDS:
+        vals = [p.rates[f] for p in profiles.values()]
+        league_stats[f] = (mean(vals), pstdev(vals))
+
+    for p in profiles.values():
+        for f in COVERAGE_FIELDS:
+            avg, sd = league_stats[f]
+            p.z_scores[f] = (p.rates[f] - avg) / sd if sd else 0.0
+        p.outliers = sorted(
+            [(f, z) for f, z in p.z_scores.items() if z >= OUTLIER_Z_THRESHOLD],
+            key=lambda x: -x[1]
+        )
+    return profiles, league_stats
+
+
+def describe_team_tendency(profile: TeamCoverageProfile):
+    if not profile.outliers:
+        return f"{profile.team_name}: no coverage runs meaningfully above league average - fairly standard mix."
+    parts = [f"{cov.replace(' %','')} {profile.rates[cov]:.1f}% (z={z:+.2f})" for cov, z in profile.outliers]
+    return f"{profile.team_name}: real outlier coverage(s) - " + ", ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Full-column loading with tiering (QB-vs-coverage AND def-allowed-to-QB)
+# ---------------------------------------------------------------------------
+
+def _compute_field_tiers(rows_by_key):
+    """rows_by_key: dict[key] -> row dict (already has _att, _thin_sample).
+    Computes league distribution (within this one coverage file) for every
+    numeric stat column, then assigns each row a tier per stat:
+    Elite / Above Avg / Average / Below Avg / Poor, based on z-score
+    bucket, direction-corrected for stats where lower is better."""
+    if not rows_by_key:
+        return
+
+    sample_row = next(iter(rows_by_key.values()))
+    stat_cols = [c for c in sample_row.keys() if c not in NON_STAT_COLUMNS and not c.startswith("_")]
+
+    field_stats = {}
+    for col in stat_cols:
+        vals = [_to_float(r.get(col)) for r in rows_by_key.values()]
+        vals = [v for v in vals if v is not None]
+        if len(vals) < 3:
+            continue
+        field_stats[col] = (mean(vals), pstdev(vals))
+
+    for r in rows_by_key.values():
+        tiers = {}
+        for col, (avg, sd) in field_stats.items():
+            v = _to_float(r.get(col))
+            if v is None or not sd:
+                continue
+            z = (v - avg) / sd
+            if col in INVERSE_STATS:
+                z = -z
+            if z >= 1.5:
+                tiers[col] = "Elite"
+            elif z >= 0.5:
+                tiers[col] = "Above Avg"
+            elif z > -0.5:
+                tiers[col] = "Average"
+            elif z > -1.5:
+                tiers[col] = "Below Avg"
+            else:
+                tiers[col] = "Poor"
+        r["_tiers"] = tiers
+
+
+def _load_coverage_keyed_data(file_paths: dict, key_column: str, volume_column: str = "ATT"):
+    """Generic loader for QB-vs-coverage, def-allowed-to-QB, receiver-vs-
+    coverage, and def-allowed-by-alignment files. Captures EVERY column
+    from the CSV, not a curated subset, and computes real statistical
+    tiers per stat within each coverage's own distribution.
+
+    volume_column: which column represents sample size for thin-sample
+    flagging - 'ATT' for QB/passing files, 'TGT' for receiver files
+    (they don't have an ATT column at all)."""
+    data = {}
+    for coverage_field, path in file_paths.items():
+        header, rows = _read_fp_csv(path)
+        by_key = {}
+        for row in rows:
+            d = dict(zip(header, row))
+            key = d.get(key_column)
+            if not key:
+                continue
+            att = int(_to_float(d.get(volume_column, 0)) or 0)
+            threshold = THIN_SAMPLE_ATT_THRESHOLD.get(coverage_field, 15)
+            d["_thin_sample"] = (att < threshold) or (coverage_field in ALWAYS_THIN_COVERAGES)
+            d["_att"] = att
+            by_key[key] = d
+        _compute_field_tiers(by_key)
+        data[coverage_field] = by_key
+    return data
+
+
+def load_qb_vs_coverage(file_paths: dict):
+    """QB's own season performance vs each coverage. Full column set
+    (including FP/DB, FP/OPP, FP/G, FP - fantasy-relevant fields) plus
+    per-stat tiers vs the real distribution of QBs facing that coverage."""
+    return _load_coverage_keyed_data(file_paths, key_column="Name")
+
+
+def load_def_allowed_to_qb(file_paths: dict):
+    """What each DEFENSE allows to QBs specifically in that coverage.
+    Same full-column + tiering treatment, keyed by team name."""
+    return _load_coverage_keyed_data(file_paths, key_column="Name")
+
+
+# ---------------------------------------------------------------------------
+# QB scrambles - a real, separate signal from QB-vs-coverage above. QBs
+# don't have named rush concepts the way RBs do (Power/Zone/Counter) - a
+# scramble is inherently improvised, not a called play - so this is a
+# single flat comparison (QB's own real scramble production vs. how much
+# a defense allows on scrambles), not a coverage-type or concept-type
+# breakdown like everything else in this module. One real player-side
+# file, one real team-side file, loaded with the SAME real generic
+# tiering helper everything else here uses, just with a single pseudo-
+# key ("SCRAMBLE") instead of iterating over multiple coverage types.
+# ---------------------------------------------------------------------------
+
+def load_qb_scrambles(file_path: str):
+    """QB's own real scramble volume/production this season - ATT, YDS,
+    YACO, MTF, Success% etc., same tiering treatment as every other file
+    here. Returns {"SCRAMBLE": {qb_name: row}} - the single-key shape
+    keeps this compatible with the same _weighted_outlier_exploit-style
+    combination logic used for alignment/QB-coverage, just with exactly
+    one "coverage" to check instead of several."""
+    return _load_coverage_keyed_data({"SCRAMBLE": file_path}, key_column="Name")
+
+
+def load_def_allowed_qb_scrambles(file_path: str):
+    """What each DEFENSE allows on QB scrambles - same shape as above,
+    keyed by team name."""
+    return _load_coverage_keyed_data({"SCRAMBLE": file_path}, key_column="Name")
+
+
+def calc_qb_scramble_exploit_strength(qb_scrambles: dict, def_allowed_scrambles: dict,
+                                       qb_name: str, opponent_team_abbrev: str) -> dict:
+    """
+    Real QB-scramble matchup signal - no outlier-coverage gating needed
+    here (unlike calc_qb_coverage_exploit_strength above), since there's
+    only one real "situation" to check: does this defense generally give
+    up scramble yardage, and does this QB generally produce it. Combines
+    the defense's allowed tier (60%, the new opponent-specific
+    information) with the QB's own tier (40%, since his overall rushing
+    profile is already partly reflected elsewhere in the pipeline via
+    role_verification/mu) - same weighting philosophy as every other
+    exploit-strength function in this module.
+
+    Uses FP/G as the combination stat - available on both sides and
+    already the established general-quality stat this module uses
+    elsewhere (see calc_alignment_exploit_strength).
+
+    Returns exploit_strength NaN (not a guess) if either side has no real
+    data - a real gap, not defaulted to neutral.
+    """
+    opp_full = TEAM_ABBREV_TO_FULL.get((opponent_team_abbrev or "").upper())
+    if opp_full is None:
+        return {"exploit_strength": np.nan}
+
+    def_row = def_allowed_scrambles.get("SCRAMBLE", {}).get(opp_full)
+    def_score = _tier_to_score(def_row.get("_tiers") if def_row else None, "FP/G")
+
+    qb_row = qb_scrambles.get("SCRAMBLE", {}).get(qb_name)
+    qb_score = _tier_to_score(qb_row.get("_tiers") if qb_row else None, "FP/G")
+
+    parts, weights = [], []
+    if def_score is not None:
+        parts.append(def_score)
+        weights.append(0.6)
+    if qb_score is not None:
+        parts.append(qb_score)
+        weights.append(0.4)
+    if not parts:
+        return {"exploit_strength": np.nan}
+    return {"exploit_strength": round(sum(p * w for p, w in zip(parts, weights)) / sum(weights), 3)}
+
+
+# ---------------------------------------------------------------------------
+# Receiver (WR/TE) by alignment vs coverage
+# ---------------------------------------------------------------------------
+
+# Alignment RTE% column names as they appear in the receiver CSVs - used to
+# confirm a player's real alignment fit before leaning on an alignment-
+# specific file for them (e.g. don't trust "Wide vs Cover 6" numbers for a
+# player who's actually 80% Slot).
+ALIGNMENT_RTE_COLUMNS = {
+    "wide": "WIDE RTE %", "slot": "SLOT RTE %",
+    "inline": "INLINE RTE %", "backfield": "BACK RTE %",
+}
+
+
+def load_receiver_vs_coverage(file_paths: dict):
+    """Receiver's (WR/TE) own season performance vs each coverage, for a
+    SPECIFIC alignment (e.g. all Wide-alignment vs Cover 6). file_paths:
+    dict of {coverage_field: csv_path}, one alignment's worth of 7 files.
+    Same full-column capture + tiering as the QB loader - reuses the
+    identical generic engine, since these files also key on 'Name'.
+    Uses TGT (not ATT - these files don't have that column) as the
+    volume basis for thin-sample flagging."""
+    return _load_coverage_keyed_data(file_paths, key_column="Name", volume_column="TGT")
+
+
+def load_def_allowed_by_alignment(file_paths: dict):
+    """What each DEFENSE allows to a specific alignment (Wide/Slot/Inline/
+    Backfield) in that coverage. Same shape as load_def_allowed_to_qb,
+    just for receivers-by-alignment instead of QBs. Team-keyed, TGT-based."""
+    return _load_coverage_keyed_data(file_paths, key_column="Name", volume_column="TGT")
+
+
+def check_alignment_fit(receiver_row, alignment):
+    """Given a receiver's row (from ANY of their coverage files - RTE%
+    columns are the same regardless of which coverage split you pulled)
+    and the alignment you're about to use for a matchup, returns the
+    player's real RTE% in that alignment so you can judge whether the
+    alignment-specific file is actually representative of how they're
+    used. Returns None if the column wasn't populated (blank = not
+    their primary alignment in that export)."""
+    col = ALIGNMENT_RTE_COLUMNS.get(alignment.lower())
+    if col is None or receiver_row is None:
+        return None
+    return _to_float(receiver_row.get(col))
+
+
+def build_receiver_matchup_report(receiver_name, alignment, opponent_team_profile: TeamCoverageProfile,
+                                   receiver_coverage_data: dict, receiver_team_name=None,
+                                   def_allowed_data: dict = None, max_outliers=3):
+    """Same shape as build_qb_matchup_report, for a receiver at a specific
+    alignment. Includes an alignment-fit check so a report never silently
+    misrepresents a player who isn't actually primarily in that alignment."""
+    if receiver_team_name and _same_team(receiver_team_name, opponent_team_profile.team_name):
+        return [{"error": f"{receiver_name} plays for {opponent_team_profile.team_name} - "
+                           f"cannot build a matchup report against his own team."}]
+
+    report = []
+    outliers = opponent_team_profile.outliers[:max_outliers]
+    if not outliers:
+        return [{"note": f"{opponent_team_profile.team_name} has no statistically real "
+                          f"outlier coverage this season - no specific coverage edge to flag."}]
+
+    for coverage_field, z in outliers:
+        cov_label = coverage_field.replace(" %", "")
+        entry = {
+            "coverage": cov_label,
+            "alignment": alignment,
+            "opponent_usage_pct": opponent_team_profile.rates[coverage_field],
+            "opponent_z_score": round(z, 2),
+        }
+
+        rec_row = receiver_coverage_data.get(coverage_field, {}).get(receiver_name)
+        if rec_row is None:
+            entry["receiver_data"] = None
+            entry["confidence"] = "no_data"
+        else:
+            entry["receiver_data"] = rec_row
+            entry["confidence"] = "thin_sample" if rec_row["_thin_sample"] else "solid"
+            fit = check_alignment_fit(rec_row, alignment)
+            entry["alignment_fit_pct"] = fit
+            entry["alignment_fit_warning"] = (fit is not None and fit < 60)
+
+        if def_allowed_data is not None:
+            def_row = def_allowed_data.get(coverage_field, {}).get(opponent_team_profile.team_name)
+            entry["defense_allows"] = def_row
+            entry["defense_confidence"] = ("thin_sample" if def_row and def_row["_thin_sample"]
+                                            else "solid" if def_row else "no_data")
+
+        report.append(entry)
+    return report
+
+
+def print_receiver_matchup_report(receiver_name, alignment, opponent_team_profile,
+                                   receiver_coverage_data, receiver_team_name=None,
+                                   def_allowed_data=None,
+                                   highlight_stats=("CR %", "YPRR", "TD", "CTGT %", "RATE", "FP/G")):
+    report = build_receiver_matchup_report(receiver_name, alignment, opponent_team_profile,
+                                            receiver_coverage_data, receiver_team_name=receiver_team_name,
+                                            def_allowed_data=def_allowed_data)
+    if report and "error" in report[0]:
+        print(f"\n  [BLOCKED] {report[0]['error']}")
+        return report
+    if report and "note" in report[0]:
+        print(f"\n  {report[0]['note']}")
+        return report
+
+    print(f"\n=== {receiver_name} ({alignment}) vs {opponent_team_profile.team_name} — Coverage Matchup ===")
+    for entry in report:
+        print(f"\n  {opponent_team_profile.team_name} runs {entry['coverage']} at "
+              f"{entry['opponent_usage_pct']:.1f}% (z={entry['opponent_z_score']:+.2f} vs league)")
+
+        rd = entry.get("receiver_data")
+        if rd is None:
+            print(f"    -> {receiver_name}: no recorded targets vs this coverage.")
+        else:
+            flag = f"  [THIN - {rd['_att']} tgt]" if entry["confidence"] == "thin_sample" else ""
+            fit_warn = ""
+            if entry.get("alignment_fit_warning"):
+                fit_warn = f"  [CAUTION: only {entry['alignment_fit_pct']:.0f}% of routes are {alignment} - this file may not represent his usual usage]"
+            stat_str = ", ".join(f"{s}={rd.get(s)} ({rd['_tiers'].get(s,'-')})"
+                                  for s in highlight_stats if s in rd)
+            print(f"    -> {receiver_name} (own history, {rd['_att']} TGT){flag}{fit_warn}: {stat_str}")
+
+        dd = entry.get("defense_allows")
+        if dd is not None:
+            flag = f"  [THIN - {dd['_att']} tgt]" if entry.get("defense_confidence") == "thin_sample" else ""
+            stat_str = ", ".join(f"{s}={dd.get(s)} ({dd['_tiers'].get(s,'-')})"
+                                  for s in highlight_stats if s in dd)
+            print(f"    -> {opponent_team_profile.team_name} allows to {alignment} ({dd['_att']} TGT){flag}: {stat_str}")
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# FULL DATASET LOADER - loads all 70 files in one call
+# ---------------------------------------------------------------------------
+
+def _extract_coverage_suffix(normalized_filename_no_ext):
+    """Given a filename (no extension) already normalized to letters+digits
+    only, uppercased, finds which real coverage type it's for by checking
+    the END of the name - real exports here use several different
+    prefixes ('QB VS COVER 0', 'DEF BF VS 1', 'BACKFIELD VS  2MAN') and
+    even a couple of confirmed real typos ('BACKFIELS VS 1',
+    'BACKFILED VS 0', 'DEF BF VS O ' - a letter O standing in for a zero),
+    so matching the suffix is far more robust than requiring one exact
+    naming convention. 2MAN is checked before bare 2/COVER2 so it isn't
+    mis-matched as plain Cover 2."""
+    n = normalized_filename_no_ext
+    if n.endswith("2MAN"):
+        return "COVER 2 MAN %"
+    if n.endswith("VSO"):  # confirmed real typo: "DEF BF VS O .csv" means Cover 0
+        return "COVER 0 %"
+    if n.endswith("0"):
+        return "COVER 0 %"
+    if n.endswith("1"):
+        return "COVER 1 %"
+    if n.endswith("2"):
+        return "COVER 2 %"
+    if n.endswith("3"):
+        return "COVER 3 %"
+    if n.endswith("4"):
+        return "COVER 4 %"
+    if n.endswith("6"):
+        return "COVER 6 %"
+    return None
+
+
+def _normalize_filename(s):
+    """Strips everything except letters/digits, uppercases - so real
+    filename variance (spacing, case, a stray trailing space before the
+    extension) doesn't block matching. Same approach as rb_matchup.py's
+    _normalize_name, applied here for the same reason."""
+    return re.sub(r"[^A-Z0-9]", "", s.upper())
+
+
+def _scan_coverage_folder(dir_path):
+    """Scans one real folder (e.g. 'WIDE', 'DEF ALLOWED/VS QBS') and
+    returns {coverage_field: full_path} for every CSV whose filename
+    suffix matches a real coverage type. Silently skips any file that
+    doesn't match (e.g. a stray non-coverage file) rather than raising -
+    same graceful-gap philosophy as the rest of this module. Returns
+    an empty dict (not an error) if the folder doesn't exist, so a
+    partially-collected dataset (e.g. QBS done, RUSH not yet exported)
+    still loads whatever IS there."""
+    if not os.path.isdir(dir_path):
+        return {}
+    out = {}
+    for fname in os.listdir(dir_path):
+        if not fname.lower().endswith(".csv"):
+            continue
+        norm = _normalize_filename(fname[:-4])
+        coverage_field = _extract_coverage_suffix(norm)
+        if coverage_field:
+            out[coverage_field] = os.path.join(dir_path, fname)
+    return out
+
+
+@dataclass
+class CoverageDataBundle:
+    """Everything needed to build a matchup report for any player type,
+    loaded once and reused. Missing files are skipped silently (not every
+    coverage/alignment combo may exist yet) - check .missing for a list of
+    what didn't load, so gaps are visible rather than silently assumed
+    complete."""
+    off_coverage: dict          # team_name -> TeamCoverageProfile (coverages this team's offense SEES)
+    def_coverage: dict          # team_name -> TeamCoverageProfile (coverages this team's defense RUNS)
+    qb_vs_coverage: dict        # coverage_field -> {qb_name: row}
+    def_allowed_to_qb: dict     # coverage_field -> {team_name: row}
+    receiver_by_alignment: dict # alignment -> coverage_field -> {player_name: row}
+    def_allowed_by_alignment: dict  # alignment -> coverage_field -> {team_name: row}
+    qb_scrambles: dict = field(default_factory=dict)          # {"SCRAMBLE": {qb_name: row}}
+    def_allowed_qb_scrambles: dict = field(default_factory=dict)  # {"SCRAMBLE": {team_name: row}}
+    missing: list = field(default_factory=list)
+
+
+# Real folder names, exactly as FantasyPoints' Data Suite export structure
+# organizes them (confirmed against an actual upload) - player-side and
+# defense-allowed-side folder names for each alignment plus QBs.
+ALIGNMENTS = ("wide", "slot", "inline", "backfield")
+ALIGNMENT_DIRS = {"wide": "WIDE", "slot": "SLOT", "inline": "INLINE", "backfield": "BACKFIELD"}
+ALIGNMENT_DEF_DIRS = {
+    "wide": os.path.join("DEF ALLOWED", "VS WIDE"),
+    "slot": os.path.join("DEF ALLOWED", "VS SLOT"),
+    "inline": os.path.join("DEF ALLOWED", "VS INLINE"),
+    "backfield": os.path.join("DEF ALLOWED", "VS BACKFIELD"),
+}
+QB_DIR = "QBS"
+QB_DEF_DIR = os.path.join("DEF ALLOWED", "VS QBS")
+COVG_DIR = "COVG%"
+QB_SCRAMBLE_DIR = "QB_SCRAMBLES"
+
+
+def _find_covg_file(covg_dir, want_offense):
+    """The team-level Man/Zone/Cover-0-6 tendency files - 'OFF COVG%.csv'
+    (coverages this team's offense SEES) and 'DEF COVG %.csv' (coverages
+    this team's defense RUNS). Matched by normalized OFF/DEF prefix rather
+    than an exact filename, same robustness reasoning as everywhere else
+    in this loader."""
+    if not os.path.isdir(covg_dir):
+        return None
+    want_prefix = "OFF" if want_offense else "DEF"
+    for fname in os.listdir(covg_dir):
+        if not fname.lower().endswith(".csv"):
+            continue
+        norm = _normalize_filename(fname[:-4])
+        if norm.startswith(want_prefix) and "COVG" in norm:
+            return os.path.join(covg_dir, fname)
+    return None
+
+
+def _find_qb_scramble_files(scramble_dir):
+    """Real, typo-tolerant finder for the two QB-scramble files - the
+    real files seen so far have used inconsistent naming/spelling (e.g.
+    'QB_SCAMBLES.csv' - a real missing letter, not a made-up example),
+    so this matches by normalized DEF-prefix presence rather than an
+    exact filename, same robustness approach as everywhere else in this
+    loader."""
+    if not os.path.isdir(scramble_dir):
+        return None, None
+    qb_file, def_file = None, None
+    for fname in os.listdir(scramble_dir):
+        if not fname.lower().endswith(".csv"):
+            continue
+        norm = _normalize_filename(fname[:-4])
+        if norm.startswith("DEF"):
+            def_file = os.path.join(scramble_dir, fname)
+        elif "SC" in norm:  # matches SCRAMBLE/SCAMBLE (real typo) either way
+            qb_file = os.path.join(scramble_dir, fname)
+    return qb_file, def_file
+
+
+def load_full_dataset(data_dir="."):
+    """Loads the complete real dataset in one call, matching the ACTUAL
+    FantasyPoints Data Suite export folder structure (confirmed directly
+    against a real upload, replacing an earlier version of this function
+    that guessed at a flat-file naming convention that turned out not to
+    match reality at all):
+
+      data_dir/
+        COVG%/OFF COVG%.csv, DEF COVG %.csv
+        QBS/QB VS COVER <N>.csv                      (7 files)
+        DEF ALLOWED/VS QBS/DEF QB VS <N>.csv          (7 files)
+        WIDE|SLOT|INLINE|BACKFIELD/<alignment> VS <N>.csv       (7 each)
+        DEF ALLOWED/VS WIDE|SLOT|INLINE|BACKFIELD/DEF <align> VS <N>.csv (7 each)
+        RUSH METRICS/, RUSH METRICS ALLOWED/ - NOT loaded here, see
+        rb_matchup.py's load_full_rb_dataset() for those.
+
+    Filename matching is suffix-based and typo-tolerant (see
+    _extract_coverage_suffix) - real exports here have used several
+    different prefix conventions and at least two confirmed real typos,
+    none of which need to be manually renamed before loading.
+
+    Missing files/folders are skipped (not every combo may be collected
+    yet) and logged in the returned bundle's .missing list instead of
+    raising - partial datasets are expected and handled gracefully
+    throughout this module (thin-sample / no-data paths already exist on
+    every report)."""
+    missing = []
+
+    off_file = _find_covg_file(os.path.join(data_dir, COVG_DIR), want_offense=True)
+    def_file = _find_covg_file(os.path.join(data_dir, COVG_DIR), want_offense=False)
+    off_profiles = {}
+    def_profiles = {}
+    if off_file:
+        off_profiles, _ = load_team_coverage_matrix(off_file)
+    else:
+        missing.append(f"Offense team coverage tendency (looked in '{os.path.join(data_dir, COVG_DIR)}')")
+    if def_file:
+        def_profiles, _ = load_team_coverage_matrix(def_file)
+    else:
+        missing.append(f"Defense team coverage tendency (looked in '{os.path.join(data_dir, COVG_DIR)}')")
+
+    qb_files = _scan_coverage_folder(os.path.join(data_dir, QB_DIR))
+    for cov in COVERAGE_FIELDS:
+        if cov not in qb_files:
+            missing.append(f"QB vs {cov} (looked in '{os.path.join(data_dir, QB_DIR)}')")
+    qb_data = load_qb_vs_coverage(qb_files) if qb_files else {}
+
+    def_qb_files = _scan_coverage_folder(os.path.join(data_dir, QB_DEF_DIR))
+    for cov in COVERAGE_FIELDS:
+        if cov not in def_qb_files:
+            missing.append(f"Def-allowed-to-QB {cov} (looked in '{os.path.join(data_dir, QB_DEF_DIR)}')")
+    def_qb_data = load_def_allowed_to_qb(def_qb_files) if def_qb_files else {}
+
+    receiver_by_alignment = {}
+    def_allowed_by_alignment = {}
+    for alignment in ALIGNMENTS:
+        rec_dir = os.path.join(data_dir, ALIGNMENT_DIRS[alignment])
+        def_dir = os.path.join(data_dir, ALIGNMENT_DEF_DIRS[alignment])
+        rec_files = _scan_coverage_folder(rec_dir)
+        def_files = _scan_coverage_folder(def_dir)
+        for cov in COVERAGE_FIELDS:
+            if cov not in rec_files:
+                missing.append(f"{alignment} receiver vs {cov} (looked in '{rec_dir}')")
+            if cov not in def_files:
+                missing.append(f"Def-allowed-{alignment} {cov} (looked in '{def_dir}')")
+        receiver_by_alignment[alignment] = load_receiver_vs_coverage(rec_files) if rec_files else {}
+        def_allowed_by_alignment[alignment] = load_def_allowed_by_alignment(def_files) if def_files else {}
+
+    scramble_dir = os.path.join(data_dir, QB_SCRAMBLE_DIR)
+    qb_scramble_file, def_scramble_file = _find_qb_scramble_files(scramble_dir)
+    qb_scrambles = load_qb_scrambles(qb_scramble_file) if qb_scramble_file else {}
+    def_allowed_qb_scrambles = load_def_allowed_qb_scrambles(def_scramble_file) if def_scramble_file else {}
+    if not qb_scramble_file:
+        missing.append(f"QB scrambles (looked in '{scramble_dir}')")
+    if not def_scramble_file:
+        missing.append(f"Def-allowed QB scrambles (looked in '{scramble_dir}')")
+
+    return CoverageDataBundle(
+        off_coverage=off_profiles, def_coverage=def_profiles,
+        qb_vs_coverage=qb_data, def_allowed_to_qb=def_qb_data,
+        receiver_by_alignment=receiver_by_alignment,
+        def_allowed_by_alignment=def_allowed_by_alignment,
+        qb_scrambles=qb_scrambles, def_allowed_qb_scrambles=def_allowed_qb_scrambles,
+        missing=missing,
+    )
+
+
+# ---------------------------------------------------------------------------
+# LIVE-MODEL EXPLOIT-STRENGTH FUNCTIONS - the actual plug-in points
+# nfl_model_combined.py imports (calc_alignment_exploit_strength,
+# calc_qb_coverage_exploit_strength). Everything above this point already
+# existed (parsing, tiering, z-score outlier detection, the interactive
+# matchup-report builders) - these two were the missing final step
+# connecting that real infrastructure to the live quality_score pipeline.
+#
+# Same 0-1 "exploit_strength" semantics as calc_coverage_quality_score/
+# calc_box_quality_score in nfl_model_combined.py (higher = more favorable
+# matchup for the offensive player) so they combine consistently with the
+# rest of that file's structural_parts averaging.
+# ---------------------------------------------------------------------------
+
+TIER_SCORE = {"Elite": 1.0, "Above Avg": 0.75, "Average": 0.5, "Below Avg": 0.25, "Poor": 0.0}
+
+
+def _tier_to_score(tiers: dict, stat: str):
+    """Converts a row's tier label for one stat into a 0-1 numeric score.
+    Returns None if that stat wasn't tiered for this row (thin league-wide
+    sample, or the column wasn't numeric) - callers skip rather than
+    guess a default."""
+    if not tiers or stat not in tiers:
+        return None
+    return TIER_SCORE.get(tiers[stat])
+
+
+def _weighted_outlier_exploit(outliers, own_data_by_coverage, def_allowed_by_coverage,
+                               own_name, opp_team_name, own_stat, max_outliers=3,
+                               own_weight=0.4, def_weight=0.6):
+    """Shared real logic for both functions below: given an opponent's
+    real outlier coverages (z-score based, from TeamCoverageProfile.
+    outliers), combines - for each outlier coverage - how exploitable the
+    DEFENSE is (their allowed tier for own_stat, weighted more heavily,
+    since that's the new opponent-specific information this signal adds)
+    with how good the PLAYER himself has been in that specific coverage
+    (weighted less, since his overall quality is already captured
+    elsewhere in the pipeline via mu/role_verification - this adds a
+    narrower "does his own history support this specific coverage fit"
+    layer on top, not a replacement for it).
+
+    Weighted by each outlier's real z-score magnitude (a coverage a team
+    leans into at z=2.5 counts for more than one at z=1.05), not treated
+    as equally-weighted just for clearing the outlier threshold.
+
+    Returns (exploit_strength: float|nan, coverages_checked: list[str]).
+    Real gaps (no data for a coverage on either side) are skipped rather
+    than defaulted to a neutral score - "no data" and "average" aren't
+    the same thing."""
+    if not outliers:
+        return np.nan, []
+
+    weighted_scores = []
+    weights = []
+    checked = []
+    for coverage_field, z in outliers[:max_outliers]:
+        checked.append(coverage_field.replace(" %", ""))
+        parts = []
+        part_weights = []
+
+        def_row = def_allowed_by_coverage.get(coverage_field, {}).get(opp_team_name)
+        def_score = _tier_to_score(def_row.get("_tiers") if def_row else None, own_stat)
+        if def_score is not None:
+            parts.append(def_score)
+            part_weights.append(def_weight)
+
+        own_row = own_data_by_coverage.get(coverage_field, {}).get(own_name)
+        own_score = _tier_to_score(own_row.get("_tiers") if own_row else None, own_stat)
+        if own_score is not None:
+            parts.append(own_score)
+            part_weights.append(own_weight)
+
+        if not parts:
+            continue  # no real data on either side for this coverage - skip, don't guess
+        combined = sum(p * w for p, w in zip(parts, part_weights)) / sum(part_weights)
+        weighted_scores.append(combined)
+        weights.append(max(z, 0.01))
+
+    if not weighted_scores:
+        return np.nan, checked
+    exploit_strength = sum(s * w for s, w in zip(weighted_scores, weights)) / sum(weights)
+    return round(exploit_strength, 3), checked
+
+
+def calc_qb_coverage_exploit_strength(bundle: CoverageDataBundle, qb_name: str,
+                                       qb_team_abbrev: str, opponent_team_abbrev: str) -> dict:
+    """
+    Real per-QB signal: for each coverage this opponent's defense genuinely
+    leans into (real z-score outlier, not just locally highest), combines
+    how much that defense allows to QBs in that specific coverage (RATE
+    allowed, tiered against the real league distribution of defenses in
+    that coverage) with this QB's own real RATE in that same coverage from
+    his own game history - see _weighted_outlier_exploit for the exact
+    combination and weighting.
+
+    Team abbreviations (as used throughout nfl_model_combined.py) are
+    converted to the full names this module's data is keyed on via
+    TEAM_ABBREV_TO_FULL. Returns neutral/empty gracefully (exploit_strength
+    NaN) if the opponent isn't found or has no real outlier coverage this
+    season - never raises, matching this module's established graceful-
+    gap handling throughout.
+    """
+    opp_full = TEAM_ABBREV_TO_FULL.get((opponent_team_abbrev or "").upper())
+    opp_profile = bundle.def_coverage.get(opp_full) if opp_full else None
+    if opp_profile is None:
+        return {"exploit_strength": np.nan, "outlier_coverages_checked": []}
+
+    exploit_strength, checked = _weighted_outlier_exploit(
+        opp_profile.outliers, bundle.qb_vs_coverage, bundle.def_allowed_to_qb,
+        qb_name, opp_profile.team_name, own_stat="RATE",
+    )
+    return {"exploit_strength": exploit_strength, "outlier_coverages_checked": checked}
+
+
+def calc_alignment_exploit_strength(bundle: CoverageDataBundle, player_name: str, position: str,
+                                     player_team_abbrev: str, opponent_team_abbrev: str) -> dict:
+    """
+    Real per-receiver signal, same shape as calc_qb_coverage_exploit_
+    strength above, but first has to figure out which alignment
+    (Wide/Slot/Inline/Backfield) this player is actually used at, since
+    the caller (nfl_model_combined.py) doesn't pass one in.
+
+    REAL BUG CAUGHT+FIXED before this shipped: the obvious approach - read
+    the player's own WIDE/SLOT/INLINE/BACK RTE% columns off whichever
+    alignment file has him - is broken. Confirmed directly on real data
+    (Saquon Barkley): those RTE% columns are self-referential PER FILE,
+    not a real cross-alignment share - the WIDE file's own "WIDE RTE %"
+    column reads 100% simply because that file has already pre-filtered
+    to his wide-alignment routes, so it trivially says "100% of THESE
+    routes were wide." Every alignment file does the same thing for
+    itself, making the column useless for telling alignments apart.
+
+    Fixed by comparing real TGT volume ACROSS the 4 alignment files
+    instead - whichever alignment has the player's highest real target
+    count (summed across all 7 of that alignment's coverage files, since
+    volume is split by coverage faced) is his real dominant alignment.
+    alignment_fit_pct is then computed honestly as that alignment's share
+    of his total charted targets across all 4 alignments - not a raw
+    CSV column.
+
+    Uses FP/G (overall fantasy value per game) as the combination stat -
+    a fair general-quality measure available on every receiver row,
+    unlike RATE (QB-specific) or CR %/YPRR alone (miss the volume side).
+
+    Returns exploit_strength NaN (not a guess) if the player has no
+    recorded targets in ANY alignment file yet this season - a real gap,
+    not defaulted to neutral.
+    """
+    opp_full = TEAM_ABBREV_TO_FULL.get((opponent_team_abbrev or "").upper())
+    opp_profile = bundle.def_coverage.get(opp_full) if opp_full else None
+    if opp_profile is None:
+        return {"exploit_strength": np.nan, "dominant_alignment": None,
+                "alignment_fit_pct": None, "outlier_coverages_checked": []}
+
+    # Real target volume per alignment, summed across that alignment's
+    # own coverage-type files (a player's targets are split by which
+    # coverage he faced, so no single coverage file has his full count).
+    tgt_by_alignment = {}
+    for alignment in ALIGNMENTS:
+        total_tgt = 0
+        for coverage_field, rows in bundle.receiver_by_alignment.get(alignment, {}).items():
+            row = rows.get(player_name)
+            if row is not None:
+                total_tgt += int(_to_float(row.get("TGT")) or 0)
+        if total_tgt > 0:
+            tgt_by_alignment[alignment] = total_tgt
+
+    if not tgt_by_alignment:
+        return {"exploit_strength": np.nan, "dominant_alignment": None,
+                "alignment_fit_pct": None, "outlier_coverages_checked": []}
+
+    dominant_alignment = max(tgt_by_alignment, key=tgt_by_alignment.get)
+    total_across_all = sum(tgt_by_alignment.values())
+    alignment_fit_pct = round(100 * tgt_by_alignment[dominant_alignment] / total_across_all, 1)
+
+    exploit_strength, checked = _weighted_outlier_exploit(
+        opp_profile.outliers,
+        bundle.receiver_by_alignment.get(dominant_alignment, {}),
+        bundle.def_allowed_by_alignment.get(dominant_alignment, {}),
+        player_name, opp_profile.team_name, own_stat="FP/G",
+    )
+    return {
+        "exploit_strength": exploit_strength,
+        "dominant_alignment": dominant_alignment,
+        "alignment_fit_pct": alignment_fit_pct,
+        "outlier_coverages_checked": checked,
+    }
+
+
+def get_matchup(bundle: CoverageDataBundle, player_name, position, opponent_team,
+                 player_team=None, alignment=None):
+    """Single entry point for a matchup report, any position. Position:
+    'QB' uses the QB pipeline. 'WR'/'TE'/'RB' uses the receiver-by-
+    alignment pipeline and REQUIRES alignment ('wide'/'slot'/'inline'/
+    'backfield') since that data is alignment-specific.
+
+    opponent_team: full team name, matched against bundle.def_coverage
+    (the defense's own tendencies - what YOU'RE facing when playing them).
+    """
+    opp_profile = bundle.def_coverage.get(opponent_team)
+    if opp_profile is None:
+        return [{"error": f"'{opponent_team}' not found in loaded team coverage data. "
+                           f"Check spelling matches the full team name (e.g. 'Seattle Seahawks')."}]
+
+    if position.upper() == "QB":
+        return build_qb_matchup_report(player_name, opp_profile, bundle.qb_vs_coverage,
+                                        qb_team_name=player_team, def_allowed_data=bundle.def_allowed_to_qb)
+
+    if alignment is None:
+        return [{"error": f"alignment is required for position '{position}' "
+                           f"(one of: wide, slot, inline, backfield)."}]
+    alignment = alignment.lower()
+    if alignment not in bundle.receiver_by_alignment:
+        return [{"error": f"Unknown alignment '{alignment}'. Must be one of: {ALIGNMENTS}"}]
+
+    return build_receiver_matchup_report(
+        player_name, alignment, opp_profile,
+        bundle.receiver_by_alignment[alignment],
+        receiver_team_name=player_team,
+        def_allowed_data=bundle.def_allowed_by_alignment[alignment],
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# Matchup report
+# ---------------------------------------------------------------------------
+
+def build_qb_matchup_report(qb_name, opponent_team_profile: TeamCoverageProfile,
+                             qb_coverage_data: dict, qb_team_name=None,
+                             def_allowed_data: dict = None, max_outliers=3):
+    if qb_team_name and _same_team(qb_team_name, opponent_team_profile.team_name):
+        return [{"error": f"{qb_name} plays for {opponent_team_profile.team_name} - "
+                           f"cannot build a matchup report against his own team."}]
+
+    report = []
+    outliers = opponent_team_profile.outliers[:max_outliers]
+    if not outliers:
+        return [{"note": f"{opponent_team_profile.team_name} has no statistically real "
+                          f"outlier coverage this season - no specific coverage edge to flag."}]
+
+    for coverage_field, z in outliers:
+        cov_label = coverage_field.replace(" %", "")
+        entry = {
+            "coverage": cov_label,
+            "opponent_usage_pct": opponent_team_profile.rates[coverage_field],
+            "opponent_z_score": round(z, 2),
+        }
+
+        qb_row = qb_coverage_data.get(coverage_field, {}).get(qb_name)
+        if qb_row is None:
+            entry["qb_data"] = None
+            entry["confidence"] = "no_data"
+        else:
+            entry["qb_data"] = qb_row  # FULL row - every column, plus _tiers dict
+            entry["confidence"] = "thin_sample" if qb_row["_thin_sample"] else "solid"
+
+        if def_allowed_data is not None:
+            def_row = def_allowed_data.get(coverage_field, {}).get(opponent_team_profile.team_name)
+            entry["defense_allows"] = def_row  # FULL row, or None
+            entry["defense_confidence"] = ("thin_sample" if def_row and def_row["_thin_sample"]
+                                            else "solid" if def_row else "no_data")
+
+        report.append(entry)
+    return report
+
+
+def print_matchup_report(qb_name, opponent_team_profile, qb_coverage_data,
+                          qb_team_name=None, def_allowed_data=None,
+                          highlight_stats=("CMP %", "YPA", "TD", "INT", "RATE", "CPOE", "FP/G")):
+    """Console-friendly summary. Prints tiers for a curated highlight set by
+    default (still has the full row available in the returned report dict
+    for anything deeper - this is just the readable console view)."""
+    report = build_qb_matchup_report(qb_name, opponent_team_profile, qb_coverage_data,
+                                      qb_team_name=qb_team_name, def_allowed_data=def_allowed_data)
+    if report and "error" in report[0]:
+        print(f"\n  [BLOCKED] {report[0]['error']}")
+        return report
+    if report and "note" in report[0]:
+        print(f"\n  {report[0]['note']}")
+        return report
+
+    print(f"\n=== {qb_name} vs {opponent_team_profile.team_name} — Coverage Matchup ===")
+    for entry in report:
+        print(f"\n  {opponent_team_profile.team_name} runs {entry['coverage']} at "
+              f"{entry['opponent_usage_pct']:.1f}% (z={entry['opponent_z_score']:+.2f} vs league)")
+
+        qd = entry.get("qb_data")
+        if qd is None:
+            print(f"    -> {qb_name}: no recorded attempts vs this coverage.")
+        else:
+            flag = f"  [THIN - {qd['_att']} att]" if entry["confidence"] == "thin_sample" else ""
+            stat_str = ", ".join(f"{s}={qd.get(s)} ({qd['_tiers'].get(s,'-')})"
+                                  for s in highlight_stats if s in qd)
+            print(f"    -> {qb_name} (own history, {qd['_att']} ATT){flag}: {stat_str}")
+
+        dd = entry.get("defense_allows")
+        if dd is not None:
+            flag = f"  [THIN - {dd['_att']} att]" if entry.get("defense_confidence") == "thin_sample" else ""
+            stat_str = ", ".join(f"{s}={dd.get(s)} ({dd['_tiers'].get(s,'-')})"
+                                  for s in highlight_stats if s in dd)
+            print(f"    -> {opponent_team_profile.team_name} allows ({dd['_att']} ATT){flag}: {stat_str}")
+
+    return report
+
+
+# ===========================================================================
+# Real, merged content from rb_matchup.py (per direct request, single-file
+# consolidation) - RB run-concept matchup data handling.
+# Real note: _compute_field_tiers_rb, _read_fp_csv_rb, _same_team_rb,
+# _to_float_rb, and TEAM_ABBREV_TO_FULL_RB below were renamed from this
+# file's original names (_compute_field_tiers, _read_fp_csv, _same_team,
+# _to_float, TEAM_ABBREV_TO_FULL) to avoid a real, confirmed collision with
+# coverage_matchup's own, genuinely different versions of the same names
+# above - verified different (not just duplicated) before renaming, e.g.
+# TEAM_ABBREV_TO_FULL here has a real extra "BLT" entry the other doesn't.
+# ===========================================================================
+
+"""
+NFL PREMIUM TOOL - RB Run-Concept Matchup Module
+===================================================
+Built from FantasyPoints.com Data Suite manual exports, same source and
+workflow as coverage_matchup.py. Confirmed structure (both player-side and
+defense-allowed sides checked directly, real column layout + real sample
+sizes verified before this was written):
+
+FILES (6 concepts, both sides):
+  Player-side:      INSIDE_ZONE.csv, OUTSIDE_ZONE.csv, MAN-DUO.csv,
+                     COUNTER.csv, POWER.csv, PULL_LEAD.csv
+                     (real filenames as exported - note MAN-DUO uses a
+                     hyphen, the others use underscores)
+  Defense-allowed:  same 6 concepts, SAME filenames as player-side - since
+                     a folder can't hold two files with identical names,
+                     the defense-allowed copies must be stored in a
+                     SEPARATE subfolder (see load_full_rb_dataset).
+
+WHY NO TOP-N USAGE FILTER (real difference from coverage_matchup.py)
+-----------------------------------------------------------------------
+Coverage is a defensive SCHEME CHOICE - ranking defenses by how often they
+choose to run a coverage is a real signal about their identity. Run
+concept is called by the OFFENSE, not the defense - a defense doesn't
+"run Counter 20% of the time," they just face whatever the RB's play call
+gives them. Ranking defenses by concept-usage-rate would measure the
+opponents THEY faced, not the defense's own tendency. So instead of a
+top-N filter, every real concept (all 6) is always shown, each graded
+directly on how that defense has actually performed against it - the
+defense-allowed Quality Score IS the signal here, not a usage-rate cutoff.
+
+DUPLICATE COLUMN HANDLING (real bug, same PATTERN as the QB Passing/
+Scrambles YDS+TD issue in coverage_matchup.py, bigger here)
+-----------------------------------------------------------------------
+Every file's real header has ATT/YDS/TD/YPC/Success% appearing THREE
+times (main Rushing/Advanced section, then again under a "Zone Concept"
+section, then again under a "Man/Gap Concept" section), plus ATT% twice.
+A naive dict(zip(header,row)) would silently keep only the LAST
+occurrence (Man/Gap Concept values) and lose the real main stats
+entirely. Fixed here via POSITIONAL (index-based) renaming, since the
+column names collide but their real positions in the row don't - the
+Zone/Man-Gap Concept columns get prefixed ZONE_/MANGAP_ during parsing.
+Confirmed identical column layout/positions on both player-side (42
+cols, includes Team/POS/FPTS section) and defense-allowed side (38 cols,
+no Team/POS, no FPTS section - real difference, not a bug).
+
+REAL SAMPLE SIZES (confirmed from actual 2025 data - player-side, >=20
+real ATT / >=10 real ATT)
+-----------------------------------------------------------------------
+Inside Zone   54 / 75      Outside Zone  57 / 72     Man/Duo   47 / 64
+Power         10 / 36      Pull Lead      8 / 32     Counter    6 / 24
+Counter/Power/Pull Lead are real, usable concepts but meaningfully
+thinner than the other three - separate thin-sample thresholds per
+concept below, not one flat cutoff.
+
+NO "LONGEST RUSH" COLUMN - confirmed absent from every file, same real
+gap as "longest catch" on the WR/coverage side. Not built, not guessed.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Real concept list + filenames (exact, as exported - note MAN-DUO's hyphen)
+# ---------------------------------------------------------------------------
+CONCEPT_FILES = {
+    "Inside Zone": "INSIDE_ZONE.csv",
+    "Outside Zone": "OUTSIDE_ZONE.csv",
+    "Man/Duo": "MAN-DUO.csv",
+    "Counter": "COUNTER.csv",
+    "Power": "POWER.csv",
+    "Pull Lead": "PULL_LEAD.csv",
+}
+
+# Real thin-sample ATT thresholds per concept, set from the actual real
+# player-side sample-size check above - Counter/Power/Pull Lead get a
+# tighter bar than Inside/Outside Zone/Man-Duo, which have real deep
+# samples league-wide.
+THIN_SAMPLE_ATT_THRESHOLD = {
+    "Inside Zone": 15, "Outside Zone": 15, "Man/Duo": 15,
+    "Power": 8, "Pull Lead": 8, "Counter": 5,
+}
+
+# Stats that actually decide rushing prop quality - double-weighted in the
+# quality score, same philosophy as CRUCIAL_QUALITY_STATS in streamlit_app.py
+# Expanded per explicit real-world feedback: efficiency/explosiveness
+# metrics (EXP RUN %, EXP YDS %, TD RATE) and the full YACO/stuff family
+# genuinely separate a good rushing matchup from a bad one, not just raw
+# volume+YPC - a defense can allow decent YPC while still getting
+# stuffed at a high rate or giving up few explosive runs, and that
+# distinction matters for grading BOTH sides (player AND defense-allowed
+# use this same set). ATT % deliberately excluded: it only exists in the
+# Zone/Man-Gap Concept columns, and since each file is already a single
+# concept, that value is always ~100%/0% by definition - a redundant
+# confirmation number, not a real signal.
+CRUCIAL_RB_STATS = {
+    "ATT", "YDS", "YPC", "TD", "Success %", "EXP RUN %", "EXP YDS %",
+    "TD RATE", "MTF/ATT", "YACO", "YACO/ATT", "YACO %", "YBCO/ATT", "STUFF %",
+}
+
+# Stats where a HIGHER number is worse (mirrors coverage_matchup.py)
+INVERSE_STATS = {"FUM", "STUFF %"}
+
+NON_STAT_COLUMNS_PLAYER = {"Rank", "Name", "Team", "POS", "G", "Season"}
+NON_STAT_COLUMNS_TEAM = {"Rank", "Name", "G", "Season", "Location", "Team Name"}
+
+TEAM_ABBREV_TO_FULL_RB = {
+    "ARI": "Arizona Cardinals", "ATL": "Atlanta Falcons", "BAL": "Baltimore Ravens",
+    "BLT": "Baltimore Ravens", "BUF": "Buffalo Bills", "CAR": "Carolina Panthers",
+    "CHI": "Chicago Bears", "CIN": "Cincinnati Bengals", "CLE": "Cleveland Browns",
+    "DAL": "Dallas Cowboys", "DEN": "Denver Broncos", "DET": "Detroit Lions",
+    "GB": "Green Bay Packers", "HOU": "Houston Texans", "IND": "Indianapolis Colts",
+    "JAX": "Jacksonville Jaguars", "JAC": "Jacksonville Jaguars", "KC": "Kansas City Chiefs",
+    "LV": "Las Vegas Raiders", "LAC": "Los Angeles Chargers", "LA": "Los Angeles Rams",
+    "LAR": "Los Angeles Rams", "MIA": "Miami Dolphins", "MIN": "Minnesota Vikings",
+    "NE": "New England Patriots", "NO": "New Orleans Saints", "NYG": "New York Giants",
+    "NYJ": "New York Jets", "PHI": "Philadelphia Eagles", "PIT": "Pittsburgh Steelers",
+    "SEA": "Seattle Seahawks", "SF": "San Francisco 49ers", "TB": "Tampa Bay Buccaneers",
+    "TEN": "Tennessee Titans", "WAS": "Washington Commanders",
+}
+
+
+def _same_team_rb(abbrev_or_name, full_name):
+    if not abbrev_or_name or not full_name:
+        return False
+    a = abbrev_or_name.strip().upper()
+    if a in TEAM_ABBREV_TO_FULL_RB:
+        return TEAM_ABBREV_TO_FULL_RB[a] == full_name
+    return abbrev_or_name.strip().lower() == full_name.strip().lower()
+
+
+def _to_float_rb(val):
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _read_fp_csv_rb(path):
+    """Reads a FantasyPoints export, returns (raw_header, data_rows) - the
+    header/rows AFTER the title row (row 0, e.g. 'Player Details'/'Team
+    Details'), which is metadata, not real columns."""
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.reader(f))
+    header = rows[1]
+    data = rows[2:]
+    return header, data
+
+
+# Positional rename map - see module docstring for why this is index-based,
+# not name-based. Index 26-37 is the real duplicate block (Zone Concept
+# then Man/Gap Concept, each repeating ATT/ATT%/YDS/TD/YPC/Success%),
+# confirmed at these exact positions on BOTH player-side and defense-
+# allowed side despite their different total column counts (42 vs 38 -
+# the difference is entirely the trailing FPTS section, absent on the
+# defense-allowed side).
+ZONE_RENAME = {26: "ZONE_ATT", 27: "ZONE_ATT_PCT", 28: "ZONE_YDS",
+                29: "ZONE_TD", 30: "ZONE_YPC", 31: "ZONE_SUCCESS_PCT"}
+MANGAP_RENAME = {32: "MANGAP_ATT", 33: "MANGAP_ATT_PCT", 34: "MANGAP_YDS",
+                   35: "MANGAP_TD", 36: "MANGAP_YPC", 37: "MANGAP_SUCCESS_PCT"}
+
+
+def _row_to_dict(header, row):
+    """Builds the row dict using positional renaming for the real
+    duplicate-name columns (indices 26-37) - everything else keyed by its
+    real column name as-is. Handles both the 42-col player-side and
+    38-col defense-allowed layouts (rename map only applies where the
+    index exists in this specific row)."""
+    d = {}
+    for i, val in enumerate(row):
+        if i >= len(header):
+            break
+        if i in ZONE_RENAME:
+            d[ZONE_RENAME[i]] = val
+        elif i in MANGAP_RENAME:
+            d[MANGAP_RENAME[i]] = val
+        else:
+            d[header[i]] = val
+    return d
+
+
+def _compute_field_tiers_rb(rows_by_key, non_stat_columns):
+    """Same real-distribution z-score tiering as coverage_matchup.py -
+    Elite/Above Avg/Average/Below Avg/Poor, computed against the actual
+    players/teams in THIS concept's file, direction-corrected for stats
+    where lower is better (FUM, STUFF %)."""
+    if not rows_by_key:
+        return
+    sample_row = next(iter(rows_by_key.values()))
+    stat_cols = [c for c in sample_row.keys() if c not in non_stat_columns and not c.startswith("_")]
+
+    field_stats = {}
+    for col in stat_cols:
+        vals = [_to_float_rb(r.get(col)) for r in rows_by_key.values()]
+        vals = [v for v in vals if v is not None]
+        if len(vals) < 3:
+            continue
+        field_stats[col] = (mean(vals), pstdev(vals))
+
+    for r in rows_by_key.values():
+        tiers = {}
+        for col, (avg, sd) in field_stats.items():
+            v = _to_float_rb(r.get(col))
+            if v is None or not sd:
+                continue
+            z = (v - avg) / sd
+            if col in INVERSE_STATS:
+                z = -z
+            if z >= 1.5:
+                tiers[col] = "Elite"
+            elif z >= 0.5:
+                tiers[col] = "Above Avg"
+            elif z > -0.5:
+                tiers[col] = "Average"
+            elif z > -1.5:
+                tiers[col] = "Below Avg"
+            else:
+                tiers[col] = "Poor"
+        r["_tiers"] = tiers
+
+
+def load_rb_vs_concept(file_paths: dict):
+    """Player-side: RB's own real season stats for ONE concept.
+    file_paths: {concept_label: csv_path}. Returns
+    {concept_label: {rb_name: row}}, every real column captured +
+    tiered, duplicate columns already resolved via positional rename."""
+    data = {}
+    for concept, path in file_paths.items():
+        header, rows = _read_fp_csv_rb(path)
+        by_key = {}
+        for row in rows:
+            d = _row_to_dict(header, row)
+            key = d.get("Name")
+            if not key:
+                continue
+            att = int(_to_float_rb(d.get("ATT", 0)) or 0)
+            threshold = THIN_SAMPLE_ATT_THRESHOLD.get(concept, 10)
+            d["_thin_sample"] = att < threshold
+            d["_att"] = att
+            by_key[key] = d
+        _compute_field_tiers_rb(by_key, NON_STAT_COLUMNS_PLAYER)
+        data[concept] = by_key
+    return data
+
+
+def load_def_allowed_rb_concept(file_paths: dict):
+    """Defense-allowed: what each DEFENSE gives up on this concept.
+    Same shape as load_rb_vs_concept, keyed by team name, using the
+    team-side column layout (no Team/POS/FPTS columns)."""
+    data = {}
+    for concept, path in file_paths.items():
+        header, rows = _read_fp_csv_rb(path)
+        by_key = {}
+        for row in rows:
+            d = _row_to_dict(header, row)
+            key = d.get("Name")
+            if not key:
+                continue
+            att = int(_to_float_rb(d.get("ATT", 0)) or 0)
+            threshold = THIN_SAMPLE_ATT_THRESHOLD.get(concept, 10)
+            d["_thin_sample"] = att < threshold
+            d["_att"] = att
+            by_key[key] = d
+        _compute_field_tiers_rb(by_key, NON_STAT_COLUMNS_TEAM)
+        data[concept] = by_key
+    return data
+
+
+@dataclass
+class RBDataBundle:
+    rb_vs_concept: dict       # concept -> {rb_name: row}
+    def_allowed: dict         # concept -> {team_name: row}
+    missing: list = field(default_factory=list)
+
+
+def _normalize_name(s):
+    """Strips everything except letters/digits, uppercases - so
+    'INSIDE_ZONE', 'Inside Zone', and 'inside-zone' all normalize to the
+    same 'INSIDEZONE' key. Real-world exports don't reliably use one
+    separator convention, so matching should be robust to that rather
+    than demanding an exact filename."""
+    return re.sub(r"[^A-Z0-9]", "", s.upper())
+
+
+def _scan_folder_for_rb_files(dir_path):
+    """Lists every real .csv in dir_path, keyed by its normalized name -
+    used by both the one-folder and two-folder loading modes so filename
+    matching is consistent (and forgiving) everywhere."""
+    if not os.path.isdir(dir_path):
+        return {}
+    out = {}
+    for fname in os.listdir(dir_path):
+        if fname.lower().endswith(".csv"):
+            out[_normalize_name(fname[:-4])] = fname
+    return out
+
+
+def _find_concept_file(norm_map, concept_norm, want_def_side):
+    """Finds the real filename matching this concept in a normalized
+    filename map. Player side: direct match on the concept name. Defense
+    side: accepts several real-world prefix conventions seen in practice
+    (DEF_X, DEFX, DEF-VS-X, 'DEF VS X') - matched by checking the
+    filename starts with DEF, optionally followed by VS, then the
+    concept name - rather than requiring one exact prefix string."""
+    if not want_def_side:
+        return norm_map.get(concept_norm)
+    for norm_name, real_fname in norm_map.items():
+        if not norm_name.startswith("DEF"):
+            continue
+        rest = norm_name[3:]
+        if rest.startswith("VS"):
+            rest = rest[2:]
+        if rest == concept_norm:
+            return real_fname
+    return None
+
+
+def load_full_rb_dataset(data_dir=".", player_dir=None, def_dir=None):
+    """Loads all 6 concepts, both sides, in one call. Filename matching is
+    NORMALIZED (spaces/underscores/hyphens all treated the same, defense
+    side accepts DEF_, DEFVS, 'DEF VS ', etc.) - real exports have used
+    several different conventions in practice, so this doesn't require
+    the person uploading them to rename anything to one exact form.
+
+    Two modes:
+    - data_dir only: ONE flat folder with all 12 files - defense-allowed
+      ones need SOME recognizable DEF prefix (DEF_INSIDE_ZONE.csv,
+      "DEF VS INSIDE ZONE.csv", etc. all work).
+    - player_dir + def_dir: two separate folders, upload each exactly as
+      already organized - no renaming needed, no DEF prefix required
+      since the folder itself tells the two sides apart.
+
+    Missing files are logged in .missing rather than raising, same
+    graceful-gap handling as coverage_matchup.py."""
+    missing = []
+    player_files = {}
+    def_files = {}
+
+    if player_dir or def_dir:
+        p_map = _scan_folder_for_rb_files(player_dir) if player_dir else {}
+        d_map = _scan_folder_for_rb_files(def_dir) if def_dir else {}
+        for concept, fname in CONCEPT_FILES.items():
+            concept_norm = _normalize_name(fname[:-4])
+            p_real = _find_concept_file(p_map, concept_norm, want_def_side=False)
+            if p_real:
+                player_files[concept] = os.path.join(player_dir, p_real)
+            else:
+                missing.append(f"Player-side {concept} (looked in '{player_dir}' for something matching '{fname}')")
+            # def_dir is its own folder - the DEF prefix isn't required
+            # here (the folder already means "defense"), but still
+            # accepted if present, since matching is normalized either way
+            d_real = d_map.get(concept_norm) or _find_concept_file(d_map, concept_norm, want_def_side=True)
+            if d_real:
+                def_files[concept] = os.path.join(def_dir, d_real)
+            else:
+                missing.append(f"Defense-allowed {concept} (looked in '{def_dir}' for something matching '{fname}')")
+    else:
+        norm_map = _scan_folder_for_rb_files(data_dir)
+        for concept, fname in CONCEPT_FILES.items():
+            concept_norm = _normalize_name(fname[:-4])
+            p_real = _find_concept_file(norm_map, concept_norm, want_def_side=False)
+            if p_real:
+                player_files[concept] = os.path.join(data_dir, p_real)
+            else:
+                missing.append(f"Player-side {concept} (looked in '{data_dir}' for something matching '{fname}')")
+            d_real = _find_concept_file(norm_map, concept_norm, want_def_side=True)
+            if d_real:
+                def_files[concept] = os.path.join(data_dir, d_real)
+            else:
+                missing.append(f"Defense-allowed {concept} (looked in '{data_dir}' for a DEF-prefixed file matching '{fname}')")
+
+    rb_data = load_rb_vs_concept(player_files) if player_files else {}
+    def_data = load_def_allowed_rb_concept(def_files) if def_files else {}
+    return RBDataBundle(rb_vs_concept=rb_data, def_allowed=def_data, missing=missing)
+
+
+TIER_SCORE = {"Elite": 1.0, "Above Avg": 0.75, "Average": 0.5, "Below Avg": 0.25, "Poor": 0.0}
+
+
+def calc_rb_concept_exploit_strength(bundle: RBDataBundle, rb_name: str,
+                                      opponent_team_abbrev: str) -> dict:
+    """
+    Real, aggregate RB matchup signal across ALL 6 real rush concepts,
+    weighted by how much this SPECIFIC back actually runs each one (his
+    own real _att share) - the real analog of coverage_matchup.py's
+    exploit-strength functions, but blended across concepts instead of
+    gated to outliers, since (per this module's own note above) concept
+    usage is an offensive play-call choice, not a defensive tendency
+    worth outlier-filtering the way coverage is.
+
+    For each concept: combines the defense's allowed tier (60%, the new
+    opponent-specific information) with the RB's own tier in that same
+    concept (40%) - same weighting philosophy as every coverage_matchup.py
+    exploit-strength function. Uses YPC as the combination stat (a fair,
+    always-present per-concept efficiency measure on both sides).
+
+    A concept this RB has never really run (0 real attempts) contributes
+    zero weight - not treated as a zero-value data point, genuinely
+    excluded, so a back who's purely an Inside/Outside Zone runner isn't
+    penalized or credited for concepts he's never actually used.
+
+    Returns exploit_strength NaN if this RB has no real attempts in ANY
+    concept yet, or the opponent isn't found - a real gap, not a guess.
+    """
+    opp_full = TEAM_ABBREV_TO_FULL_RB.get((opponent_team_abbrev or "").upper())
+    if opp_full is None:
+        return {"exploit_strength": np.nan, "concepts_used": []}
+
+    concept_atts = {}
+    for concept, rows in bundle.rb_vs_concept.items():
+        row = rows.get(rb_name)
+        if row is not None:
+            att = row.get("_att", 0) or 0
+            if att > 0:
+                concept_atts[concept] = att
+
+    if not concept_atts:
+        return {"exploit_strength": np.nan, "concepts_used": []}
+
+    total_att = sum(concept_atts.values())
+    weighted_scores, weights = [], []
+    for concept, att in concept_atts.items():
+        own_row = bundle.rb_vs_concept.get(concept, {}).get(rb_name)
+        def_row = bundle.def_allowed.get(concept, {}).get(opp_full)
+        own_score = TIER_SCORE.get((own_row.get("_tiers") or {}).get("YPC")) if own_row else None
+        def_score = TIER_SCORE.get((def_row.get("_tiers") or {}).get("YPC")) if def_row else None
+
+        parts, part_weights = [], []
+        if def_score is not None:
+            parts.append(def_score)
+            part_weights.append(0.6)
+        if own_score is not None:
+            parts.append(own_score)
+            part_weights.append(0.4)
+        if not parts:
+            continue
+        combined = sum(p * w for p, w in zip(parts, part_weights)) / sum(part_weights)
+        weighted_scores.append(combined)
+        weights.append(att / total_att)
+
+    if not weighted_scores:
+        return {"exploit_strength": np.nan, "concepts_used": list(concept_atts.keys())}
+    exploit_strength = sum(s * w for s, w in zip(weighted_scores, weights)) / sum(weights)
+    return {"exploit_strength": round(exploit_strength, 3), "concepts_used": list(concept_atts.keys())}
+
+
+def get_rb_matchup(bundle: RBDataBundle, rb_name, opponent_team_full, rb_team_name=None):
+    """Single entry point - one report entry per concept the RB has ANY
+    real data for (all 6 checked, not filtered by a usage-rate cutoff -
+    see module docstring for why). Each entry has the RB's own history
+    (own_row) and what the opponent allows on that concept
+    (defense_allows), both tiered."""
+    if rb_team_name and _same_team_rb(rb_team_name, opponent_team_full):
+        return [{"error": f"{rb_name} plays for {opponent_team_full} - "
+                           f"cannot build a matchup report against his own team."}]
+
+    report = []
+    for concept in CONCEPT_FILES:
+        own_row = bundle.rb_vs_concept.get(concept, {}).get(rb_name)
+        def_row = bundle.def_allowed.get(concept, {}).get(opponent_team_full)
+        if own_row is None and def_row is None:
+            continue
+        report.append({
+            "concept": concept,
+            "own_row": own_row,
+            "own_confidence": ("thin_sample" if own_row and own_row.get("_thin_sample")
+                                else "solid" if own_row else "no_data"),
+            "defense_allows": def_row,
+            "defense_confidence": ("thin_sample" if def_row and def_row.get("_thin_sample")
+                                    else "solid" if def_row else "no_data"),
+        })
+    if not report:
+        return [{"note": f"No data found for {rb_name} or {opponent_team_full} "
+                          f"in any of the 6 run concepts."}]
+    return report
+  
