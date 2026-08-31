@@ -4830,4 +4830,3 @@ if mode == "Season Backtest":
         pmiss_summary["mean_abs_miss"] = round(pmiss_summary["mean_abs_miss"], 2)
         st.markdown("**Real mu accuracy by 1Q/1H prop_type**")
         st.dataframe(pmiss_summary, width='stretch')
-
