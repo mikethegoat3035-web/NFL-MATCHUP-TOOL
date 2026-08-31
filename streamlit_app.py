@@ -11,6 +11,8 @@ import numpy as np
 from datetime import datetime
 from nfl_model_combined import (
     scan_full_slate_nfl, rescore_quality_mu_row_nfl, backtest_week, build_season_accuracy_report,
+    build_season_simulation_backtest_report,
+    score_partial_game_week_against_actuals, add_simulation_columns_to_backtest_rows,
     diagnose_participation_data, get_player_matchup_explanation, diagnose_injuries_data,
     diagnose_alignment_data, pull_player_stats, pull_schedules, pull_pbp,
     build_coverage_crossref_game_log, diagnose_player_stats_for_game_log,
@@ -383,22 +385,28 @@ with st.expander("🔍 Debug: Check for real receiver alignment data (wide/slot/
 
 mode = st.radio(
     "Mode",
-    ["Scan (adjustable lines)", "Draft Rankings", "Coverage Matchup (premium data)"],
+    ["Season Backtest", "Weekly Scan / Draft Rankings", "Coverage Matchup (premium data)"],
     horizontal=True,
-    help="Draft Rankings builds a full season projection/ranking for your "
-         "league format, using last season's data as the projection basis. "
-         "Coverage Matchup uses the manually-collected FantasyPoints premium "
-         "dataset (Cover 0-6 shell-level splits) - separate from the free "
-         "nflreadpy pipeline the other two modes run on. Real-results "
-         "backtesting now lives inside Coverage Matchup's 'Backtest Mu Tool' "
-         "and 'Scan Everything' sections - more thorough than the old "
-         "separate Backtest mode, so that mode was removed.",
+    help="Renamed for real, honest clarity (previously 'Scan (adjustable lines)' and "
+         "'Draft Rankings', which didn't reflect what's actually inside either one). "
+         "'Season Backtest' holds the real Readiness Report AND the new 1000-sample "
+         "simulation backtest - checking mu (and now the simulation's own real gap) "
+         "against real, actual results across a completed season. 'Weekly Scan / "
+         "Draft Rankings' is genuinely two real tools sharing one mode: once a real "
+         "weekly slate loads, you get the live scan (Minimum bar filter, Slip "
+         "Builder, Locked Slips); without one loaded, you get the season-long draft "
+         "board/rankings instead. 'Coverage Matchup' uses the manually-collected "
+         "FantasyPoints premium dataset (Cover 0-6 shell-level splits, alignment vs "
+         "coverage, RB run concepts) - separate from the free nflreadpy pipeline the "
+         "other two modes run on - and has its own real backtest and quality-score "
+         "validation tools built in.",
 )
+
 
 if mode != "Coverage Matchup (premium data)":
     col1, col2 = st.columns(2)
     with col1:
-        if mode == "Draft Rankings":
+        if mode == "Weekly Scan / Draft Rankings":
             season = st.number_input(
                 "Draft season", min_value=2020, max_value=2030, value=2026, step=1,
                 help="This is the season you're drafting FOR. Projections are built from "
@@ -409,7 +417,7 @@ if mode != "Coverage Matchup (premium data)":
         else:
             season = st.number_input("Season", min_value=2020, max_value=2030, value=2025, step=1)
     with col2:
-        if mode == "Draft Rankings":
+        if mode == "Weekly Scan / Draft Rankings":
             st.caption("Draft Rankings uses the prior completed season as the projection basis - "
                        "week isn't used in this mode.")
             week = None
@@ -441,7 +449,7 @@ if "rb_player_dir" not in st.session_state:
 if "rb_def_dir" not in st.session_state:
     st.session_state.rb_def_dir = None
 
-if mode == "Draft Rankings":
+if mode == "Weekly Scan / Draft Rankings":
     st.subheader("League Settings")
     lcol1, lcol2, lcol3, lcol4 = st.columns(4)
     with lcol1:
@@ -487,7 +495,7 @@ else:
     # separate "Backtest" mode option was removed from the mode selector
     # a while back (consolidated elsewhere), and this check was never
     # updated to match. Since this else-branch is only ever reached for
-    # "Scan (adjustable lines)" mode now (Draft Rankings and Coverage
+    # "Season Backtest" mode now (Draft Rankings and Coverage
     # Matchup are both handled by earlier branches above), btn_col2 -
     # and the real, working build_season_accuracy_report tool inside it -
     # has been permanently unreachable dead code, not something tonight's
@@ -684,7 +692,7 @@ def _render_season_report(report):
 # -----------------------------------------------------------------------
 # DRAFT RANKINGS DISPLAY
 # -----------------------------------------------------------------------
-if mode == "Draft Rankings":
+if mode == "Weekly Scan / Draft Rankings":
     if st.session_state.draft_rankings_df is not None and not st.session_state.draft_rankings_df.empty:
         rankings = st.session_state.draft_rankings_df.copy()
         current_settings = st.session_state.get("league_settings", league_settings)
@@ -4624,10 +4632,10 @@ elif mode == "Coverage Matchup (premium data)":
                                         )
                                         st.markdown(rb_game_card_html, unsafe_allow_html=True)
 
-elif mode not in ("Draft Rankings", "Coverage Matchup (premium data)"):
+elif mode not in ("Weekly Scan / Draft Rankings", "Coverage Matchup (premium data)"):
     st.info("Click the button above to load this week's props.")
 
-if mode == "Scan (adjustable lines)":
+if mode == "Season Backtest":
     st.divider()
     # ---------------------------------------------------------------
     # Season backtest controls - moved to the BOTTOM of the scan page,
@@ -4692,4 +4700,134 @@ if mode == "Scan (adjustable lines)":
                 except Exception as e:
                     st.error(f"Season readiness report failed: {e}")
                     st.session_state.season_report = None
+
+    st.divider()
+    st.subheader("Real, 1000-sample simulation backtest (does the sim's gap actually predict real outcomes?)")
+    st.caption(
+        "For every real, completed week in this range, runs a real 1000-sample Monte "
+        "Carlo per player-prop (negative binomial for count props like receptions/TDs, "
+        "normal for continuous props like yardage - both matched to the model's own "
+        "real mu AND sigma), then checks the real, actual outcome against it. Same "
+        "real, honest limitation as the readiness report above - no free historical "
+        "NFL player-prop-line archive exists, so the hypothetical line is the "
+        "simulation's own real average (floored to a genuine .5), not an actual "
+        "historical book line."
+    )
+    st.caption(
+        "Real, honest note on which signals are actually feeding mu here: this uses "
+        "whatever ENABLE_*_IN_QUALITY_SCORE flags are currently on elsewhere in the "
+        "model - alignment vs coverage is currently on, QB-vs-coverage and RB run-"
+        "concepts are currently off (still working through their own one-at-a-time "
+        "rollout, documented near those flags). This backtest reflects real, current "
+        "mu exactly as the live scanner produces it - it won't retroactively include "
+        "a signal that's switched off, and turning one on will change these results "
+        "the next time this runs."
+    )
+    sim_n = st.number_input("Simulations per prop", min_value=100, max_value=5000, value=1000, step=100,
+                             key="nfl_sim_n_simulations")
+    if st.button("Run simulation backtest for this week range", type="secondary"):
+        if report_end_week < report_start_week:
+            st.error("End week must be >= start week.")
+        else:
+            weeks_to_run = list(range(report_start_week, report_end_week + 1))
+            with st.spinner(f"Running {sim_n}-sample simulations across weeks "
+                             f"{report_start_week}-{report_end_week} of {bt_season}..."):
+                try:
+                    st.session_state.sim_backtest_report = build_season_simulation_backtest_report(
+                        bt_season, weeks=weeks_to_run,
+                        coverage_bundle=st.session_state.get("coverage_bundle"),
+                        rb_bundle=st.session_state.get("rb_bundle"),
+                        n_simulations=int(sim_n),
+                    )
+                    n_rows = len(st.session_state.sim_backtest_report["raw"])
+                    st.success(f"Simulated and scored {n_rows} real rows across weeks "
+                               f"{report_start_week}-{report_end_week} of {bt_season}.")
+                except Exception as e:
+                    st.error(f"Simulation backtest failed: {e}")
+                    st.session_state.sim_backtest_report = None
+
+    if st.session_state.get("sim_backtest_report") is not None and not st.session_state.sim_backtest_report["raw"].empty:
+        sim_report = st.session_state.sim_backtest_report
+        st.markdown("**Real hit-rate by prop_type and gap-pct bucket**")
+        st.dataframe(sim_report["bucket_summary"], width='stretch')
+        st.caption(
+            "Split by prop_type from the start, not lumped together - different NFL "
+            "props (receptions vs rush yards vs rush TDs) likely need genuinely "
+            "different real gap-pct thresholds, the same real lesson already learned "
+            "building MLB's hitter-vs-pitcher backtest split. Needs a real, decent "
+            "sample per bucket before trusting it."
+        )
+        if not sim_report["quality_tier_summary"].empty:
+            st.markdown("**Real accuracy (|mu - actual|) by quality_score tier**")
+            st.dataframe(sim_report["quality_tier_summary"], width='stretch')
+            st.caption(
+                "The real, direct 'is quality_score actually meaningful' check - if the "
+                "80-100 tier's mean_abs_miss isn't meaningfully lower than the <40 "
+                "tier's, quality_score isn't earning its keep as currently weighted."
+            )
+
+    st.divider()
+    st.subheader("Real 1Q / 1H prop backtest (Option A - genuinely independent historical build)")
+    st.caption(
+        "Every prop above (rush attempts, longest rush, rush yards, rush TDs, "
+        "receptions, targets, rec yards, rec TDs, longest catch, pass attempts, "
+        "completions, pass yards, pass TDs, longest completion), now also computed "
+        "for just the 1st quarter or 1st half - built from real play-by-play data, "
+        "filtered to the real, actual plays inside that time window, with its own "
+        "genuinely independent real historical mu/sigma - not a fraction or estimate "
+        "derived from the full-game number. Uses the same, unmodified mu/sigma logic "
+        "(recency weighting, shrinkage) the full-game props already use - real, honest "
+        "note: that logic hasn't been separately tuned for partial-game variance, "
+        "which may genuinely behave differently (a smaller, choppier real sample) - "
+        "worth watching once this runs against real data."
+    )
+    pw_col1, pw_col2 = st.columns(2)
+    with pw_col1:
+        partial_time_window = st.radio("Time window", ["1q", "1h"], horizontal=True, key="nfl_partial_window")
+    with pw_col2:
+        partial_n_sim = st.number_input("Simulations per prop", min_value=100, max_value=5000, value=1000,
+                                         step=100, key="nfl_partial_n_simulations")
+    if st.button(f"Run {report_start_week}-{report_end_week} week 1Q/1H backtest", type="secondary"):
+        weeks_to_run = list(range(report_start_week, report_end_week + 1))
+        all_partial_rows = []
+        with st.spinner(f"Scoring real {partial_time_window.upper()} props across weeks "
+                         f"{report_start_week}-{report_end_week} of {bt_season}..."):
+            for wk in weeks_to_run:
+                try:
+                    wk_scored = score_partial_game_week_against_actuals(
+                        bt_season, wk, partial_time_window, starters_only=True)
+                    if wk_scored.empty:
+                        continue
+                    wk_sim = add_simulation_columns_to_backtest_rows(wk_scored, n_simulations=int(partial_n_sim))
+                    if not wk_sim.empty:
+                        all_partial_rows.append(wk_sim)
+                except Exception as e:
+                    st.warning(f"Week {wk}: {e}")
+                    continue
+        if not all_partial_rows:
+            st.warning("No real, comparable 1Q/1H rows came back for this range.")
+        else:
+            partial_raw = pd.concat(all_partial_rows, ignore_index=True)
+            st.session_state.nfl_partial_backtest_raw = partial_raw
+            st.success(f"Scored {len(partial_raw)} real {partial_time_window.upper()} rows across weeks "
+                       f"{report_start_week}-{report_end_week} of {bt_season}.")
+
+    if st.session_state.get("nfl_partial_backtest_raw") is not None:
+        praw = st.session_state.nfl_partial_backtest_raw
+        bins = [0, 5, 10, 15, 20, 30, 1000]
+        labels = ["0-5%", "5-10%", "10-15%", "15-20%", "20-30%", "30%+"]
+        praw = praw.copy()
+        praw["gap_bucket"] = pd.cut(praw["gap_pct"], bins=bins, labels=labels, right=False)
+        psummary = praw.groupby(["prop_type", "gap_bucket"], observed=True).agg(
+            n=("real_cleared_line", "size"), real_hit_rate=("real_cleared_line", "mean"),
+        ).reset_index()
+        psummary["real_hit_rate"] = round(psummary["real_hit_rate"] * 100, 1)
+        st.markdown("**Real hit-rate by 1Q/1H prop_type and gap-pct bucket**")
+        st.dataframe(psummary, width='stretch')
+        pmiss_summary = praw.groupby("prop_type", observed=True).agg(
+            n=("abs_miss", "size"), mean_abs_miss=("abs_miss", "mean"),
+        ).reset_index()
+        pmiss_summary["mean_abs_miss"] = round(pmiss_summary["mean_abs_miss"], 2)
+        st.markdown("**Real mu accuracy by 1Q/1H prop_type**")
+        st.dataframe(pmiss_summary, width='stretch')
 
