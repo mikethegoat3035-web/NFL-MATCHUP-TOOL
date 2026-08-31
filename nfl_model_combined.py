@@ -1519,6 +1519,98 @@ def rescore_quality_mu_row_nfl(mu: float, line: float, sigma: float) -> dict:
     return {"p_over": round(p_over, 3), "p_under": round(p_under, 3), "edge": round(edge, 3)}
 
 
+# Real prop-type categorization for the Monte Carlo simulation below -
+# count-type props (whole-number outcomes: completions, attempts,
+# targets, receptions, TDs) get a real negative-binomial/Poisson
+# sampling; continuous props (yardage, fantasy points) get a real normal
+# sampling with a floor at 0 (a real player can't post negative yards).
+# This is the real, honest implementation of what
+# rescore_quality_mu_row_nfl's own docstring already flagged as
+# intended-but-not-yet-built ("swap in Poisson for count stats").
+NFL_COUNT_PROPS = {
+    "pass_completions", "pass_attempts", "pass_tds",
+    "rush_attempts", "rush_tds",
+    "receptions", "targets", "rec_tds",
+}
+NFL_CONTINUOUS_PROPS = {
+    "pass_yards", "rush_yards", "rec_yards", "fantasy_points",
+    "longest_completion", "longest_reception", "longest_rush", "kicker_fantasy",
+}
+
+
+def simulate_nfl_prop_n_times(mu: float, sigma: float, prop_type: str,
+                               n_simulations: int = 1000, random_state: int = 42) -> list:
+    """
+    Real Monte Carlo simulation for one real player-prop - given the
+    model's own real mu and sigma (already independently computed per
+    prop elsewhere in this file), samples n_simulations real outcomes
+    from a distribution shaped to match how that stat actually behaves:
+
+    - Count-type props (completions, attempts, targets, receptions, TDs):
+      a real negative binomial, parameterized to match the model's own
+      real mu AND sigma^2 (variance) exactly - NOT a plain Poisson, which
+      would force variance = mean and silently throw away the model's
+      own, independently-estimated sigma. Real sports count data is
+      almost always overdispersed (sigma^2 > mu) - a receiver's real
+      target count varies more game to game than a pure Poisson would
+      predict - so negative binomial is the honest choice here. Falls
+      back to Poisson only in the rare case sigma^2 <= mu, where negative
+      binomial's parameterization breaks down.
+    - Continuous props (yardage, fantasy points): a real normal
+      distribution centered on mu with spread sigma, floored at 0 (a
+      real player can't post negative yards or negative fantasy points
+      in the vast majority of real scoring systems).
+
+    Returns a real list of n_simulations sampled values - same real
+    shape as MLB's simulate_matchup_n_times() per-prop series, so the
+    same downstream real_over_rate/gap-pct backtest logic can be reused.
+    """
+    rng = np.random.default_rng(random_state)
+    if sigma is None or np.isnan(sigma) or sigma <= 0 or mu is None or np.isnan(mu):
+        return []
+
+    # REAL BUG FIX - partial-game props (1q_rush_attempts, 1h_receptions,
+    # etc.) carry a real time-window prefix that doesn't literally match
+    # NFL_COUNT_PROPS/NFL_CONTINUOUS_PROPS (those sets only hold the
+    # unprefixed, full-game names) - without stripping it first, EVERY
+    # partial-game prop silently fell through to the continuous/normal
+    # branch, even genuine count stats like rush attempts or receptions.
+    # Strip any real "1q_"/"1h_" prefix before checking, so a partial-
+    # game count prop gets the same real negative-binomial treatment its
+    # full-game counterpart already gets.
+    base_prop_type = prop_type
+    for prefix in NFL_TIME_WINDOWS:
+        if prop_type.startswith(f"{prefix}_"):
+            base_prop_type = prop_type[len(prefix) + 1:]
+            break
+
+    if base_prop_type in NFL_COUNT_PROPS:
+        variance = sigma ** 2
+        # REAL BUG FIX - found by actually running against live 2025 data
+        # (a real player with mu=0.0 historically - e.g. never scored a
+        # real 1Q TD - but a nonzero sigma from rare/occasional events).
+        # r = mu^2/(variance-mu) correctly evaluates to 0 when mu=0, but
+        # p = r/(r+mu) then divides 0/0, a genuine ZeroDivisionError.
+        # mu<=0 is exactly the case Poisson already handles gracefully
+        # (numpy's rng.poisson(0) correctly returns all real zeros, no
+        # error), so route it there directly instead of attempting the
+        # negative binomial parameterization at all.
+        if mu > 0 and variance > mu:
+            # Real negative binomial matched to the model's own real mu/variance
+            r = mu ** 2 / (variance - mu)
+            p = r / (r + mu)
+            samples = rng.negative_binomial(r, p, size=n_simulations)
+        else:
+            # Real, honest fallback - either mu<=0 (handled correctly by
+            # Poisson even at exactly 0) or variance too low for negative
+            # binomial's parameterization to work
+            samples = rng.poisson(max(mu, 0), size=n_simulations)
+        return [max(0, int(v)) for v in samples]
+    else:
+        samples = rng.normal(mu, sigma, size=n_simulations)
+        return [max(0.0, round(float(v), 1)) for v in samples]
+
+
 def calc_quality_score(matchup_exploit_strength: float, sample_size_games: int,
                         coverage_confidence: float) -> float:
     """
@@ -4028,6 +4120,153 @@ def score_week_against_actuals(season: int, week: int, starters_only: bool = Tru
     return slate_df.drop(columns=["line", "p_over", "edge"], errors="ignore")
 
 
+def add_simulation_columns_to_backtest_rows(scored_df: pd.DataFrame, n_simulations: int = 1000) -> pd.DataFrame:
+    """
+    Real, additive layer on top of score_week_against_actuals()'s
+    already-real mu/sigma/actual columns - for every real row, runs the
+    1000-sample Monte Carlo (simulate_nfl_prop_n_times) and adds:
+
+      - sim_avg: the real, empirical average across the simulated samples
+        (should closely track mu itself - a real sanity check that the
+        simulation faithfully represents the model's own projection)
+      - hypothetical_line: same real fix as the MLB backtest - floor(mu)
+        + 0.5 for count props (guarantees a genuine .5 line, matching
+        real sportsbook convention, never a whole number); for
+        continuous yardage props, real sportsbook lines also almost
+        always sit at a .5 (e.g. 74.5 rec yards), so the same floor+0.5
+        convention is used there too.
+      - sim_rate: real, empirical % of the 1000 samples that cleared
+        hypothetical_line
+      - sim_cv: real coefficient of variation (sigma/mu) - how stable/
+        consistent this specific real projection is, same real signal
+        MLB's Stage 1 CV filter uses
+      - real_cleared_line: did the REAL, actual outcome clear
+        hypothetical_line - the real ground truth this all gets checked
+        against
+      - gap_pct: how far sim_avg sits from hypothetical_line, as a % of
+        the line itself - same real metric MLB's backtest buckets by
+
+    Returns a new DataFrame (doesn't mutate scored_df) with these columns
+    added - rows where mu/sigma/actual aren't usable are dropped rather
+    than filled with fake placeholder values.
+    """
+    import math
+    rows = []
+    for _, row in scored_df.iterrows():
+        mu, sigma, actual = row.get("mu"), row.get("sigma"), row.get("actual")
+        prop_type = row.get("prop_type")
+        if pd.isna(mu) or pd.isna(sigma) or pd.isna(actual) or sigma is None or sigma <= 0:
+            continue
+        samples = simulate_nfl_prop_n_times(mu, sigma, prop_type, n_simulations=n_simulations)
+        if not samples:
+            continue
+        sim_avg = sum(samples) / len(samples)
+        hypothetical_line = math.floor(sim_avg) + 0.5
+        sim_rate = round(sum(1 for v in samples if v > hypothetical_line) / len(samples) * 100, 1)
+        sim_cv = round(sigma / mu, 3) if mu > 0 else np.nan
+        real_cleared_line = actual > hypothetical_line
+        gap_pct = round(abs(sim_avg - hypothetical_line) / hypothetical_line * 100, 1) if hypothetical_line else 0.0
+
+        new_row = row.to_dict()
+        new_row.update({
+            "sim_avg": round(sim_avg, 2), "hypothetical_line": hypothetical_line,
+            "sim_rate": sim_rate, "sim_cv": sim_cv,
+            "real_cleared_line": real_cleared_line, "gap_pct": gap_pct,
+        })
+        rows.append(new_row)
+
+    return pd.DataFrame(rows)
+
+
+def build_season_simulation_backtest_report(season: int, weeks: list = None, through_week: int = 18,
+                                             coverage_bundle=None, rb_bundle=None,
+                                             n_simulations: int = 1000) -> dict:
+    """
+    Real, season-wide simulation backtest - runs score_week_against_
+    actuals() + add_simulation_columns_to_backtest_rows() across every
+    real, completed week of a season, then buckets every real row by
+    (prop_type, gap_pct range) to show the real hit-rate in each bucket.
+
+    Same real purpose as MLB's own backtest: answers "does a bigger real
+    gap between the simulation's average and a real, plausible line
+    actually predict a more reliable real outcome" - with real, evidence-
+    based numbers instead of a reasoned-but-unvalidated guess.
+
+    Real, honest limitation carried over from build_season_accuracy_
+    report: no free historical NFL player-prop-line archive exists, so
+    hypothetical_line is the model's own real mu (floored to the nearest
+    real .5), not an actual historical book line - same real, documented
+    tradeoff as the rest of this file's backtest tooling.
+
+    Split by prop_type from the start (not lumped together) - different
+    NFL props (receptions vs rush yards vs rush TDs) likely have
+    genuinely different real gap-pct behavior, the same real lesson
+    already learned building MLB's hitter-vs-pitcher backtest split.
+    """
+    if weeks is None:
+        weeks = get_completed_weeks_with_data(season, through_week)
+
+    all_sim_rows = []
+    for wk in weeks:
+        try:
+            wk_df = score_week_against_actuals(season, wk, starters_only=True,
+                                                coverage_bundle=coverage_bundle, rb_bundle=rb_bundle)
+            if wk_df.empty:
+                continue
+            sim_df = add_simulation_columns_to_backtest_rows(wk_df, n_simulations=n_simulations)
+            if not sim_df.empty:
+                sim_df["week"] = wk
+                all_sim_rows.append(sim_df)
+        except Exception as e:
+            print(f"Skipping week {wk} in simulation backtest: {e}")
+            continue
+
+    if not all_sim_rows:
+        return {"raw": pd.DataFrame(), "bucket_summary": pd.DataFrame()}
+
+    raw = pd.concat(all_sim_rows, ignore_index=True)
+
+    bins = [0, 5, 10, 15, 20, 30, 1000]
+    labels = ["0-5%", "5-10%", "10-15%", "15-20%", "20-30%", "30%+"]
+    raw["gap_bucket"] = pd.cut(raw["gap_pct"], bins=bins, labels=labels, right=False)
+    bucket_summary = raw.groupby(["prop_type", "gap_bucket"], observed=True).agg(
+        n=("real_cleared_line", "size"),
+        real_hit_rate=("real_cleared_line", "mean"),
+    ).reset_index()
+    bucket_summary["real_hit_rate"] = round(bucket_summary["real_hit_rate"] * 100, 1)
+
+    # Real, direct answer to "actual vs quality of mu" - buckets every
+    # real row by its own real quality_score tier (same 80-100/60-80/
+    # 40-60/<40 bands build_season_accuracy_report already uses) and
+    # shows the real mean absolute miss (|mu - actual|) and match_ratio
+    # in each tier - the real, correct accuracy metric here, NOT
+    # real_cleared_line. real_cleared_line tests whether the actual
+    # outcome landed above or below a line set at the model's OWN mean,
+    # which is structurally ~50% regardless of how accurate that mean
+    # actually is - it's the right metric for the gap_pct bucket
+    # question above, but the wrong one for checking quality_score
+    # itself. abs_miss/match_ratio (already computed by
+    # score_week_against_actuals) directly measures real prediction
+    # error, which is what actually answers "is quality_score earning
+    # its keep." If quality_score is doing its real job, the 80-100
+    # tier's mean abs_miss should sit meaningfully below the <40 tier's.
+    if "quality_score" in raw.columns and "abs_miss" in raw.columns:
+        q_bins = [0, 40, 60, 80, 101]
+        q_labels = ["<40", "40-60", "60-80", "80-100"]
+        raw["quality_tier"] = pd.cut(raw["quality_score"], bins=q_bins, labels=q_labels, right=False)
+        agg_kwargs = {"n": ("abs_miss", "size"), "mean_abs_miss": ("abs_miss", "mean")}
+        if "match_ratio" in raw.columns:
+            agg_kwargs["mean_match_ratio"] = ("match_ratio", "mean")
+        quality_tier_summary = raw.groupby("quality_tier", observed=True).agg(**agg_kwargs).reset_index()
+        quality_tier_summary["mean_abs_miss"] = round(quality_tier_summary["mean_abs_miss"], 2)
+        if "mean_match_ratio" in quality_tier_summary.columns:
+            quality_tier_summary["mean_match_ratio"] = round(quality_tier_summary["mean_match_ratio"], 2)
+    else:
+        quality_tier_summary = pd.DataFrame()
+
+    return {"raw": raw, "bucket_summary": bucket_summary, "quality_tier_summary": quality_tier_summary}
+
+
 def backtest_week(season: int, week: int, coverage_bundle=None, rb_bundle=None) -> pd.DataFrame:
     """
     Runs the scanner for a week that's already been played, then joins in
@@ -4512,6 +4751,219 @@ def build_longest_play_by_game(pbp_df: pd.DataFrame, position: str) -> pd.DataFr
     idx = sub.groupby([id_col, "season", "week"])["yards_gained"].idxmax()
     agg = sub.loc[idx, [id_col, "posteam", "season", "week", "yards_gained"]]
     return agg.rename(columns={id_col: "gsis_id", "posteam": "team", "yards_gained": "longest_play"})
+
+
+# Real time-window definitions for partial-game props - qtr is the
+# standard, stable nflverse pbp column for quarter number (1-4, 5=OT),
+# same real confidence category as receiver_player_id/rusher_player_id/
+# passer_player_id/yards_gained already used in build_longest_play_by_game
+# above - a long-standing, public, widely-used nflverse schema column,
+# not something guessed. Not yet used elsewhere in this specific
+# codebase before now, so this is real, new pbp usage - same honest
+# category as when longest-play props were first added.
+NFL_TIME_WINDOWS = {
+    "1q": {1},
+    "1h": {1, 2},
+}
+
+
+def build_partial_game_player_stats(pbp_df: pd.DataFrame, time_window: str) -> pd.DataFrame:
+    """
+    Real, independent partial-game stats (Option A - a genuinely separate
+    historical build for 1Q/1H props, not a fraction of the full-game
+    number) - aggregates real play-by-play data, filtered to only the
+    real plays that happened within time_window ("1q" or "1h"), into a
+    per-player, per-game DataFrame shaped exactly like player_stats_df
+    (same gsis_id/season/week/team keys) so it can be fed directly into
+    the EXISTING calc_prop_mu()/calc_player_sigma() without any changes
+    to either function - those are already generic over prop_column and
+    player_stats_df, so this just gives them a genuinely different real
+    data source to compute historical mu/sigma from.
+
+    Real columns produced (prefixed to avoid colliding with the real,
+    full-game player_stats_df columns of the same base name):
+      {window}_rush_attempts, {window}_rushing_yards, {window}_rushing_tds,
+      {window}_receptions, {window}_targets, {window}_receiving_yards,
+      {window}_receiving_tds, {window}_completions, {window}_attempts,
+      {window}_passing_yards, {window}_passing_tds,
+      {window}_longest_rush, {window}_longest_reception, {window}_longest_completion
+    plus gsis_id, team, season, week.
+
+    Raises a clear KeyError naming exactly which expected column is
+    missing, same defensive approach as build_longest_play_by_game,
+    rather than silently returning wrong/empty data on a real schema
+    mismatch.
+    """
+    time_window = time_window.lower()
+    if time_window not in NFL_TIME_WINDOWS:
+        raise ValueError(f"time_window must be one of {list(NFL_TIME_WINDOWS)}, got {time_window!r}")
+    quarters = NFL_TIME_WINDOWS[time_window]
+
+    required = {"qtr", "play_type", "season", "week", "posteam",
+                "rusher_player_id", "receiver_player_id", "passer_player_id",
+                "yards_gained", "complete_pass", "rush_touchdown", "pass_touchdown"}
+    missing = required - set(pbp_df.columns)
+    if missing:
+        raise KeyError(f"build_partial_game_player_stats: expected pbp columns not found: {missing}")
+
+    sub = pbp_df[pbp_df["qtr"].isin(quarters)].copy()
+    if sub.empty:
+        return pd.DataFrame(columns=["gsis_id", "team", "season", "week"])
+
+    game_keys = ["season", "week"]
+
+    def _agg_for_role(id_col, play_type, extra_mask=None):
+        rows = sub[sub["play_type"] == play_type].copy()
+        if extra_mask is not None:
+            rows = rows[extra_mask(rows)]
+        rows = rows.dropna(subset=[id_col])
+        return rows
+
+    # Rushing - real rush attempts, yards, TDs, longest, this time window only
+    rush_rows = _agg_for_role("rusher_player_id", "run")
+    rush_agg = rush_rows.groupby(["rusher_player_id", "posteam"] + game_keys).agg(
+        rush_attempts=("yards_gained", "size"),
+        rushing_yards=("yards_gained", "sum"),
+        rushing_tds=("rush_touchdown", "sum"),
+        longest_rush=("yards_gained", "max"),
+    ).reset_index().rename(columns={"rusher_player_id": "gsis_id", "posteam": "team"})
+
+    # Receiving - real targets (all pass plays with a real receiver),
+    # receptions (completions only), yards/TDs/longest from completions only
+    target_rows = _agg_for_role("receiver_player_id", "pass")
+    rec_rows = target_rows[target_rows["complete_pass"] == 1]
+    targets_agg = target_rows.groupby(["receiver_player_id", "posteam"] + game_keys).agg(
+        targets=("yards_gained", "size"),
+    ).reset_index().rename(columns={"receiver_player_id": "gsis_id", "posteam": "team"})
+    rec_agg = rec_rows.groupby(["receiver_player_id", "posteam"] + game_keys).agg(
+        receptions=("yards_gained", "size"),
+        receiving_yards=("yards_gained", "sum"),
+        receiving_tds=("pass_touchdown", "sum"),
+        longest_reception=("yards_gained", "max"),
+    ).reset_index().rename(columns={"receiver_player_id": "gsis_id", "posteam": "team"})
+
+    # Passing - real attempts (all pass plays with a real passer),
+    # completions/yards/TDs/longest from completions only
+    attempt_rows = _agg_for_role("passer_player_id", "pass")
+    comp_rows = attempt_rows[attempt_rows["complete_pass"] == 1]
+    attempts_agg = attempt_rows.groupby(["passer_player_id", "posteam"] + game_keys).agg(
+        attempts=("yards_gained", "size"),
+    ).reset_index().rename(columns={"passer_player_id": "gsis_id", "posteam": "team"})
+    comp_agg = comp_rows.groupby(["passer_player_id", "posteam"] + game_keys).agg(
+        completions=("yards_gained", "size"),
+        passing_yards=("yards_gained", "sum"),
+        passing_tds=("pass_touchdown", "sum"),
+        longest_completion=("yards_gained", "max"),
+    ).reset_index().rename(columns={"passer_player_id": "gsis_id", "posteam": "team"})
+
+    merge_keys = ["gsis_id", "team"] + game_keys
+    result = rush_agg
+    for other in (targets_agg, rec_agg, attempts_agg, comp_agg):
+        result = result.merge(other, on=merge_keys, how="outer")
+
+    prefix = f"{time_window}_"
+    rename_map = {c: prefix + c for c in result.columns if c not in merge_keys}
+    result = result.rename(columns=rename_map)
+    return result.fillna(0)
+
+
+# Real column-name mapping for partial-game props, same real shape as
+# score_week_against_actuals's own prop_to_stat_column - the left side is
+# what gets shown/scored as the "prop", the right side is the real
+# column build_partial_game_player_stats actually produces for it once
+# prefixed with the real time window ("1q_"/"1h_").
+# Real, deliberate narrowing (per direct feedback after the first real
+# live backtest run) - TD props and longest-play props dropped from the
+# 1Q/1H list specifically. TDs showed a real, honest problem in that
+# live run: a Q1/1H TD is rare enough that mu sits very close to 0
+# almost always, so even a tiny real difference produces a huge
+# percentage gap - the gap_pct metric stops being a meaningful signal
+# for a base rate that low. Volume/yardage props (rush, receiving) plus
+# passing volume (attempts/completions/yards - added back in after
+# request, TDs and longest-completion still excluded for the same
+# rare-event reason) are kept - full-game props (score_week_against_
+# actuals) are unaffected, this narrowing is specific to the
+# partial-game backtest only.
+NFL_PARTIAL_PROP_TO_STAT_SUFFIX = {
+    "rush_attempts": "rush_attempts", "rush_yards": "rushing_yards",
+    "receptions": "receptions", "targets": "targets", "rec_yards": "receiving_yards",
+    "pass_attempts": "attempts", "pass_completions": "completions", "pass_yards": "passing_yards",
+}
+
+
+
+def score_partial_game_week_against_actuals(season: int, week: int, time_window: str,
+                                             starters_only: bool = True) -> pd.DataFrame:
+    """
+    Real, independent 1Q/1H backtest scoring - same real shape and
+    purpose as score_week_against_actuals(), but for a real partial-game
+    time window (Option A: a genuinely separate historical build, not a
+    fraction of the full-game mu). For every real prop in
+    NFL_PARTIAL_PROP_TO_STAT_SUFFIX, computes mu/sigma from the player's
+    own real PAST games' partial-game stats (via the existing, unchanged
+    calc_prop_mu/calc_player_sigma - this just feeds them a genuinely
+    different real data source), then checks the real, actual partial-
+    game outcome for the target week.
+
+    Real, honest scope note: reuses calc_prop_mu/calc_player_sigma
+    exactly as built for full-game props, including their own real
+    shrinkage/recency-weighting logic - no separate tuning has been done
+    specifically for partial-game variance, which may genuinely behave
+    differently (a partial-game stat is inherently a smaller, choppier
+    sample than the full game it's drawn from). Worth watching once this
+    runs against real data.
+    """
+    time_window = time_window.lower()
+    if time_window not in NFL_TIME_WINDOWS:
+        raise ValueError(f"time_window must be one of {list(NFL_TIME_WINDOWS)}, got {time_window!r}")
+    prefix = f"{time_window}_"
+
+    pbp_df = pull_pbp([season])
+    partial_stats_df = build_partial_game_player_stats(pbp_df, time_window)
+    if partial_stats_df.empty:
+        return pd.DataFrame()
+
+    depth_charts_df = pull_depth_charts([season]) if nfl else pd.DataFrame()
+    schedules_df = pull_schedules([season])
+
+    actual_week_rows = partial_stats_df[
+        (partial_stats_df["season"] == season) & (partial_stats_df["week"] == week)
+    ].set_index("gsis_id")
+
+    if starters_only:
+        starter_ids = get_starters_for_week(season, week, depth_charts_df, schedules_df)
+        if starter_ids:
+            actual_week_rows = actual_week_rows[actual_week_rows.index.isin(starter_ids)]
+
+    rows = []
+    for gsis_id, arow in actual_week_rows.iterrows():
+        team = arow.get("team")
+        for prop_type, stat_suffix in NFL_PARTIAL_PROP_TO_STAT_SUFFIX.items():
+            stat_col = prefix + stat_suffix
+            if stat_col not in partial_stats_df.columns:
+                continue
+            actual = arow.get(stat_col)
+            # Same real participation filter as score_week_against_actuals -
+            # a real 0 in a volume/yardage prop essentially never happens
+            # for a real, active starter. TD/longest-play exemptions
+            # removed - this prop list is narrowed to volume/yardage
+            # props only now, so those cases no longer apply here.
+            if actual == 0:
+                continue
+            mu = calc_prop_mu(gsis_id, stat_col, partial_stats_df, season, week, current_team=team)
+            sigma = calc_player_sigma(gsis_id, stat_col, partial_stats_df, season, week, current_team=team)
+            if pd.isna(mu) or pd.isna(sigma):
+                continue
+            miss = mu - actual
+            rows.append({
+                "gsis_id": gsis_id, "team": team, "time_window": time_window,
+                "prop_type": f"{time_window}_{prop_type}", "mu": mu, "sigma": sigma,
+                "actual": actual, "miss": miss, "abs_miss": abs(miss),
+                "match_ratio": abs(miss) / sigma if sigma > 0 else np.nan,
+                "season": season, "week": week,
+            })
+
+    return pd.DataFrame(rows)
 
 
 def build_coverage_crossref_game_log(player_gsis_id: str, position: str,
