@@ -8,15 +8,53 @@ same workflow as the MLB tool's adjustable Best Edges table.
 import streamlit as st
 import pandas as pd
 import numpy as np
+import os
+import math
+import itertools
+import concurrent.futures
 from datetime import datetime
+
+# Real fix - the actual reported symptom ("loads for a bit then just stops
+# scanning, no error") is the signature of a hung network call, not a
+# crash: nflreadpy's underlying HTTP pulls don't have an explicit timeout
+# anywhere in this codebase, so one slow/stalled request can block the
+# entire week loop forever with nothing to show for it - no exception, no
+# progress movement, nothing. This wraps one unit of work (one week) in a
+# background thread with a hard wall-clock limit - if it doesn't finish in
+# time, the loop gives up on that week and moves to the next one instead
+# of hanging indefinitely.
+BT_PER_WEEK_TIMEOUT_SECONDS = 180
+
+
+def _run_with_timeout(fn, args, kwargs, timeout_seconds):
+    """
+    Runs fn(*args, **kwargs) in a background thread; returns (result, timed_out).
+    Real bug caught and fixed during testing (see the MLB tool's identical
+    fix) - using the executor as a context manager blocks on exit until
+    the hung thread actually finishes, defeating the entire timeout.
+    Managing the executor manually and calling shutdown(wait=False)
+    detaches the still-running thread instead of waiting for it.
+    """
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(fn, *args, **kwargs)
+    try:
+        result = future.result(timeout=timeout_seconds)
+        executor.shutdown(wait=False)
+        return result, False
+    except concurrent.futures.TimeoutError:
+        executor.shutdown(wait=False)
+        return None, True
 from nfl_model_combined import (
     scan_full_slate_nfl, rescore_quality_mu_row_nfl, backtest_week, build_season_accuracy_report,
     build_season_simulation_backtest_report, build_combined_readiness_and_simulation_report,
+    build_combined_report_from_raw, score_week_against_actuals,
     score_partial_game_week_against_actuals, add_simulation_columns_to_backtest_rows,
     diagnose_participation_data, get_player_matchup_explanation, diagnose_injuries_data,
     diagnose_alignment_data, pull_player_stats, pull_schedules, pull_pbp,
     build_coverage_crossref_game_log, diagnose_player_stats_for_game_log,
     build_longest_play_by_game, build_week_games_list,
+    build_team_offense, simulate_matchup_n_times, real_over_rate_from_simulation,
+    pull_rosters,
     # Real, merged in from coverage_matchup.py and rb_matchup.py (per direct
     # request, single-file consolidation matching the MLB tool's structure) -
     # both files' real content now lives directly inside nfl_model_combined.py.
@@ -1398,6 +1436,316 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
     if st.session_state.season_report is not None:
         st.divider()
         _render_season_report(st.session_state.season_report)
+
+    # ---------------------------------------------------------------
+    # Full Matchup Simulation - real, direct port of the MLB tool's
+    # section, using the full play-by-play game engine (simulate_one_game/
+    # simulate_matchup_n_times/build_team_offense) that already existed in
+    # nfl_model_combined.py but was never wired into any live UI before
+    # this. Two real, severe bugs were found and fixed getting this
+    # working: (1) build_team_offense only looked at CURRENT-season pbp to
+    # identify who the QB/top rushers/top targets even are, so week 1
+    # always produced a completely empty offense (confirmed directly:
+    # qb_gsis_id None, 0 rushers, 0 targets) - fixed with the same
+    # prior-season fallback pattern used throughout this session. (2) same
+    # cold-start class of bug already fixed in the advanced-metrics/grade
+    # builders.
+    # STATUS, stated plainly: mechanically verified against real data
+    # (produces sane, real stat-line distributions - confirmed directly,
+    # e.g. a real QB's simulated pass_yards/completions/attempts came back
+    # in a realistic range) but NOT YET backtested/calibrated for accuracy
+    # - same honest standard as everywhere else in this project.
+    #
+    # REAL DESIGN CHANGE (per direct request/pushback): quality_score and
+    # the simulation's own empirical read are two DIFFERENT signals - one
+    # answers "how much do I trust this projection's inputs" (data
+    # confidence), the other answers "how consistent/big is this specific
+    # edge across many random game outcomes" (real empirical
+    # variance/rate). They should NOT be blended into one number, but they
+    # SHOULD be shown side by side on the same row so you can actually
+    # cross-check them together, instead of living in two disconnected
+    # places. Both Stage 1 and Stage 2 now pull quality_score for the same
+    # (gsis_id, prop) via scan_full_slate_nfl (team-filtered to just this
+    # matchup's two teams, so it's a fast, small scan, not a full-league
+    # one) and show it as a real column - a genuinely "confirmed" play is
+    # one where BOTH signals agree (real quality_score AND a tight,
+    # consistent real simulated edge), not one where either is trusted
+    # alone.
+    # ---------------------------------------------------------------
+    st.divider()
+    st.header("🎮 Full Matchup Simulation")
+    st.caption(
+        "Real, full-game simulation (down-and-distance state machine, real "
+        "bootstrap-sampled outcomes from each player's own real play-by-play "
+        "history, tilted by the same real coverage/alignment/concept exploit "
+        "signals used elsewhere in this tool) - not a single formula's one "
+        "answer. Runs the whole game many times and shows the real, "
+        "empirical rate each player's props actually clear a real line, "
+        "with quality_score shown alongside for the same row so you can "
+        "cross-check both signals together rather than trusting either "
+        "alone."
+    )
+    st.caption(
+        "Honest status: mechanically verified against real data (produces "
+        "real, plausible stat-line distributions) but not yet backtested "
+        "for calibrated accuracy - treat Stage 1/2 results here as a real, "
+        "additional signal to weigh, not yet a fully proven one, until a "
+        "real backtest against completed games confirms it."
+    )
+
+    nfl_sim_season = st.number_input("Season", min_value=2020, max_value=2030,
+                                       value=datetime.now().year, step=1, key="nfl_sim_season")
+    nfl_sim_week = st.number_input("Week", min_value=1, max_value=18, value=1, step=1, key="nfl_sim_week")
+
+    if st.button("Load this week's real games", key="nfl_sim_load_games"):
+        try:
+            schedules_for_sim = pull_schedules([nfl_sim_season])
+            st.session_state.nfl_sim_games_df = build_week_games_list(nfl_sim_season, nfl_sim_week, schedules_for_sim)
+        except Exception as e:
+            st.error(f"Couldn't pull the real schedule: {e}")
+            st.session_state.nfl_sim_games_df = pd.DataFrame()
+
+    sim_games_df = st.session_state.get("nfl_sim_games_df")
+    if sim_games_df is None or sim_games_df.empty:
+        st.info("Click \"Load this week's real games\" above to pick a real matchup.")
+    else:
+        sim_game_label = st.selectbox("Pick a real game", sim_games_df["matchup"].tolist(), key="nfl_sim_game_select")
+        sim_row = sim_games_df[sim_games_df["matchup"] == sim_game_label].iloc[0]
+        sim_home, sim_away = sim_row["home_team"], sim_row["away_team"]
+
+        sim_n_games = st.slider("Number of simulated games", 100, 2000, 500, step=100, key="nfl_sim_n_games_slider",
+                                 help="500 is a reasonable balance of speed vs statistical tightness for this "
+                                      "engine's per-play bootstrap sampling - more takes longer with diminishing "
+                                      "real precision gains past this point.")
+
+        if st.button("Run full matchup simulation", key="nfl_sim_run_button"):
+            with st.spinner("Pulling real pbp/roster data and building both real offenses..."):
+                try:
+                    sim_pbp_df = pull_pbp([nfl_sim_season])
+                    sim_prior_pbp_df = pull_pbp([nfl_sim_season - 1])
+                    sim_rosters_df = pull_rosters([nfl_sim_season])
+                    sim_coverage_bundle = st.session_state.get("coverage_bundle")
+                    sim_rb_bundle = st.session_state.get("rb_bundle")
+
+                    home_offense = build_team_offense(
+                        sim_home, sim_away, nfl_sim_season, nfl_sim_week,
+                        sim_pbp_df, sim_prior_pbp_df, sim_rosters_df,
+                        coverage_bundle=sim_coverage_bundle, rb_bundle=sim_rb_bundle,
+                    )
+                    away_offense = build_team_offense(
+                        sim_away, sim_home, nfl_sim_season, nfl_sim_week,
+                        sim_pbp_df, sim_prior_pbp_df, sim_rosters_df,
+                        coverage_bundle=sim_coverage_bundle, rb_bundle=sim_rb_bundle,
+                    )
+
+                    if home_offense.qb_gsis_id is None or away_offense.qb_gsis_id is None:
+                        st.warning("Couldn't identify a real starting QB for one or both teams (even after the "
+                                   "prior-season fallback) - results below may be incomplete for that side.")
+
+                    name_lookup_df = sim_rosters_df[sim_rosters_df["season"] == nfl_sim_season][
+                        ["gsis_id", "full_name"]].drop_duplicates()
+                    name_lookup = name_lookup_df.set_index("gsis_id")["full_name"].to_dict()
+                except Exception as e:
+                    st.error(f"Couldn't build one or both real offenses: {e}")
+                    home_offense = away_offense = None
+
+            if home_offense is not None and away_offense is not None:
+                with st.spinner(f"Running {sim_n_games} real simulated games..."):
+                    try:
+                        sim_results = simulate_matchup_n_times(home_offense, away_offense, n_simulations=sim_n_games)
+                        st.session_state.nfl_sim_results = sim_results
+                        st.session_state.nfl_sim_name_lookup = name_lookup
+
+                        # Real, direct team tagging - every gsis_id that ended
+                        # up in either offense's pools gets tagged with its
+                        # real team, so Stage 1 can show it and a same-team
+                        # conflict check works for parlay building later.
+                        team_map = {}
+                        if home_offense.qb_gsis_id:
+                            team_map[home_offense.qb_gsis_id] = sim_home
+                        if away_offense.qb_gsis_id:
+                            team_map[away_offense.qb_gsis_id] = sim_away
+                        for gid, _ in home_offense.rushers:
+                            team_map[gid] = sim_home
+                        for gid, _ in home_offense.targets:
+                            team_map[gid] = sim_home
+                        for gid, _ in away_offense.rushers:
+                            team_map[gid] = sim_away
+                        for gid, _ in away_offense.targets:
+                            team_map[gid] = sim_away
+                        st.session_state.nfl_sim_team_lookup = team_map
+
+                        # Real fix (per direct request) - also run the real,
+                        # actual live scan for just these two teams
+                        # (team_filter keeps this fast - a 2-team scan, not a
+                        # full-league one) so quality_score is available to
+                        # cross-check against the simulation's own numbers,
+                        # instead of the two signals living in totally
+                        # separate, disconnected places.
+                        try:
+                            quality_slate = scan_full_slate_nfl(
+                                nfl_sim_season, nfl_sim_week,
+                                coverage_bundle=sim_coverage_bundle, rb_bundle=sim_rb_bundle,
+                                team_filter=[sim_home, sim_away],
+                            )
+                            quality_lookup = {}
+                            if not quality_slate.empty and "gsis_id" in quality_slate.columns:
+                                for _, qrow in quality_slate.iterrows():
+                                    quality_lookup[(qrow["gsis_id"], qrow["prop_type"])] = qrow.get("quality_score")
+                            st.session_state.nfl_sim_quality_lookup = quality_lookup
+                        except Exception as e:
+                            st.warning(f"Simulation ran, but pulling quality_score for cross-checking failed: {e} "
+                                       f"- Stage 1/2 below will show sim results without a quality_score column.")
+                            st.session_state.nfl_sim_quality_lookup = {}
+
+                        st.success(f"Ran {sim_n_games} real simulated games for {sim_away} @ {sim_home}.")
+                    except Exception as e:
+                        st.error(f"Simulation failed: {e}")
+
+        if st.session_state.get("nfl_sim_results"):
+            st.subheader("Enter each real line to check against the simulated games")
+            sim_results = st.session_state.nfl_sim_results
+            name_lookup = st.session_state.get("nfl_sim_name_lookup", {})
+            team_lookup = st.session_state.get("nfl_sim_team_lookup", {})
+            quality_lookup = st.session_state.get("nfl_sim_quality_lookup", {})
+
+            nfl_sim_props_wanted = st.multiselect(
+                "Which props to show",
+                ["pass_attempts", "pass_completions", "pass_yards", "pass_tds", "interceptions",
+                 "rush_attempts", "rush_yards", "rush_tds"],
+                default=["pass_yards", "rush_yards", "pass_tds"],
+                key="nfl_sim_props_multiselect",
+            )
+
+            if not nfl_sim_props_wanted:
+                st.info("Pick at least one prop above.")
+            else:
+                st.subheader("Stage 1 - who actually stayed great across the simulation")
+                st.caption(
+                    "No line needed yet. Ranks every real player against the rest of THIS matchup's "
+                    "own field (z-score) for real edge + consistency, with the real, live quality_score "
+                    "for that same (player, prop) shown alongside for cross-checking - not blended in, "
+                    "just visible together."
+                )
+                fcol1, fcol2, fcol3 = st.columns(3)
+                with fcol1:
+                    nfl_min_zscore = st.slider("Minimum edge (real std devs above this matchup's own field)",
+                                                0.0, 2.0, 0.3, step=0.1, key="nfl_sim_min_zscore")
+                with fcol2:
+                    nfl_max_cv = st.slider("Maximum coefficient of variation (lower = more consistent)",
+                                            0.1, 1.5, 0.7, step=0.05, key="nfl_sim_max_cv")
+                with fcol3:
+                    nfl_min_quality_for_flag = st.slider(
+                        "Quality_score bar for the \"confirmed\" flag", 0, 100, 70, step=5,
+                        key="nfl_sim_min_quality_flag",
+                        help="Doesn't filter anything out - just controls which rows get marked "
+                             "\"confirmed\" (real sim edge AND real quality_score both clearing their bars) "
+                             "in the table below.",
+                    )
+
+                stage1_rows = []
+                for gid, props in sim_results.items():
+                    player_name = name_lookup.get(gid, gid)
+                    team = team_lookup.get(gid, "?")
+                    for prop in nfl_sim_props_wanted:
+                        series = props.get(prop, [])
+                        if not series:
+                            continue
+                        avg = sum(series) / len(series)
+                        std = (sum((v - avg) ** 2 for v in series) / len(series)) ** 0.5
+                        cv = round(std / avg, 3) if avg else None
+                        q_score = quality_lookup.get((gid, prop))
+                        stage1_rows.append({"gsis_id": gid, "player": player_name, "team": team, "prop": prop,
+                                             "real_avg": round(avg, 2), "cv": cv, "quality_score": q_score})
+
+                stage1_df = pd.DataFrame(stage1_rows)
+                if stage1_df.empty:
+                    st.warning("No real data to rank yet.")
+                else:
+                    stage1_df["field_mean"] = stage1_df.groupby("prop")["real_avg"].transform("mean")
+                    stage1_df["field_std"] = stage1_df.groupby("prop")["real_avg"].transform("std").fillna(0.01)
+                    stage1_df["zscore"] = round((stage1_df["real_avg"] - stage1_df["field_mean"]) / stage1_df["field_std"], 2)
+
+                    survivors = stage1_df[
+                        (stage1_df["zscore"] >= nfl_min_zscore) & (stage1_df["cv"].fillna(99) <= nfl_max_cv)
+                    ].sort_values("zscore", ascending=False).copy()
+
+                    # Real, visible cross-check column - "confirmed" means
+                    # BOTH signals agree (real sim edge/consistency already
+                    # required to be a survivor here, AND a real quality_score
+                    # clearing the bar above) - this is the direct answer to
+                    # "how do we know a 70+ play is consistent": it's this
+                    # column, not a blended number.
+                    survivors["confirmed"] = survivors["quality_score"].apply(
+                        lambda q: "✅ both agree" if pd.notna(q) and q >= nfl_min_quality_for_flag else "sim only")
+
+                    st.dataframe(survivors[["player", "team", "prop", "real_avg", "cv", "zscore",
+                                             "quality_score", "confirmed"]], width='stretch')
+                    st.caption(f"{len(survivors)} of {len(stage1_df)} real (player, prop) combinations cleared "
+                               f"the sim's own edge/consistency bars. \"confirmed\" additionally requires real "
+                               f"quality_score >= {nfl_min_quality_for_flag} for that same row - a genuinely "
+                               f"cross-checked play, not just one signal trusted alone.")
+
+                    with st.expander(f"See all {len(stage1_df)} real (player, prop) combinations, unfiltered"):
+                        st.dataframe(stage1_df[["player", "team", "prop", "real_avg", "cv", "zscore", "quality_score"]]
+                                     .sort_values("zscore", ascending=False), width='stretch')
+
+                    if survivors.empty:
+                        st.info("Nothing cleared the bar - try lowering the sliders above, or this matchup "
+                                "genuinely doesn't have a standout edge tonight.")
+                    else:
+                        st.subheader("Stage 2 - enter each real line for the survivors above")
+
+                        def _round_half(x):
+                            return math.floor(x) + 0.5 if x is not None else 1.5
+
+                        base_rows = [{"gsis_id": r["gsis_id"], "player": r["player"], "team": r["team"],
+                                      "prop": r["prop"], "quality_score": r["quality_score"],
+                                      "your_line": _round_half(r["real_avg"])}
+                                     for _, r in survivors.iterrows()]
+                        base_df = pd.DataFrame(base_rows)
+                        edited_lines = st.data_editor(
+                            base_df, key="nfl_sim_lines_editor", width='stretch', hide_index=True,
+                            column_order=["player", "team", "prop", "quality_score", "your_line"],
+                            disabled=["gsis_id", "player", "team", "prop", "quality_score"],
+                            column_config={"your_line": st.column_config.NumberColumn("Real line (edit me)", step=0.5)},
+                        )
+
+                        # Real fix - joins back to sim_results by the REAL
+                        # gsis_id carried through from Stage 1, not a fragile
+                        # reverse name lookup (which would silently break for
+                        # any two players sharing a display name).
+                        result_rows = []
+                        for _, row in edited_lines.iterrows():
+                            gid = row["gsis_id"]
+                            series = sim_results.get(gid, {}).get(row["prop"], [])
+                            # Real bug fixed before delivery - real_over_rate_
+                            # from_simulation returns "mean", not "avg" - the
+                            # original draft of this section referenced "avg"
+                            # directly, which would have crashed the instant
+                            # anyone entered a line here. Confirmed the real
+                            # function signature before shipping this time.
+                            r = real_over_rate_from_simulation(series, row["your_line"])
+                            result_rows.append({"player": row["player"], "team": row["team"], "prop": row["prop"],
+                                                 "quality_score": row["quality_score"], "line": row["your_line"],
+                                                 "sim_avg": r["mean"], "over_rate_pct": round(r["over_rate"] * 100, 1),
+                                                 "n_simulations": r["n"]})
+
+                        result_df = pd.DataFrame(result_rows).sort_values("over_rate_pct", ascending=False, na_position="last")
+                        result_df["under_rate_pct"] = round(100 - result_df["over_rate_pct"], 1)
+                        result_df["lean"] = result_df["over_rate_pct"].apply(
+                            lambda v: "OVER" if v > 50 else ("UNDER" if v < 50 else "COIN FLIP"))
+                        result_df["confirmed"] = result_df["quality_score"].apply(
+                            lambda q: "✅ both agree" if pd.notna(q) and q >= nfl_min_quality_for_flag else "sim only")
+                        st.dataframe(
+                            result_df[["player", "team", "prop", "quality_score", "line", "sim_avg",
+                                       "over_rate_pct", "under_rate_pct", "lean", "confirmed"]],
+                            width='stretch')
+                        st.caption("over_rate_pct is the real, empirical rate across the simulated games - "
+                                   "'over in 78 of 100', not a formula's single calculated probability. "
+                                   "\"confirmed\" means this row's real quality_score also clears the bar set "
+                                   f"above ({nfl_min_quality_for_flag}) - the real, visible cross-check between "
+                                   "the two signals.")
 
 elif mode == "Coverage Matchup (premium data)":
     st.subheader("Coverage Matchup — Premium FantasyPoints Data")
@@ -4733,6 +5081,45 @@ if mode == "Season Backtest":
                  "genuinely produces more reliable results. 0 runs every real row, "
                  "unchanged from the default.",
         )
+    # Real fix - this used to be ONE blocking call across the whole week
+    # range (build_combined_readiness_and_simulation_report), holding
+    # every week's scored rows in memory until the entire range finished,
+    # then only writing session_state at the very end. Real-world use
+    # showed weeks 1-7 "won't load" - the app was actually hitting
+    # Streamlit Community Cloud's free-tier memory ceiling mid-run
+    # (each week takes ~90-100+ real seconds and scoring several weeks'
+    # worth of full slates plus a 1000-sample simulation at the end is
+    # genuinely heavy) and getting silently restarted, which wipes
+    # session_state completely with zero warning. Same root cause and
+    # same fix pattern as the MLB tool's backtest: score ONE week at a
+    # time, save that week's raw rows to disk the instant it finishes,
+    # and skip any week already saved so a restart only costs whatever
+    # week was actually in flight - not the whole range.
+    NFL_BT_RESULTS_FILE = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), f"nfl_bt_raw_{bt_season}.csv")
+
+    if "nfl_bt_raw" not in st.session_state or st.session_state.get("nfl_bt_raw_season") != bt_season:
+        if os.path.exists(NFL_BT_RESULTS_FILE):
+            try:
+                st.session_state.nfl_bt_raw = pd.read_csv(NFL_BT_RESULTS_FILE)
+            except Exception:
+                st.session_state.nfl_bt_raw = pd.DataFrame()
+        else:
+            st.session_state.nfl_bt_raw = pd.DataFrame()
+        st.session_state.nfl_bt_raw_season = bt_season
+
+    st.caption(
+        "Results save to disk, per real week, the moment each week finishes - "
+        "if the app restarts mid-run (this platform's free tier can do that "
+        "under memory pressure on a long range), just click Run again with "
+        "the same season/week range and it'll only process the weeks not "
+        "already saved. Note: a saved week reflects whatever QB-coverage/RB-"
+        "concept toggle state was active when IT was scored - if you change "
+        "a toggle, clear the accumulated data below before re-running, or "
+        "you'll get a real mix of old-toggle and new-toggle weeks with no "
+        "warning which is which."
+    )
+
     if st.button("Run combined backtest for this week range", type="secondary"):
         if report_end_week < report_start_week:
             st.error("End week must be >= start week.")
@@ -4750,30 +5137,114 @@ if mode == "Season Backtest":
             _nfl_module.ENABLE_QB_COVERAGE_IN_QUALITY_SCORE = toggle_qb_coverage
             _nfl_module.ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE = toggle_run_concept
             weeks_to_run = list(range(report_start_week, report_end_week + 1))
-            with st.spinner(f"Scoring + simulating weeks {report_start_week}-{report_end_week} "
-                             f"of {bt_season} against real results..."):
-                try:
-                    st.session_state.combined_report = build_combined_readiness_and_simulation_report(
-                        bt_season, weeks=weeks_to_run,
-                        coverage_bundle=st.session_state.get("coverage_bundle"),
-                        rb_bundle=st.session_state.get("rb_bundle"),
-                        n_simulations=int(sim_n),
-                        min_quality_score=combined_min_quality if combined_min_quality > 0 else None,
-                    )
-                    n_rows = len(st.session_state.combined_report["raw"])
-                    st.session_state.backtest_mode = True
-                    st.success(f"Scored {n_rows} real rows across weeks {report_start_week}-"
-                               f"{report_end_week} of {bt_season}.")
-                except Exception as e:
-                    st.error(f"Combined backtest failed: {e}")
-                    st.session_state.combined_report = None
-                finally:
-                    # Real, guaranteed reset - runs whether the backtest
-                    # succeeded or failed, so a toggle used for one real test
-                    # never silently stays flipped for anything that runs
-                    # later in the same session.
-                    _nfl_module.ENABLE_QB_COVERAGE_IN_QUALITY_SCORE = _prior_qb_coverage
-                    _nfl_module.ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE = _prior_run_concept
+
+            already_done_weeks = set()
+            if not st.session_state.nfl_bt_raw.empty and "week" in st.session_state.nfl_bt_raw.columns:
+                already_done_weeks = set(st.session_state.nfl_bt_raw["week"].dropna().astype(int).tolist())
+            weeks_remaining = [w for w in weeks_to_run if w not in already_done_weeks]
+            skipped = len(weeks_to_run) - len(weeks_remaining)
+
+            try:
+                if not weeks_remaining:
+                    st.info(f"All {len(weeks_to_run)} week(s) in this range are already saved from a "
+                             f"prior run - nothing new to score. Clear the accumulated data below if "
+                             f"you want to re-run them (e.g. after changing a toggle).")
+                else:
+                    if skipped:
+                        st.info(f"Skipping {skipped} week(s) already saved from a prior run - "
+                                 f"scoring the remaining {len(weeks_remaining)}.")
+                    progress = st.progress(0.0, text="Starting...")
+                    total_new_rows = 0
+                    timed_out_weeks = []
+                    for i, wk in enumerate(weeks_remaining):
+                        # Real fix - hard timeout per week. A hung
+                        # nflreadpy/network pull used to freeze the WHOLE
+                        # remaining run with no error shown at all - this
+                        # gives up on just this one week after
+                        # BT_PER_WEEK_TIMEOUT_SECONDS and keeps going, so a
+                        # single bad week doesn't take the rest of the range
+                        # down with it.
+                        try:
+                            wk_df, timed_out = _run_with_timeout(
+                                score_week_against_actuals,
+                                (bt_season, wk),
+                                {"starters_only": True,
+                                 "coverage_bundle": st.session_state.get("coverage_bundle"),
+                                 "rb_bundle": st.session_state.get("rb_bundle")},
+                                BT_PER_WEEK_TIMEOUT_SECONDS,
+                            )
+                        except Exception as e:
+                            st.warning(f"Week {wk} failed to score, skipped: {e}")
+                            wk_df, timed_out = pd.DataFrame(), False
+
+                        if timed_out:
+                            timed_out_weeks.append(wk)
+                            wk_df = pd.DataFrame()
+
+                        # Real fix - save THIS week's rows to session_state
+                        # AND disk immediately, right after it finishes,
+                        # instead of waiting for every requested week to
+                        # complete. session_state alone only protects a
+                        # rerun within the same session (tab switches) - the
+                        # disk file is what survives the app process itself
+                        # restarting, which wipes session_state completely.
+                        if not wk_df.empty:
+                            if st.session_state.nfl_bt_raw.empty:
+                                st.session_state.nfl_bt_raw = wk_df
+                            else:
+                                st.session_state.nfl_bt_raw = pd.concat(
+                                    [st.session_state.nfl_bt_raw, wk_df], ignore_index=True)
+                            file_exists = os.path.exists(NFL_BT_RESULTS_FILE)
+                            wk_df.to_csv(NFL_BT_RESULTS_FILE, mode="a", header=not file_exists, index=False)
+                            total_new_rows += len(wk_df)
+
+                        progress.progress((i + 1) / len(weeks_remaining),
+                                           text=f"Scored {i+1}/{len(weeks_remaining)} weeks "
+                                                f"({total_new_rows} real rows saved so far"
+                                                + (f", {len(timed_out_weeks)} timed out" if timed_out_weeks else "")
+                                                + ")...")
+                    progress.empty()
+
+                    if timed_out_weeks:
+                        st.warning(f"Week(s) {timed_out_weeks} took longer than "
+                                   f"{BT_PER_WEEK_TIMEOUT_SECONDS}s to pull/score and were skipped instead "
+                                   f"of freezing the whole run - this is what was previously showing as "
+                                   f"'stops scanning' with no error. Click Run again to retry just these "
+                                   f"weeks (everything else stays saved).")
+
+                    st.success(f"Scored {total_new_rows} new real rows this run - "
+                               f"{len(st.session_state.nfl_bt_raw)} total accumulated for "
+                               f"season {bt_season}.")
+
+                # Real, cheap step - rebuilds every summary table from
+                # whatever's accumulated in session_state right now, even if
+                # this run only added a few weeks or got cut short. Doesn't
+                # require every requested week to be present - a partial
+                # range still produces a real, usable report instead of
+                # nothing until the full range finishes.
+                st.session_state.combined_report = build_combined_report_from_raw(
+                    st.session_state.nfl_bt_raw,
+                    n_simulations=int(sim_n),
+                    min_quality_score=combined_min_quality if combined_min_quality > 0 else None,
+                )
+                st.session_state.backtest_mode = True
+            except Exception as e:
+                st.error(f"Combined backtest failed: {e}")
+            finally:
+                # Real, guaranteed reset - runs whether the backtest
+                # succeeded or failed, so a toggle used for one real test
+                # never silently stays flipped for anything that runs
+                # later in the same session.
+                _nfl_module.ENABLE_QB_COVERAGE_IN_QUALITY_SCORE = _prior_qb_coverage
+                _nfl_module.ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE = _prior_run_concept
+
+    if st.session_state.get("nfl_bt_raw") is not None and not st.session_state.nfl_bt_raw.empty:
+        if st.button("Clear accumulated backtest data for this season", key="nfl_bt_clear_button"):
+            st.session_state.nfl_bt_raw = pd.DataFrame()
+            st.session_state.combined_report = None
+            if os.path.exists(NFL_BT_RESULTS_FILE):
+                os.remove(NFL_BT_RESULTS_FILE)
+            st.rerun()
 
     if st.session_state.get("combined_report") is not None and not st.session_state.combined_report["raw"].empty:
         creport = st.session_state.combined_report
