@@ -1647,7 +1647,9 @@ def calc_quality_score(matchup_exploit_strength: float, sample_size_games: int,
 
 def build_player_full_coverage_efficiency(player_gsis_id: str, role: str,
                                            participation_df: pd.DataFrame, pbp_df: pd.DataFrame,
-                                           min_plays_per_type: int = 8) -> dict:
+                                           min_plays_per_type: int = 8,
+                                           prior_participation_df: pd.DataFrame = None,
+                                           prior_pbp_df: pd.DataFrame = None) -> dict:
     """
     Real per-player efficiency (yards/play) split across EVERY charted
     coverage type (Cover 0/1/2/3/4/6/9, 2-Man, Combo, etc.), not just
@@ -1660,11 +1662,17 @@ def build_player_full_coverage_efficiency(player_gsis_id: str, role: str,
     sample - see calc_full_coverage_adjusted_mu for how the fallback
     then correctly relies on whichever 2-3 real coverages ARE reliable.
 
-    Returns {coverage_type: {"ypp": float, "n_plays": int}, ...} for
-    types clearing min_plays_per_type, plus "overall_ypp"/"overall_plays"
-    keys holding this player's real overall average across every play
-    regardless of coverage type (the baseline the multiplier compares
-    against).
+    REAL FIX - same bug/fix as the offense/defense grade builders above:
+    week 1 (zero current-season plays) always returned an empty result
+    ("overall_plays": 0), meaning THIS is exactly the mechanism that
+    can't yet show "how does Drake Maye do vs Cover 2/4/6" or "how did
+    AJ Brown/Doubs do vs those coverages" in week 1 - the real per-
+    coverage-type splits from all of last season are the fix, and are
+    now used automatically when the current season has nothing yet.
+    Note: this function itself stays gated off live by
+    ENABLE_FULL_COVERAGE_MU_ADJUSTMENT (False) pending its own isolated
+    backtest, per this project's established one-flag-at-a-time rollout
+    discipline - this fix makes it READY to test properly, not live yet.
     """
     merged = participation_df.merge(
         pbp_df[["game_id", "play_id", "defteam", "posteam",
@@ -1677,6 +1685,19 @@ def build_player_full_coverage_efficiency(player_gsis_id: str, role: str,
     player_plays = merged[
         (merged[player_col] == player_gsis_id) & merged["defense_coverage_type"].notna()
     ]
+
+    if player_plays.empty and prior_participation_df is not None and prior_pbp_df is not None \
+            and not prior_participation_df.empty and not prior_pbp_df.empty:
+        prior_merged = prior_participation_df.merge(
+            prior_pbp_df[["game_id", "play_id", "defteam", "posteam",
+                           "receiver_player_id", "receiving_yards",
+                           "passer_player_id", "passing_yards"]],
+            left_on=["nflverse_game_id", "play_id"], right_on=["game_id", "play_id"], how="left",
+        )
+        player_plays = prior_merged[
+            (prior_merged[player_col] == player_gsis_id) & prior_merged["defense_coverage_type"].notna()
+        ]
+
     if player_plays.empty:
         return {"overall_ypp": np.nan, "overall_plays": 0}
 
@@ -1961,7 +1982,9 @@ def calc_percentile_grade(value: float, comparison_series: pd.Series) -> float:
 
 def build_qb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFrame,
                                ngs_pass_df: pd.DataFrame, participation_df: pd.DataFrame,
-                               pbp_df: pd.DataFrame, pass_explosive_df: pd.DataFrame = None) -> pd.DataFrame:
+                               pbp_df: pd.DataFrame, pass_explosive_df: pd.DataFrame = None,
+                               prior_ngs_pass_df: pd.DataFrame = None,
+                               prior_pbp_df: pd.DataFrame = None) -> pd.DataFrame:
     """
     QB advanced metrics: EPA/play, CPOE, success rate, passer_rating, aDOT,
     aggressiveness, air-EPA vs YAC-EPA split, pressure rate faced, and
@@ -1972,11 +1995,35 @@ def build_qb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFr
     versa, so this isn't redundant with aDOT.
     Uses weeks BEFORE the target week only (same leak-avoidance as mu).
     Each metric gets a 0-100 percentile grade against this season's QBs.
+
+    REAL FIX (found live this session, same bug class as the longest-play/
+    role-trend prior-season bridges already built elsewhere in this file):
+    week 1 (and, less severely, early weeks generally) has ZERO weeks of
+    current-season history, so hist_stats/hist_ngs/hist_pbp were ALWAYS
+    empty and this function ALWAYS returned pd.DataFrame() - meaning
+    calc_grade_matchup_strength had literally nothing to work with, no
+    matter how good or bad the real matchup was, which is the actual
+    reason quality_score structurally couldn't clear ~65 in week 1
+    (confirmed directly against real 2025 data: 44 columns/max 64.8 in
+    week 1 vs 124 columns/max 82.1 in week 2, the exact moment this data
+    stops being empty). The prior-season data needed to fix this was
+    ALREADY being pulled in build_weekly_slate for the role_trend/longest-
+    play bridges (prior_ngs_pass_df, prior_pbp_df) - just never threaded
+    into this function. Now falls back to the full prior season (all
+    weeks, same no-week-filter convention the longest-play bridge already
+    uses, since week numbers reset each season) whenever the current
+    season's own history is empty. player_stats_df already carries BOTH
+    seasons (pulled as pull_player_stats([season, season - 1]) at the
+    call site) so no new param was needed there - just a filter fix.
     """
     hist_stats = player_stats_df[
         (player_stats_df["season"] == season) & (player_stats_df["week"] < week)
         & (player_stats_df["position"] == "QB")
     ]
+    if hist_stats.empty:
+        hist_stats = player_stats_df[
+            (player_stats_df["season"] == season - 1) & (player_stats_df["position"] == "QB")
+        ]
     if hist_stats.empty:
         return pd.DataFrame()
 
@@ -1987,6 +2034,8 @@ def build_qb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFr
     ).reset_index()
 
     hist_ngs = ngs_pass_df[(ngs_pass_df["season"] == season) & (ngs_pass_df["week"] < week)]
+    if hist_ngs.empty and prior_ngs_pass_df is not None and not prior_ngs_pass_df.empty:
+        hist_ngs = prior_ngs_pass_df[prior_ngs_pass_df["season"] == season - 1]
     ngs_agg = hist_ngs.groupby("player_gsis_id").agg(
         cpoe=("completion_percentage_above_expectation", "mean"),
         adot=("avg_intended_air_yards", "mean"),
@@ -1995,6 +2044,8 @@ def build_qb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFr
     ).reset_index().rename(columns={"player_gsis_id": "gsis_id"})
 
     hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week) & (pbp_df["play_type"] == "pass")]
+    if hist_pbp.empty and prior_pbp_df is not None and not prior_pbp_df.empty:
+        hist_pbp = prior_pbp_df[(prior_pbp_df["season"] == season - 1) & (prior_pbp_df["play_type"] == "pass")]
     pbp_agg = hist_pbp.groupby("passer_player_id").agg(
         success_rate=("success", "mean"),
         air_epa=("air_epa", "mean"),
@@ -2018,7 +2069,8 @@ def build_qb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFr
 
 
 def build_receiver_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFrame,
-                                     ngs_rec_df: pd.DataFrame, rec_explosive_df: pd.DataFrame = None) -> pd.DataFrame:
+                                     ngs_rec_df: pd.DataFrame, rec_explosive_df: pd.DataFrame = None,
+                                     prior_ngs_rec_df: pd.DataFrame = None) -> pd.DataFrame:
     """
     WR/TE advanced metrics: target_share, air_yards_share, wopr, racr,
     receiving_epa (season-aggregated, already in player_stats), separation,
@@ -2033,11 +2085,26 @@ def build_receiver_advanced_metrics(season: int, week: int, player_stats_df: pd.
     than being a raw counting number that a short-target slot receiver and
     a deep-threat receiver can't be fairly compared on. Adding raw YAC/YPR
     alongside it would be redundant, not additive.
+
+    REAL FIX - same bug/fix as build_qb_advanced_metrics: week 1 (zero
+    current-season history) always returned pd.DataFrame() empty, meaning
+    a WR/TE's own real skill grade (separation, catch%, aDOT-independent
+    efficiency) simply didn't exist yet for the grade-based crosswalk to
+    use - directly the AJ Brown/Doubs gap flagged live: their real 2025
+    NGS separation/catch%/target-share profile should inform week 1 of
+    2026, not go unused just because 2026 itself hasn't accumulated games
+    yet. Falls back to the full prior season (all weeks) when current-
+    season history is empty, same as the QB version.
     """
     hist_stats = player_stats_df[
         (player_stats_df["season"] == season) & (player_stats_df["week"] < week)
         & (player_stats_df["position"].isin(["WR", "TE", "RB"]))
     ]
+    if hist_stats.empty:
+        hist_stats = player_stats_df[
+            (player_stats_df["season"] == season - 1)
+            & (player_stats_df["position"].isin(["WR", "TE", "RB"]))
+        ]
     if hist_stats.empty:
         return pd.DataFrame()
 
@@ -2050,6 +2117,8 @@ def build_receiver_advanced_metrics(season: int, week: int, player_stats_df: pd.
     ).reset_index()
 
     hist_ngs = ngs_rec_df[(ngs_rec_df["season"] == season) & (ngs_rec_df["week"] < week)]
+    if hist_ngs.empty and prior_ngs_rec_df is not None and not prior_ngs_rec_df.empty:
+        hist_ngs = prior_ngs_rec_df[prior_ngs_rec_df["season"] == season - 1]
     ngs_agg = hist_ngs.groupby("player_gsis_id").agg(
         avg_separation=("avg_separation", "mean"),
         avg_cushion=("avg_cushion", "mean"),
@@ -2074,7 +2143,8 @@ def build_receiver_advanced_metrics(season: int, week: int, player_stats_df: pd.
 
 
 def build_rb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFrame,
-                               ngs_rush_df: pd.DataFrame, rush_explosive_df: pd.DataFrame = None) -> pd.DataFrame:
+                               ngs_rush_df: pd.DataFrame, rush_explosive_df: pd.DataFrame = None,
+                               prior_ngs_rush_df: pd.DataFrame = None) -> pd.DataFrame:
     """
     RB advanced metrics: rushing_epa (season-aggregated), rush_yards_over_
     expected_per_att, efficiency, avg_time_to_los, percent_attempts_gte_
@@ -2083,11 +2153,19 @@ def build_rb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFr
     "breakaway run" tendency signal, distinct from efficiency (average
     per-carry value): a between-the-tackles grinder can have strong
     efficiency with almost no explosive runs, or vice versa.
+
+    REAL FIX - same bug/fix as build_qb_advanced_metrics: falls back to
+    the full prior season (all weeks) when current-season history is
+    empty (week 1 always was, structurally), instead of returning nothing.
     """
     hist_stats = player_stats_df[
         (player_stats_df["season"] == season) & (player_stats_df["week"] < week)
         & (player_stats_df["position"] == "RB")
     ]
+    if hist_stats.empty:
+        hist_stats = player_stats_df[
+            (player_stats_df["season"] == season - 1) & (player_stats_df["position"] == "RB")
+        ]
     if hist_stats.empty:
         return pd.DataFrame()
 
@@ -2096,6 +2174,8 @@ def build_rb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFr
     ).reset_index()
 
     hist_ngs = ngs_rush_df[(ngs_rush_df["season"] == season) & (ngs_rush_df["week"] < week)]
+    if hist_ngs.empty and prior_ngs_rush_df is not None and not prior_ngs_rush_df.empty:
+        hist_ngs = prior_ngs_rush_df[prior_ngs_rush_df["season"] == season - 1]
     ngs_agg = hist_ngs.groupby("player_gsis_id").agg(
         rush_yards_over_expected_per_att=("rush_yards_over_expected_per_att", "mean"),
         efficiency=("efficiency", "mean"),
@@ -2213,7 +2293,9 @@ def build_defense_explosive_allowed(pbp_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_defense_advanced_metrics(season: int, week: int, pbp_df: pd.DataFrame,
-                                    participation_df: pd.DataFrame) -> pd.DataFrame:
+                                    participation_df: pd.DataFrame,
+                                    prior_pbp_df: pd.DataFrame = None,
+                                    prior_participation_df: pd.DataFrame = None) -> pd.DataFrame:
     """
     DEF advanced metrics: EPA allowed per play, split pass defense vs run
     defense - this is the real free equivalent of DVOA (DVOA itself is
@@ -2221,8 +2303,21 @@ def build_defense_advanced_metrics(season: int, week: int, pbp_df: pd.DataFrame,
     success rate allowed, pressure rate generated, and explosive-play-
     allowed rate (pass + run, via build_defense_explosive_allowed) - the
     big-play-specific signal EPA's average alone doesn't isolate.
+
+    REAL FIX - same bug/fix as the offense-side builders above: this is
+    literally the "how much does Seattle allow real QB/WR production"
+    side of the matchup, and it was returning pd.DataFrame() empty in
+    week 1 for the exact same reason (zero current-season history) -
+    meaning def_grades in calc_grade_matchup_strength had nothing either,
+    so BOTH sides of a matchup were structurally blank in week 1, not
+    just the offensive player's own grade. Falls back to the full prior
+    season (all weeks) when current-season history is empty.
     """
     hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)]
+    used_prior = False
+    if hist_pbp.empty and prior_pbp_df is not None and not prior_pbp_df.empty:
+        hist_pbp = prior_pbp_df[prior_pbp_df["season"] == season - 1]
+        used_prior = True
     if hist_pbp.empty:
         return pd.DataFrame()
 
@@ -2240,7 +2335,13 @@ def build_defense_advanced_metrics(season: int, week: int, pbp_df: pd.DataFrame,
 
     merged = pass_def.merge(run_def, on="defteam", how="outer")
 
-    hist_participation = participation_df.merge(
+    # Real fix - the participation join needs to use the SAME season's
+    # participation table as whichever pbp we actually ended up using
+    # above (current or prior-season fallback), or the game_id/play_id
+    # join keys won't match anything and pressure_rate_generated silently
+    # comes back empty even when hist_pbp itself has real prior-season data.
+    participation_to_use = prior_participation_df if (used_prior and prior_participation_df is not None) else participation_df
+    hist_participation = participation_to_use.merge(
         hist_pbp[["game_id", "play_id", "defteam"]],
         left_on=["nflverse_game_id", "play_id"], right_on=["game_id", "play_id"], how="inner",
     )
@@ -2701,7 +2802,9 @@ def calc_role_verification_score(role_trend: dict, min_games: int = 2) -> float:
 def calc_blended_matchup_strength(structural_exploit: float, grade_exploit: float,
                                    role_verification_score: float,
                                    structural_weight: float = 0.5,
-                                   matchup_weight: float = 0.15) -> float:
+                                   matchup_weight: float = 0.15,
+                                   role_is_bridged: bool = False,
+                                   bridged_matchup_weight: float = 0.4) -> float:
     """
     Combines the structural tendency signal (coverage-elevation or
     box-count exploit strength, 0-1) with the grade-based crosswalk signal
@@ -2742,6 +2845,27 @@ def calc_blended_matchup_strength(structural_exploit: float, grade_exploit: floa
     reweights across whatever IS available; a completely absent matchup
     signal falls back to neutral (0.5) rather than zeroing the whole score
     out.
+
+    ISOLATED BRIDGED-MODE OVERRIDE (added live this session, real gap
+    found via direct testing): the 0.15/0.85 weighting above was validated
+    on a backtest where role_verification_score almost always had genuine
+    current-season data behind it (most of a season's weeks do). It was
+    NEVER validated for the specific week-1-style edge case where role_
+    verification is bridged from prior-season data and damped to a 0.75
+    ceiling (calc_role_verification_score) - in that exact case, real
+    testing showed quality_score stayed capped near 65 even AFTER fixing
+    the grade/coverage builders to use real prior-season data (build_qb_
+    advanced_metrics etc.), because the now-real grade signal only carries
+    15% of the blend. role_is_bridged=True switches to bridged_matchup_
+    weight (0.4, giving genuinely-real prior-season grade/coverage data
+    more say than a damped placeholder) ONLY in that specific case -
+    every other week's calls pass role_is_bridged=False and get the
+    exact same validated 0.15/0.85 split as before, completely untouched.
+    HONEST CAVEAT: 0.4 is a reasoned starting point for this one edge
+    case, not itself backtested yet (there's no free way to backtest
+    "week 1 of a season that hasn't been played" against real outcomes
+    ahead of time) - re-evaluate once real 2026 week 1 results come in,
+    the same real-evidence discipline used for every other reweight here.
     """
     parts = [(structural_exploit, structural_weight), (grade_exploit, 1 - structural_weight)]
     valid = [(v, w) for v, w in parts if pd.notna(v)]
@@ -2753,7 +2877,8 @@ def calc_blended_matchup_strength(structural_exploit: float, grade_exploit: floa
 
     if pd.isna(role_verification_score):
         return round(matchup_signal, 3)
-    return round(matchup_signal * matchup_weight + role_verification_score * (1 - matchup_weight), 3)
+    effective_matchup_weight = bridged_matchup_weight if role_is_bridged else matchup_weight
+    return round(matchup_signal * effective_matchup_weight + role_verification_score * (1 - effective_matchup_weight), 3)
 
 
 def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=None,
@@ -2847,6 +2972,11 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
     # both seasons above), so no extra pull needed for that one.
     prior_ngs_pass_df = pull_ngs("passing", [season - 1])
     prior_ngs_rush_df = pull_ngs("rushing", [season - 1])
+    # Real fix - prior_ngs_rec_df was never pulled at all (only pass/rush
+    # prior-season NGS existed), so build_receiver_advanced_metrics had no
+    # prior-season NGS source to fall back to even after being given the
+    # capability to use one - this is the actual AJ Brown/Doubs gap.
+    prior_ngs_rec_df = pull_ngs("receiving", [season - 1])
 
     # Per-game longest-play tables for the longest_completion/
     # longest_reception/longest_rush props (see build_longest_play_by_game).
@@ -2900,16 +3030,22 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
     qb_metrics = build_qb_advanced_metrics(
         season, week, player_stats_df, ngs_pass_df, participation_df, pbp_history_df,
         pass_explosive_df=explosive_rates["pass_explosive"],
+        prior_ngs_pass_df=prior_ngs_pass_df, prior_pbp_df=prior_pbp_df,
     )
     rec_metrics = build_receiver_advanced_metrics(
         season, week, player_stats_df, ngs_rec_df,
         rec_explosive_df=explosive_rates["rec_explosive"],
+        prior_ngs_rec_df=prior_ngs_rec_df,
     )
     rb_metrics = build_rb_advanced_metrics(
         season, week, player_stats_df, ngs_rush_df,
         rush_explosive_df=explosive_rates["rush_explosive"],
+        prior_ngs_rush_df=prior_ngs_rush_df,
     )
-    def_metrics = build_defense_advanced_metrics(season, week, pbp_history_df, participation_df)
+    def_metrics = build_defense_advanced_metrics(
+        season, week, pbp_history_df, participation_df,
+        prior_pbp_df=prior_pbp_df, prior_participation_df=prior_participation_df,
+    )
 
     # Play-action tendency/vulnerability, QB pressure profile, and PROE -
     # closes the previously-flagged gaps (FTN's is_play_action/is_motion
@@ -3061,6 +3197,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
             if ENABLE_FULL_COVERAGE_MU_ADJUSTMENT and pd.notna(mu) and opp_coverage_row:
                 player_full_coverage_eff = build_player_full_coverage_efficiency(
                     gsis_id, "passer", participation_df, pbp_history_df,
+                    prior_participation_df=prior_participation_df, prior_pbp_df=prior_pbp_df,
                 )
                 full_cov_result = calc_full_coverage_adjusted_mu(adjusted_mu, player_full_coverage_eff, opp_coverage_row)
                 adjusted_mu = full_cov_result["adjusted_mu"]
@@ -3090,7 +3227,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                                            prior_source_df=prior_ngs_pass_df)
             role_score = calc_role_verification_score(role_trend)
             blended_exploit = calc_blended_matchup_strength(
-                combined_structural_exploit, grade_exploit, role_score
+                combined_structural_exploit, grade_exploit, role_score,
+                role_is_bridged=role_trend.get("bridged_from_prior_season", False),
             )
             quality_score = calc_quality_score(
                 matchup_exploit_strength=blended_exploit,
@@ -3160,7 +3298,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 )
                 if sib_prop in PROP_METRIC_CROSSWALK:
                     sib_grade_exploit = calc_grade_matchup_strength(merged_grades, sib_prop)
-                    sib_blended = calc_blended_matchup_strength(combined_structural_exploit, sib_grade_exploit, role_score)
+                    sib_blended = calc_blended_matchup_strength(combined_structural_exploit, sib_grade_exploit, role_score, role_is_bridged=role_trend.get("bridged_from_prior_season", False))
                     sib_quality_score = calc_quality_score(
                         matchup_exploit_strength=sib_blended,
                         sample_size_games=confidence_info["games_sampled_current"],
@@ -3261,7 +3399,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                                      if pd.notna(v)]
                 combined_rush_structural = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
                 blended_exploit = calc_blended_matchup_strength(
-                    combined_rush_structural, grade_exploit, role_score
+                    combined_rush_structural, grade_exploit, role_score,
+                    role_is_bridged=role_trend.get("bridged_from_prior_season", False),
                 )
                 rush_quality_score = calc_quality_score(
                     matchup_exploit_strength=blended_exploit,
@@ -3307,7 +3446,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                     )
                     if sib_prop in PROP_METRIC_CROSSWALK:
                         sib_grade_exploit = calc_grade_matchup_strength(merged_grades_rush, sib_prop)
-                        sib_blended = calc_blended_matchup_strength(combined_rush_structural, sib_grade_exploit, role_score)
+                        sib_blended = calc_blended_matchup_strength(combined_rush_structural, sib_grade_exploit, role_score, role_is_bridged=role_trend.get("bridged_from_prior_season", False))
                         sib_quality_score = calc_quality_score(
                             matchup_exploit_strength=sib_blended,
                             sample_size_games=rb_confidence_info["games_sampled_current"],
@@ -3417,6 +3556,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 if ENABLE_FULL_COVERAGE_MU_ADJUSTMENT and opp_coverage_row:
                     player_full_coverage_eff = build_player_full_coverage_efficiency(
                         gsis_id, "receiver", participation_df, pbp_history_df,
+                        prior_participation_df=prior_participation_df, prior_pbp_df=prior_pbp_df,
                     )
                     full_cov_result = calc_full_coverage_adjusted_mu(adjusted_mu, player_full_coverage_eff, opp_coverage_row)
                     adjusted_mu = full_cov_result["adjusted_mu"]
@@ -3431,7 +3571,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                                                prior_source_df=player_stats_df)
                 role_score = calc_role_verification_score(role_trend)
                 blended_exploit = calc_blended_matchup_strength(
-                    combined_structural_exploit, grade_exploit, role_score
+                    combined_structural_exploit, grade_exploit, role_score,
+                    role_is_bridged=role_trend.get("bridged_from_prior_season", False),
                 )
                 quality_score = calc_quality_score(
                     matchup_exploit_strength=blended_exploit,
@@ -3490,7 +3631,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                     )
                     if sib_prop in PROP_METRIC_CROSSWALK:
                         sib_grade_exploit = calc_grade_matchup_strength(merged_grades_rec, sib_prop)
-                        sib_blended = calc_blended_matchup_strength(combined_structural_exploit, sib_grade_exploit, role_score)
+                        sib_blended = calc_blended_matchup_strength(combined_structural_exploit, sib_grade_exploit, role_score, role_is_bridged=role_trend.get("bridged_from_prior_season", False))
                         sib_quality_score = calc_quality_score(
                             matchup_exploit_strength=sib_blended,
                             sample_size_games=rec_confidence_info["games_sampled_current"],
@@ -4768,55 +4909,28 @@ def build_season_accuracy_report(season: int, weeks: list = None, through_week: 
     }
 
 
-def build_combined_readiness_and_simulation_report(season: int, weeks: list = None, through_week: int = 18,
-                                                     coverage_bundle=None, rb_bundle=None,
-                                                     n_simulations: int = 1000, min_quality_score: float = None,
-                                                     strict_true_starters: bool = False) -> dict:
+def build_combined_report_from_raw(raw: pd.DataFrame, n_simulations: int = 1000,
+                                    min_quality_score: float = None) -> dict:
     """
-    Real, combined report - per direct request, runs score_week_against_
-    actuals() ONCE per real week and builds BOTH the readiness
-    diagnostics (quality_score accuracy, by_prop_type, adjustment
-    direction, role verification) AND the 1000-sample simulation backtest
-    (gap_pct buckets, real hit-rate) from that SAME shared set of scored
-    rows - not two separate report functions each re-running the same
-    expensive real scoring step for the same week range.
-
-    Real, honest reason this matters beyond convenience: score_week_
-    against_actuals is the genuinely slow part (confirmed ~90-100+
-    real seconds per week during this build's own testing) - running the
-    readiness report and the simulation backtest as two separate button
-    clicks over the same weeks silently doubles that real cost for no
-    reason, since both were computing mu/sigma/actual from scratch
-    independently. This combines them into one real pass.
-
-    Returns a dict with both reports' real keys merged together:
-    raw, by_prop_type, by_position, by_quality_tier, by_quality_tier_by_prop,
-    adjustment_direction_accuracy, role_verification_check (readiness side),
-    plus bucket_summary, quality_tier_summary (simulation side) - built
-    from the same underlying real rows, not recomputed separately.
+    Real, extracted aggregation step - takes rows ALREADY scored by
+    score_week_against_actuals() (any number of weeks, even a partial/
+    in-progress set) and builds every summary table (readiness +
+    simulation) from them. Split out from build_combined_readiness_and_
+    simulation_report() specifically so the expensive per-week SCORING
+    step (confirmed ~90-100+ real seconds/week) and this cheaper
+    aggregation step can run independently - the app layer can now score
+    one real week at a time, persist each week's raw rows to disk
+    immediately, and call this function on whatever's accumulated so far
+    at any point, including right after a restart with only a partial
+    set of weeks actually scored yet. No re-scoring needed just to see
+    a report on partial progress.
     """
-    if weeks is None:
-        weeks = get_completed_weeks_with_data(season, through_week)
-
-    week_results = []
-    for wk in weeks:
-        try:
-            wk_df = score_week_against_actuals(season, wk, starters_only=True, coverage_bundle=coverage_bundle,
-                                                rb_bundle=rb_bundle, strict_true_starters=strict_true_starters)
-            if not wk_df.empty:
-                week_results.append(wk_df)
-        except Exception as e:
-            print(f"Skipping week {wk}: {e}")
-            continue
-
-    if not week_results:
+    if raw is None or raw.empty:
         return {"raw": pd.DataFrame(), "by_prop_type": pd.DataFrame(), "by_position": pd.DataFrame(),
                 "by_quality_tier": pd.DataFrame(), "by_quality_tier_by_prop": pd.DataFrame(),
                 "adjustment_direction_accuracy": np.nan, "role_verification_check": pd.DataFrame(),
                 "bucket_summary": pd.DataFrame(), "quality_tier_summary": pd.DataFrame(),
                 "sim_raw": pd.DataFrame()}
-
-    raw = pd.concat(week_results, ignore_index=True)
 
     # --- Readiness diagnostics (same real logic as build_season_accuracy_report) ---
     by_prop_type = raw.groupby("prop_type").agg(
@@ -4911,6 +5025,63 @@ def build_combined_readiness_and_simulation_report(season: int, weeks: list = No
         "bucket_summary": bucket_summary, "quality_tier_summary": quality_tier_summary,
         "sim_raw": sim_raw,
     }
+
+
+def build_combined_readiness_and_simulation_report(season: int, weeks: list = None, through_week: int = 18,
+                                                     coverage_bundle=None, rb_bundle=None,
+                                                     n_simulations: int = 1000, min_quality_score: float = None,
+                                                     strict_true_starters: bool = False) -> dict:
+    """
+    Real, combined report - per direct request, runs score_week_against_
+    actuals() ONCE per real week and builds BOTH the readiness
+    diagnostics (quality_score accuracy, by_prop_type, adjustment
+    direction, role verification) AND the 1000-sample simulation backtest
+    (gap_pct buckets, real hit-rate) from that SAME shared set of scored
+    rows - not two separate report functions each re-running the same
+    expensive real scoring step for the same week range.
+
+    Real, honest reason this matters beyond convenience: score_week_
+    against_actuals is the genuinely slow part (confirmed ~90-100+
+    real seconds per week during this build's own testing) - running the
+    readiness report and the simulation backtest as two separate button
+    clicks over the same weeks silently doubles that real cost for no
+    reason, since both were computing mu/sigma/actual from scratch
+    independently. This combines them into one real pass.
+
+    Kept as a single-call convenience wrapper for any other caller that
+    wants the whole range done in one shot - see build_combined_report_
+    from_raw() for the version that lets the app layer score weeks one
+    at a time with real, incremental disk persistence between them.
+
+    Returns a dict with both reports' real keys merged together:
+    raw, by_prop_type, by_position, by_quality_tier, by_quality_tier_by_prop,
+    adjustment_direction_accuracy, role_verification_check (readiness side),
+    plus bucket_summary, quality_tier_summary (simulation side) - built
+    from the same underlying real rows, not recomputed separately.
+    """
+    if weeks is None:
+        weeks = get_completed_weeks_with_data(season, through_week)
+
+    week_results = []
+    for wk in weeks:
+        try:
+            wk_df = score_week_against_actuals(season, wk, starters_only=True, coverage_bundle=coverage_bundle,
+                                                rb_bundle=rb_bundle, strict_true_starters=strict_true_starters)
+            if not wk_df.empty:
+                week_results.append(wk_df)
+        except Exception as e:
+            print(f"Skipping week {wk}: {e}")
+            continue
+
+    if not week_results:
+        return {"raw": pd.DataFrame(), "by_prop_type": pd.DataFrame(), "by_position": pd.DataFrame(),
+                "by_quality_tier": pd.DataFrame(), "by_quality_tier_by_prop": pd.DataFrame(),
+                "adjustment_direction_accuracy": np.nan, "role_verification_check": pd.DataFrame(),
+                "bucket_summary": pd.DataFrame(), "quality_tier_summary": pd.DataFrame(),
+                "sim_raw": pd.DataFrame()}
+
+    raw = pd.concat(week_results, ignore_index=True)
+    return build_combined_report_from_raw(raw, n_simulations=n_simulations, min_quality_score=min_quality_score)
 
 
 # ---------------------------------------------------------------------------
@@ -6062,8 +6233,25 @@ def build_team_offense(team: str, opponent: str, season: int, week: int,
     from real pbp alone (exploit_strength=None -> uniform bootstrap,
     per PlayerPlayPool) - the simulation is never blocked on premium data,
     same graceful-degrade philosophy as everywhere else in this project.
+
+    REAL, SEVERE BUG FOUND AND FIXED (confirmed directly against real
+    2025 week 1 data before this fix): `hist` only ever looked at
+    CURRENT-season pbp for identifying who the QB/top rushers/top targets
+    even ARE. In week 1, hist was always empty, so qb_gsis_id came back
+    None and rushers/targets came back as empty lists - a completely
+    blank, useless TeamOffense with nothing to simulate, for every team,
+    every week 1. prior_pbp_df was already a required parameter here but
+    was never actually used for this - only threaded through to the
+    per-player pool builders for THEIR OWN history, not for figuring out
+    which players to build pools for in the first place. Now falls back
+    to identifying usage from the full prior season when current-season
+    usage is empty, same pattern as every other cold-start fix this
+    session (build_qb_advanced_metrics, build_receiver_advanced_metrics,
+    etc.).
     """
     hist = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week) & (pbp_df["posteam"] == team)]
+    if hist.empty and prior_pbp_df is not None and not prior_pbp_df.empty:
+        hist = prior_pbp_df[(prior_pbp_df["season"] == season - 1) & (prior_pbp_df["posteam"] == team)]
     name_lookup = rosters_df[rosters_df["season"] == season][["gsis_id", "full_name"]].drop_duplicates().set_index("gsis_id")["full_name"]
 
     qb_counts = hist["passer_player_id"].dropna().value_counts()
