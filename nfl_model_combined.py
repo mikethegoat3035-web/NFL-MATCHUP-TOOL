@@ -4361,9 +4361,24 @@ def build_league_fallback_mus(player_stats_df: pd.DataFrame, season: int,
         "WR": ["receiving_yards", "rushing_yards", "receptions", "targets", "receiving_tds"],
         "TE": ["receiving_yards", "receptions", "targets", "receiving_tds"],
     }
-    df = player_stats_df[
+    # REAL FIX (found live via a real screenshot showing Shane Buechele's
+    # mu/sigma as None despite a "Fallback: League Average" label at week
+    # 1 of 2026 - confirmed directly: build_league_fallback_mus/sigmas
+    # only ever looked at the CURRENT season's data, which is
+    # mathematically guaranteed to be completely empty at week 1 of any
+    # new season (zero real games have been played yet for anyone). This
+    # broke the fallback exactly when it's needed most - a genuinely new
+    # player (rookie, practice-squad call-up) with zero current AND zero
+    # prior-team history had nowhere real left to fall back to. Now
+    # includes the full prior season too, giving early weeks (especially
+    # week 1) a real, substantial population - later weeks naturally
+    # shift more weight onto real current-season data as it accumulates,
+    # since both real sources are combined here, not swapped.
+    current_season_df = player_stats_df[
         (player_stats_df["season"] == season) & (player_stats_df["week"] < through_week)
     ]
+    prior_season_df = player_stats_df[player_stats_df["season"] == season - 1]
+    df = pd.concat([current_season_df, prior_season_df], ignore_index=True)
     fallback = {}
     for position, columns in prop_by_position.items():
         pos_df = df[df["position"] == position]
@@ -4523,9 +4538,12 @@ def build_league_fallback_sigmas(player_stats_df: pd.DataFrame, season: int,
         "TE": ["receiving_yards", "receptions", "targets", "receiving_tds"],
     }
 
-    df = player_stats_df[
+    # REAL FIX - same confirmed bug and same fix as build_league_fallback_mus above.
+    current_season_df = player_stats_df[
         (player_stats_df["season"] == season) & (player_stats_df["week"] < through_week)
     ]
+    prior_season_df = player_stats_df[player_stats_df["season"] == season - 1]
+    df = pd.concat([current_season_df, prior_season_df], ignore_index=True)
 
     fallback = {}
     for position, columns in prop_by_position.items():
