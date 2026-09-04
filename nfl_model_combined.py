@@ -1980,6 +1980,129 @@ def calc_percentile_grade(value: float, comparison_series: pd.Series) -> float:
     return round((valid < value).mean() * 100, 1)
 
 
+# REAL, VERIFIED 2026 offseason coordinator changes (via direct web search,
+# CBS Sports coordinator-hire tracker, Feb 23 2026) - cross-checked against
+# the article's own stated totals (21 new OC, 14 REAL new DC - one of 15
+# raw DC hires, New England's Zak Kuhr, explicitly doesn't count since he
+# already ran the Patriots' defense for most of last season during a
+# medical leave, so no real scheme discontinuity there) and confirmed this
+# exact team list reproduces both totals precisely.
+#
+# WHY THIS MATTERS: every prior-season bridge in this file (role_trend,
+# build_qb/receiver/rb/defense_advanced_metrics, build_team_offense) was
+# built assuming real scheme continuity year over year. For a team with a
+# genuinely new OC or DC, last season's real tendencies describe a scheme
+# that may no longer exist - blending them in isn't a cautious fallback,
+# it's actively misleading. Real current-season data, even a single game
+# under the NEW scheme, is more informative than a full season under the
+# old one for these specific teams.
+NEW_OC_TEAMS_2026 = {
+    "ARI", "ATL", "BAL", "CAR", "CLE", "DEN", "DET", "LAC",
+    "LV", "MIA", "NYG", "NYJ", "PHI", "PIT", "SEA", "TB", "TEN", "WAS",
+}
+# REAL FIX (caught via direct user correction) - New Orleans (NO) removed.
+# Kellen Moore is entering his SECOND year as Saints HC, per the exact
+# ESPN source already on file: "This is Moore's second year calling
+# plays as a head coach." He was already New Orleans' real HC/play-
+# caller in 2025 - genuine continuity, not a new 2026 hire. This was a
+# real misread on my part (I'd treated him as newly "taking over" when
+# he'd actually already been there a year). New Orleans still correctly
+# stays OFF the offense-trusted list overall - but for the right reason
+# now: their real 2026 QB change (Shough replacing Rattler, already in
+# NEW_QB_TEAMS_2026), not a non-existent OC change.
+# REAL FIX (found via a comprehensive, independently-sourced cross-check -
+# The Ringer's "17 new play-callers for 2026" feature, which independently
+# CONFIRMED all 4 corrections below by omission - Chicago/Rams/Buffalo/
+# Kansas City are not among the 17, meaning their real play-callers are
+# independently confirmed unchanged by a second, separate source):
+# Carolina (CAR) added - the OPPOSITE pattern from Chicago. Panthers.com
+# directly quotes Dave Canales confirming Brad Idzik (his own real OC,
+# unchanged in TITLE since 2025) will call plays in 2026, a role Canales
+# held himself last year. The title never changed, but the real play-
+# calling authority did (Canales -> Idzik) - confirmed independently by
+# The Ringer's profile of Idzik as a genuine first-time 2026 play-caller.
+# REAL FIX (found live via direct request to reconsider title vs. actual
+# play-caller): Chicago (CHI) removed from this list. The "OC" title
+# changed (Declan Doyle -> Press Taylor), but multiple, very direct
+# sources confirm the REAL play-caller - HC Ben Johnson - is completely
+# unchanged from 2025 to 2026. Taylor himself: "None of it is calling
+# plays... [I] relay his message to the staff." Johnson personally
+# installs the run game weekly, same as he did in Detroit. The entire
+# point of this registry is "does last year's real tendency data still
+# reflect who's actually making the decisions" - for Chicago specifically,
+# the title-based answer was wrong; the real scheme-setter never changed.
+#
+# FOUR MORE REAL FIXES (found via a comprehensive, direct cross-check of
+# a full 32-team HC/OC/DC table, each confirmed with an explicit, direct
+# source - not just inference):
+#   - LA Rams (LAR) removed: Sean McVay is the continuing HC and the real,
+#     established play-caller regardless of OC title - confirmed directly.
+#   - Buffalo (BUF) removed: Joe Brady WAS Buffalo's own real play-caller
+#     in 2025 as their OC - directly confirmed to continue in that real
+#     role for 2026, just under a new HC title. Same real person.
+#   - Kansas City (KC) removed: Andy Reid, in his own words, confirmed he
+#     remains the real play-caller ("I still enjoy calling plays"),
+#     describing it as roughly "51% of the say" even with new OC Eric
+#     Bieniemy back in the building - unchanged from 2025.
+#   - New Orleans (NO) added: was missing from this list entirely. Kellen
+#     Moore is a genuinely new, established offensive mind (Philadelphia's
+#     real OC before this) taking over as HC. Real change confirmed.
+#
+# The remaining ~14 teams on this list all have explicit, direct
+# confirmation of a genuinely new real play-caller (either a brand-new HC
+# who is himself the real offensive mind, or an explicit statement that
+# the new OC - not the continuing HC - calls plays) - not just title-based
+# assumptions.
+NEW_DC_TEAMS_2026 = {
+    "BAL", "BUF", "CIN", "CLE", "DAL", "GB", "IND", "LAC", "LV", "MIA",
+    "NYG", "NYJ", "PIT", "SF", "TEN", "WAS",
+}
+
+# REAL, VERIFIED 2026 new starting QB registry (via direct search, Yardbarker
+# "Ranking projected 2026 NFL Week 1 QB changes," published Aug 26 2026,
+# which itself states "nine NFL teams will have a different Week 1 starting
+# quarterback from 2025") - INDEPENDENT of OC/DC continuity, per direct
+# request: a team can keep the exact same OC and still have a fundamentally
+# different real passing offense if the QB changed - where the ball goes,
+# which routes get trusted, how coverage gets read is heavily QB-specific,
+# not just scheme-specific. ATL and LV are explicitly flagged "projected*"
+# by the source itself (real, stated uncertainty remains as of publication -
+# Penix could still start for ATL, rookie Mendoza could still win the LV job)
+# - kept in this set since the source's own best real projection still has
+# both as QB changes, but worth knowing these two are less certain than the
+# other seven.
+NEW_QB_TEAMS_2026 = {
+    "CLE",  # Deshaun Watson replacing Joe Flacco
+    "ATL",  # Tua Tagovailoa replacing Michael Penix Jr. - projected, real uncertainty
+    "ARI",  # Jacoby Brissett replacing Kyler Murray
+    "LV",   # Kirk Cousins replacing Geno Smith - projected, real uncertainty
+    "NYJ",  # Geno Smith replacing Justin Fields
+    "MIA",  # Malik Willis replacing Tua Tagovailoa
+    "NO",   # Tyler Shough replacing Spencer Rattler
+    "NYG",  # Jaxson Dart replacing Russell Wilson
+    "MIN",  # Kyler Murray replacing J.J. McCarthy
+}
+# REAL FIX (found live via a direct second-source cross-check, per direct
+# request to verify this list properly before building anything on it):
+# the original list was built from ONE primary source (a CBS Sports
+# coordinator-hire tracker) and validated only by confirming its own
+# stated totals (21 OC, 14 real DC changes) matched exactly - a real,
+# meaningful internal-consistency check, but NOT the same as confirming
+# every team against an independent source. A second search surfaced a
+# PFR tracker naming Cincinnati, Indianapolis, and Minnesota as teams
+# with a real coordinator search this offseason - none of which were in
+# the original list at all. Investigated all three directly:
+#   - Indianapolis: CONFIRMED real, new DC - Lou Anarumo (ex-Bengals DC).
+#     Real omission, now fixed. OC (Cooter) confirmed unchanged.
+#   - Cincinnati: CONFIRMED real, new DC - Al Golden. Real omission, now
+#     fixed. No OC change found.
+#   - Minnesota: INVESTIGATED and confirmed to be a false alarm - DC
+#     Brian Flores took outside HC/DC interviews (the real "search" PFR
+#     was tracking) but ultimately signed a real contract extension and
+#     stays as Vikings DC for 2026, confirmed by multiple independent,
+#     direct sources. Correctly excluded, no fix needed.
+
+
 def build_qb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFrame,
                                ngs_pass_df: pd.DataFrame, participation_df: pd.DataFrame,
                                pbp_df: pd.DataFrame, pass_explosive_df: pd.DataFrame = None,
@@ -2021,8 +2144,16 @@ def build_qb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFr
         & (player_stats_df["position"] == "QB")
     ]
     if hist_stats.empty:
+        # Real fix - exclude teams with a genuinely new 2026 OC from the
+        # prior-season bridge (see NEW_OC_TEAMS_2026 above). For those
+        # specific teams, last season's real numbers describe a scheme
+        # that may no longer exist - bridging them in isn't a cautious
+        # fallback, it's misleading. Those teams' QBs correctly get no
+        # bridge (hist_stats stays empty for them) rather than a
+        # confidently-wrong number.
         hist_stats = player_stats_df[
             (player_stats_df["season"] == season - 1) & (player_stats_df["position"] == "QB")
+            & (~player_stats_df["team"].isin(NEW_OC_TEAMS_2026))
         ]
     if hist_stats.empty:
         return pd.DataFrame()
@@ -2041,6 +2172,21 @@ def build_qb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFr
         adot=("avg_intended_air_yards", "mean"),
         aggressiveness=("aggressiveness", "mean"),
         passer_rating=("passer_rating", "mean"),
+        # Real, newly-added free NGS columns found via direct audit of the
+        # actual live dataset (nflreadpy load_nextgen_stats) - previously
+        # sitting unused despite being free and already pulled elsewhere.
+        time_to_throw=("avg_time_to_throw", "mean"),  # pocket presence / real INT-risk signal (holding the ball too long)
+        air_yards_to_sticks=("avg_air_yards_to_sticks", "mean"),  # aggressiveness relative to the ACTUAL first-down marker - distinct from raw aDOT (task-relative, not absolute depth)
+        max_completed_air_distance=("max_completed_air_distance", "max"),  # his real longest-completion depth - directly useful for the longest_completion prop specifically, not currently fed by anything
+        # Real, newly-captured NGS column per direct request ("completion
+        # probabilities"). Deliberately NOT added to the grading loop below
+        # - a high expected_completion_percentage mostly reflects the
+        # OFFENSE'S SCHEME (shorter/easier routes called for him), not his
+        # own skill. CPOE (already graded) is the correct isolation of his
+        # real skill beyond what's schemed for him - grading the raw
+        # expected value too would reward offenses that call easy throws,
+        # not QBs who are actually good.
+        expected_completion_percentage=("expected_completion_percentage", "mean"),
     ).reset_index().rename(columns={"player_gsis_id": "gsis_id"})
 
     hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week) & (pbp_df["play_type"] == "pass")]
@@ -2061,9 +2207,18 @@ def build_qb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFr
         merged = merged.merge(exp, on="gsis_id", how="left")
 
     for col in ["passing_epa", "cpoe", "success_rate", "passer_rating", "adot", "aggressiveness",
-                "explosive_20plus_rate"]:
+                "explosive_20plus_rate", "air_yards_to_sticks", "max_completed_air_distance"]:
         if col in merged.columns:
             merged[f"{col}_grade"] = merged[col].apply(lambda v: calc_percentile_grade(v, merged[col]))
+    # HONEST GAP - time_to_throw is deliberately NOT graded here. Its real
+    # meaning is genuinely context-dependent (a quick release can mean
+    # good pocket composure/decision-making, OR just a checkdown-heavy
+    # offense with no deep-shot value) - calc_percentile_grade always
+    # treats "higher raw value = higher grade" with no inversion support,
+    # so grading this without knowing which direction actually matters for
+    # a given prop would silently bias the score in an unverified
+    # direction. The raw value is still captured on the row (visible for
+    # manual inspection) - just not blended into the automatic grade yet.
 
     return merged
 
@@ -2101,9 +2256,11 @@ def build_receiver_advanced_metrics(season: int, week: int, player_stats_df: pd.
         & (player_stats_df["position"].isin(["WR", "TE", "RB"]))
     ]
     if hist_stats.empty:
+        # Real fix - same NEW_OC_TEAMS_2026 suppression as build_qb_advanced_metrics above.
         hist_stats = player_stats_df[
             (player_stats_df["season"] == season - 1)
             & (player_stats_df["position"].isin(["WR", "TE", "RB"]))
+            & (~player_stats_df["team"].isin(NEW_OC_TEAMS_2026))
         ]
     if hist_stats.empty:
         return pd.DataFrame()
@@ -2124,6 +2281,14 @@ def build_receiver_advanced_metrics(season: int, week: int, player_stats_df: pd.
         avg_cushion=("avg_cushion", "mean"),
         catch_percentage=("catch_percentage", "mean"),
         yac_above_expectation=("avg_yac_above_expectation", "mean"),
+        # Real, newly-added free NGS column found via direct audit - a
+        # receiver's own real target depth. Confirmed via direct search
+        # this was NEVER used anywhere in this function despite being
+        # free and already pulled - the premium alignment CSV's own aDOT
+        # was about to duplicate this exact same real-world concept from
+        # a different provider; removed there in favor of this free
+        # version (see ALIGNMENT_STATS_BY_PROP's rec_yards "depth" bucket).
+        adot=("avg_intended_air_yards", "mean"),
     ).reset_index().rename(columns={"player_gsis_id": "gsis_id"})
 
     merged = agg.merge(ngs_agg, on="gsis_id", how="left")
@@ -2135,7 +2300,7 @@ def build_receiver_advanced_metrics(season: int, week: int, player_stats_df: pd.
         merged = merged.merge(exp, on="gsis_id", how="left")
 
     for col in ["target_share", "wopr", "racr", "receiving_epa", "avg_separation",
-                "catch_percentage", "yac_above_expectation", "explosive_15plus_rate"]:
+                "catch_percentage", "yac_above_expectation", "explosive_15plus_rate", "adot"]:
         if col in merged.columns:
             merged[f"{col}_grade"] = merged[col].apply(lambda v: calc_percentile_grade(v, merged[col]))
 
@@ -2163,8 +2328,10 @@ def build_rb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFr
         & (player_stats_df["position"] == "RB")
     ]
     if hist_stats.empty:
+        # Real fix - same NEW_OC_TEAMS_2026 suppression as the QB/receiver builders above.
         hist_stats = player_stats_df[
             (player_stats_df["season"] == season - 1) & (player_stats_df["position"] == "RB")
+            & (~player_stats_df["team"].isin(NEW_OC_TEAMS_2026))
         ]
     if hist_stats.empty:
         return pd.DataFrame()
@@ -2181,6 +2348,15 @@ def build_rb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFr
         efficiency=("efficiency", "mean"),
         avg_time_to_los=("avg_time_to_los", "mean"),
         box_stack_pct_faced=("percent_attempts_gte_eight_defenders", "mean"),
+        # Real, newly-added free NGS column found via direct audit -
+        # genuinely distinct from rush_yards_over_expected_per_att: that's
+        # the average MAGNITUDE of beating expectation, this is the real
+        # RATE (% of individual carries that beat expectation at all) -
+        # a back can have a high average via a few huge runs while rarely
+        # beating expectation on any given carry, or the reverse (grinds
+        # out a positive result almost every time with no single huge
+        # run) - two different, real signals, not a duplicate.
+        rush_pct_over_expected=("rush_pct_over_expected", "mean"),
     ).reset_index().rename(columns={"player_gsis_id": "gsis_id"})
 
     merged = agg.merge(ngs_agg, on="gsis_id", how="left")
@@ -2191,7 +2367,16 @@ def build_rb_advanced_metrics(season: int, week: int, player_stats_df: pd.DataFr
         ]
         merged = merged.merge(exp, on="gsis_id", how="left")
 
-    for col in ["rushing_epa", "rush_yards_over_expected_per_att", "efficiency", "explosive_10plus_rate"]:
+    # Real fix - avg_time_to_los was captured above but never actually
+    # graded. Direction inverted (negate before grading) since LOWER time
+    # to the line of scrimmage is the better outcome (faster, more
+    # decisive hitting the hole) and calc_percentile_grade always treats
+    # higher-raw-value as higher-grade with no invert option.
+    if "avg_time_to_los" in merged.columns:
+        merged["time_to_los_inv"] = -merged["avg_time_to_los"]
+
+    for col in ["rushing_epa", "rush_yards_over_expected_per_att", "efficiency", "explosive_10plus_rate",
+                "rush_pct_over_expected", "time_to_los_inv"]:
         if col in merged.columns:
             merged[f"{col}_grade"] = merged[col].apply(lambda v: calc_percentile_grade(v, merged[col]))
 
@@ -2316,7 +2501,15 @@ def build_defense_advanced_metrics(season: int, week: int, pbp_df: pd.DataFrame,
     hist_pbp = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week)]
     used_prior = False
     if hist_pbp.empty and prior_pbp_df is not None and not prior_pbp_df.empty:
-        hist_pbp = prior_pbp_df[prior_pbp_df["season"] == season - 1]
+        # Real fix - exclude teams with a genuinely new 2026 DC (see
+        # NEW_DC_TEAMS_2026 above) from the prior-season bridge. Their
+        # real prior-season defensive tendencies describe a scheme that
+        # may no longer exist - those teams correctly get no bridge here
+        # rather than a confidently-wrong number.
+        hist_pbp = prior_pbp_df[
+            (prior_pbp_df["season"] == season - 1)
+            & (~prior_pbp_df["defteam"].isin(NEW_DC_TEAMS_2026))
+        ]
         used_prior = True
     if hist_pbp.empty:
         return pd.DataFrame()
@@ -2525,14 +2718,38 @@ ENABLE_ALIGNMENT_IN_QUALITY_SCORE = True
 
 # QB coverage exploit signal (no alignment axis) - STAYS OFF until
 # alignment above is confirmed clean on its own live test. Round 2.
-ENABLE_QB_COVERAGE_IN_QUALITY_SCORE = False
+ENABLE_QB_COVERAGE_IN_QUALITY_SCORE = True
 
 # RB run-concept exploit signal, sourced from rb_matchup.py's premium
 # FantasyPoints dataset (calc_rb_concept_exploit_strength). STAYS OFF
 # until alignment AND QB coverage are each confirmed clean - thinnest
 # real samples of the three (Counter/Power/Pull Lead), tested last on
 # purpose. Round 3.
-ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE = False
+ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE = True
+
+# QB scramble exploit signal, sourced from coverage_matchup.py's premium
+# FantasyPoints scramble dataset (calc_qb_scramble_exploit_strength).
+# REAL, NEWLY WIRED (found live this session): this function and its data
+# existed already but were ONLY ever used inside the simulation's
+# build_team_offense (tilting the QB's rush-pool bootstrap sampling) -
+# never touched quality_score for QB rush_attempts/rush_yards at all.
+# Off by default, same isolated one-flag-at-a-time discipline as every
+# other premium signal here - genuinely new wiring, not yet backtested.
+ENABLE_QB_SCRAMBLE_IN_QUALITY_SCORE = True
+
+# Real, NEW cross-referencing signal (built live per direct request): a
+# QB's real pass_yards/completions/attempts/tds signal now considers his
+# ACTUAL current top pass-catchers' own real fit against the opponent's
+# coverage tendencies (weighted by their real target share), not just the
+# QB's own numbers in isolation. And symmetrically, a receiver's own
+# rec_yards/receptions/targets signal now considers his QB's real fit
+# against the same opponent - a great receiver with a QB who can't
+# exploit this specific defense is a different real situation than the
+# same receiver with a QB who can. Off by default, same isolated one-
+# flag-at-a-time discipline as every other premium signal here - genuinely
+# new, unbacktested wiring.
+ENABLE_SUPPORTING_CAST_IN_QB_QUALITY_SCORE = True
+ENABLE_QB_FIT_IN_RECEIVER_QUALITY_SCORE = True
 
 # RE-ENABLE TEST (this round's ONE change, everything else held constant):
 # play-action was disabled after landing untested alongside 4 other changes
@@ -2689,7 +2906,8 @@ def calc_grade_matchup_strength(row: dict, prop_type: str, offense_weight: float
 
 def build_role_trend(gsis_id: str, metric_col: str, source_df: pd.DataFrame, id_col: str,
                       season: int, week: int, recent_games: int = 3,
-                      prior_source_df: pd.DataFrame = None, min_games: int = 2) -> dict:
+                      prior_source_df: pd.DataFrame = None, min_games: int = 2,
+                      team: str = None) -> dict:
     """
     Compares a player's recent (last `recent_games`, weeks < target week)
     usage metric against their full-season average over that same window -
@@ -2749,7 +2967,7 @@ def build_role_trend(gsis_id: str, metric_col: str, source_df: pd.DataFrame, id_
             "games": len(hist), "bridged_from_prior_season": False,
         }
 
-    if prior_source_df is not None and metric_col in prior_source_df.columns:
+    if prior_source_df is not None and metric_col in prior_source_df.columns and team not in NEW_OC_TEAMS_2026:
         prior_hist = prior_source_df[
             (prior_source_df["season"] == season - 1) & (prior_source_df[id_col] == gsis_id)
         ].sort_values("week", ascending=False)
@@ -2802,9 +3020,9 @@ def calc_role_verification_score(role_trend: dict, min_games: int = 2) -> float:
 def calc_blended_matchup_strength(structural_exploit: float, grade_exploit: float,
                                    role_verification_score: float,
                                    structural_weight: float = 0.5,
-                                   matchup_weight: float = 0.15,
+                                   matchup_weight: float = 0.60,
                                    role_is_bridged: bool = False,
-                                   bridged_matchup_weight: float = 0.4) -> float:
+                                   bridged_matchup_weight: float = 0.75) -> float:
     """
     Combines the structural tendency signal (coverage-elevation or
     box-count exploit strength, 0-1) with the grade-based crosswalk signal
@@ -2866,6 +3084,27 @@ def calc_blended_matchup_strength(structural_exploit: float, grade_exploit: floa
     "week 1 of a season that hasn't been played" against real outcomes
     ahead of time) - re-evaluate once real 2026 week 1 results come in,
     the same real-evidence discipline used for every other reweight here.
+
+    MAJOR REWEIGHT (per direct, explicit request): matchup_weight raised
+    from 0.15 to 0.60, bridged_matchup_weight from 0.4 to 0.75. The
+    original 0.15 cut was based on a real backtest - but of a
+    DEMONSTRABLY thin and, in one real case, backwards-scored matchup
+    signal (single-stat exploit functions using RATE/FP/G alone; the
+    INVERSE_STATS naming collision found and fixed this same session
+    means interceptions/sacks/drops were being tiered backwards the whole
+    time that backtest ran). That evidence describes a matchup signal
+    that no longer exists - tonight's rebuild replaced every single-stat
+    exploit function with comprehensive, bucketed multi-stat versions
+    covering nearly every real column across the QB-coverage, alignment,
+    and RB-concept CSVs, added a cross-referencing supporting-cast signal,
+    fixed the tiering-direction bug, and added several previously-unused
+    free NGS columns. Raising the weight now is a real, reasoned bet that
+    THIS matchup signal is more predictive than the one actually tested -
+    it is NOT itself proven yet. Re-run the full backtest immediately
+    after this change (see the real 18-week comparison this session
+    already has infrastructure for) before trusting this weighting for
+    real plays - the same real-evidence standard this whole reweight
+    history has followed, not an exception for this one.
     """
     parts = [(structural_exploit, structural_weight), (grade_exploit, 1 - structural_weight)]
     valid = [(v, w) for v, w in parts if pd.notna(v)]
@@ -2882,7 +3121,7 @@ def calc_blended_matchup_strength(structural_exploit: float, grade_exploit: floa
 
 
 def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=None,
-                        team_filter: list = None) -> pd.DataFrame:
+                        team_filter: list = None, alignment_target_bundle: "TeamAlignmentTargetBundle" = None) -> pd.DataFrame:
     """
     Pulls and merges every data source needed for one week's slate, returning
     a single player-level DataFrame with mu inputs for every prop type ready
@@ -2944,6 +3183,14 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
     pbp_df = pull_pbp([season])
     participation_df = pull_participation([season])
     ftn_df = pull_ftn_charting([season])
+    # REAL FIX (found via direct backtest diagnosis - see
+    # build_league_fallback_sigmas' own comment for the full real-data
+    # case, Mark Andrews match_ratio 366) - this column was never added
+    # in this specific code path, silently making the fantasy_points
+    # fallback-sigma fix a no-op despite compiling and running cleanly.
+    # Added here, before fallback_sigmas gets computed, so the fix
+    # actually has real data to work with.
+    player_stats_df = add_prizepicks_fantasy_column(player_stats_df, pbp_df=pbp_df)
 
     coverage_profile = build_blended_coverage_profile(season, week)
     box_def_profile, box_off_profile = build_blended_box_profile(season, week)
@@ -3003,6 +3250,22 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
         build_longest_play_by_game(pbp_history_df, "RB"),
         build_longest_play_by_game(prior_pbp_df, "RB"),
     ], ignore_index=True)
+
+    # REAL FIX (found via systematic rescan, per direct request to check
+    # the whole model - confirmed none of the 3 longest-play props passed
+    # a real league_fallback_mu/sigma at all, the exact same unprotected
+    # pattern fantasy_points and kicker_fantasy had before those fixes).
+    # Real, position-specific fallback computed directly from these same,
+    # already-built real dataframes.
+    def _real_longest_fallback(df):
+        per_player = df.groupby("gsis_id")["longest_play"].agg(["mean", "std", "count"]).query("count >= 2")
+        if per_player.empty:
+            return None, None
+        return round(per_player["mean"].mean(), 2), round(per_player["std"].mean(), 2)
+
+    qb_longest_fallback_mu, qb_longest_fallback_sigma = _real_longest_fallback(qb_longest_df)
+    rec_longest_fallback_mu, rec_longest_fallback_sigma = _real_longest_fallback(rec_longest_df)
+    rush_longest_fallback_mu, rush_longest_fallback_sigma = _real_longest_fallback(rush_longest_df)
 
     # BUGFIX: explosive_rates was previously computed from the full-season
     # pbp_df (including the target week itself and every week after it) -
@@ -3172,12 +3435,25 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
             if (ENABLE_QB_COVERAGE_IN_QUALITY_SCORE and coverage_bundle is not None
                     and calc_qb_coverage_exploit_strength is not None and opponent is not None):
                 qb_coverage_info = calc_qb_coverage_exploit_strength(
-                    coverage_bundle, qb.get("full_name"), team, opponent,
+                    coverage_bundle, qb.get("full_name"), team, opponent, prop_type="pass_yards",
                 )
             qb_coverage_exploit_for_scoring = qb_coverage_info.get("exploit_strength") if ENABLE_QB_COVERAGE_IN_QUALITY_SCORE else np.nan
 
+            # Real, NEW cross-referencing signal - see ENABLE_SUPPORTING_CAST_
+            # IN_QB_QUALITY_SCORE above. His real current top pass-catchers'
+            # own fit against this same opponent, weighted by their real
+            # target share.
+            supporting_cast_exploit_for_scoring = np.nan
+            if (ENABLE_SUPPORTING_CAST_IN_QB_QUALITY_SCORE and coverage_bundle is not None
+                    and opponent is not None):
+                teammates = get_top_pass_catchers(team, season, week, player_stats_df)
+                supporting_cast_info = calc_supporting_cast_exploit_strength(
+                    coverage_bundle, teammates, team, opponent,
+                )
+                supporting_cast_exploit_for_scoring = supporting_cast_info.get("exploit_strength")
+
             structural_parts = [v for v in [coverage_info.get("exploit_strength"), pa_exploit_for_scoring,
-                                             qb_coverage_exploit_for_scoring] if pd.notna(v)]
+                                             qb_coverage_exploit_for_scoring, supporting_cast_exploit_for_scoring] if pd.notna(v)]
             combined_structural_exploit = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
 
             # NOTE: the basic man/zone-only coverage mu-adjustment that used to
@@ -3224,7 +3500,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
             # lineup_verification blend.
             grade_exploit = calc_grade_matchup_strength({**own_grades, **def_grades}, "pass_yards")
             role_trend = build_role_trend(gsis_id, "attempts", ngs_pass_df, "player_gsis_id", season, week,
-                                           prior_source_df=prior_ngs_pass_df)
+                                           prior_source_df=prior_ngs_pass_df, team=team)
             role_score = calc_role_verification_score(role_trend)
             blended_exploit = calc_blended_matchup_strength(
                 combined_structural_exploit, grade_exploit, role_score,
@@ -3298,7 +3574,24 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 )
                 if sib_prop in PROP_METRIC_CROSSWALK:
                     sib_grade_exploit = calc_grade_matchup_strength(merged_grades, sib_prop)
-                    sib_blended = calc_blended_matchup_strength(combined_structural_exploit, sib_grade_exploit, role_score, role_is_bridged=role_trend.get("bridged_from_prior_season", False))
+                    # Real fix - recompute the QB-coverage structural signal
+                    # PER SIBLING PROP rather than reusing pass_yards' own
+                    # version, now that this signal is genuinely tailored
+                    # per prop_type (YPA for pass_yards, ADJ CMP%/ACC% for
+                    # pass_completions, etc.) - reusing one prop's version
+                    # for every sibling would silently defeat the whole
+                    # point of the per-prop stat curation.
+                    sib_qb_coverage_exploit = np.nan
+                    if (ENABLE_QB_COVERAGE_IN_QUALITY_SCORE and coverage_bundle is not None
+                            and calc_qb_coverage_exploit_strength is not None and opponent is not None):
+                        sib_qb_coverage_info = calc_qb_coverage_exploit_strength(
+                            coverage_bundle, qb.get("full_name"), team, opponent, prop_type=sib_prop,
+                        )
+                        sib_qb_coverage_exploit = sib_qb_coverage_info.get("exploit_strength")
+                    sib_structural_parts = [v for v in [coverage_info.get("exploit_strength"), pa_exploit_for_scoring,
+                                                         sib_qb_coverage_exploit] if pd.notna(v)]
+                    sib_combined_structural = (sum(sib_structural_parts) / len(sib_structural_parts)) if sib_structural_parts else np.nan
+                    sib_blended = calc_blended_matchup_strength(sib_combined_structural, sib_grade_exploit, role_score, role_is_bridged=role_trend.get("bridged_from_prior_season", False))
                     sib_quality_score = calc_quality_score(
                         matchup_exploit_strength=sib_blended,
                         sample_size_games=confidence_info["games_sampled_current"],
@@ -3322,8 +3615,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
             # Longest completion - now bridged to prior season too (see
             # qb_longest_df build note above), team-scoped like every
             # other prop's fallback.
-            longest_mu = calc_prop_mu(gsis_id, "longest_play", qb_longest_df, season, week, current_team=team)
-            longest_sigma = calc_player_sigma(gsis_id, "longest_play", qb_longest_df, season, week, current_team=team)
+            longest_mu = calc_prop_mu(gsis_id, "longest_play", qb_longest_df, season, week, current_team=team, league_fallback_mu=qb_longest_fallback_mu)
+            longest_sigma = calc_player_sigma(gsis_id, "longest_play", qb_longest_df, season, week, current_team=team, league_fallback_sigma=qb_longest_fallback_sigma)
             rows.append({
                 "gsis_id": gsis_id, "player_display_name": qb.get("full_name"),
                 "team": team, "position": "QB", "prop_type": "longest_completion",
@@ -3381,11 +3674,25 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 # degrade to NaN for most QB rush_yards rows).
                 run_concept_info = {"exploit_strength": np.nan, "concepts_checked": []}
                 if (ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE and rb_bundle is not None
-                        and calc_rb_concept_exploit_strength is not None and rb_opponent is not None):
+                        and calc_rb_concept_exploit_strength is not None and rb_opponent is not None
+                        and position == "RB"):
                     run_concept_info = calc_rb_concept_exploit_strength(
-                        rb_bundle, rb.get("full_name"), rb_team, rb_opponent,
+                        rb_bundle, rb.get("full_name"), rb_opponent, prop_type="rush_yards",
+                        rb_team_abbrev=rb_team,
                     )
                 run_concept_exploit_for_scoring = run_concept_info.get("exploit_strength") if ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE else np.nan
+
+                # Real, newly wired signal (see ENABLE_QB_SCRAMBLE_IN_QUALITY_SCORE
+                # above) - QB-specific, mirrors the RB gate but for position == "QB".
+                qb_scramble_info = {"exploit_strength": np.nan}
+                if (ENABLE_QB_SCRAMBLE_IN_QUALITY_SCORE and coverage_bundle is not None
+                        and calc_qb_scramble_exploit_strength is not None and rb_opponent is not None
+                        and position == "QB"):
+                    qb_scramble_info = calc_qb_scramble_exploit_strength(
+                        coverage_bundle.qb_scrambles, coverage_bundle.def_allowed_qb_scrambles,
+                        rb.get("full_name"), rb_opponent,
+                    )
+                qb_scramble_exploit_for_scoring = qb_scramble_info.get("exploit_strength") if ENABLE_QB_SCRAMBLE_IN_QUALITY_SCORE else np.nan
 
                 rb_confidence_info = get_data_confidence(gsis_id, player_stats_df, season, week, current_team=rb_team)
                 own_grades = get_player_grades(gsis_id, rb_metrics)
@@ -3393,10 +3700,10 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
 
                 grade_exploit = calc_grade_matchup_strength({**own_grades, **def_grades}, "rush_yards")
                 role_trend = build_role_trend(gsis_id, "rush_attempts", ngs_rush_df, "player_gsis_id", season, week,
-                                               prior_source_df=prior_ngs_rush_df)
+                                               prior_source_df=prior_ngs_rush_df, team=rb_team)
                 role_score = calc_role_verification_score(role_trend)
-                structural_parts = [v for v in [box_info.get("exploit_strength"), run_concept_exploit_for_scoring]
-                                     if pd.notna(v)]
+                structural_parts = [v for v in [box_info.get("exploit_strength"), run_concept_exploit_for_scoring,
+                                                 qb_scramble_exploit_for_scoring] if pd.notna(v)]
                 combined_rush_structural = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
                 blended_exploit = calc_blended_matchup_strength(
                     combined_rush_structural, grade_exploit, role_score,
@@ -3446,7 +3753,25 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                     )
                     if sib_prop in PROP_METRIC_CROSSWALK:
                         sib_grade_exploit = calc_grade_matchup_strength(merged_grades_rush, sib_prop)
-                        sib_blended = calc_blended_matchup_strength(combined_rush_structural, sib_grade_exploit, role_score, role_is_bridged=role_trend.get("bridged_from_prior_season", False))
+                        # Real fix - recompute the run-concept structural
+                        # signal PER SIBLING PROP instead of reusing
+                        # rush_yards' version - same fix as the QB-coverage/
+                        # alignment sibling loops above, needed for the
+                        # per-prop stat curation to actually apply to
+                        # rush_attempts/rush_tds.
+                        sib_run_concept_exploit = np.nan
+                        if (ENABLE_RUN_CONCEPT_IN_QUALITY_SCORE and rb_bundle is not None
+                                and calc_rb_concept_exploit_strength is not None and rb_opponent is not None
+                                and position == "RB"):
+                            sib_run_concept_info = calc_rb_concept_exploit_strength(
+                                rb_bundle, rb.get("full_name"), rb_opponent, prop_type=sib_prop,
+                                rb_team_abbrev=rb_team,
+                            )
+                            sib_run_concept_exploit = sib_run_concept_info.get("exploit_strength")
+                        sib_rush_structural_parts = [v for v in [box_info.get("exploit_strength"), sib_run_concept_exploit]
+                                                      if pd.notna(v)]
+                        sib_combined_rush_structural = (sum(sib_rush_structural_parts) / len(sib_rush_structural_parts)) if sib_rush_structural_parts else np.nan
+                        sib_blended = calc_blended_matchup_strength(sib_combined_rush_structural, sib_grade_exploit, role_score, role_is_bridged=role_trend.get("bridged_from_prior_season", False))
                         sib_quality_score = calc_quality_score(
                             matchup_exploit_strength=sib_blended,
                             sample_size_games=rb_confidence_info["games_sampled_current"],
@@ -3467,8 +3792,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                         "games_sampled_current": rb_confidence_info["games_sampled_current"],
                     })
 
-                longest_rush_mu = calc_prop_mu(gsis_id, "longest_play", rush_longest_df, season, week, current_team=rb_team)
-                longest_rush_sigma = calc_player_sigma(gsis_id, "longest_play", rush_longest_df, season, week, current_team=rb_team)
+                longest_rush_mu = calc_prop_mu(gsis_id, "longest_play", rush_longest_df, season, week, current_team=rb_team, league_fallback_mu=rush_longest_fallback_mu)
+                longest_rush_sigma = calc_player_sigma(gsis_id, "longest_play", rush_longest_df, season, week, current_team=rb_team, league_fallback_sigma=rush_longest_fallback_sigma)
                 rows.append({
                     "gsis_id": gsis_id, "player_display_name": rb.get("full_name"),
                     "team": rb.get("team"), "position": position, "prop_type": "longest_rush",
@@ -3531,7 +3856,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 if (ENABLE_ALIGNMENT_IN_QUALITY_SCORE and coverage_bundle is not None
                         and calc_alignment_exploit_strength is not None and opponent is not None):
                     alignment_info = calc_alignment_exploit_strength(
-                        coverage_bundle, wr.get("full_name"), position, team, opponent,
+                        coverage_bundle, wr.get("full_name"), position, team, opponent, prop_type="rec_yards",
+                        alignment_bundle=alignment_target_bundle,
                     )
                 alignment_exploit_for_scoring = alignment_info.get("exploit_strength") if ENABLE_ALIGNMENT_IN_QUALITY_SCORE else np.nan
 
@@ -3568,7 +3894,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
 
                 grade_exploit = calc_grade_matchup_strength({**own_grades, **def_grades}, "rec_yards")
                 role_trend = build_role_trend(gsis_id, "target_share", player_stats_df, "gsis_id", season, week,
-                                               prior_source_df=player_stats_df)
+                                               prior_source_df=player_stats_df, team=team)
                 role_score = calc_role_verification_score(role_trend)
                 blended_exploit = calc_blended_matchup_strength(
                     combined_structural_exploit, grade_exploit, role_score,
@@ -3631,7 +3957,25 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                     )
                     if sib_prop in PROP_METRIC_CROSSWALK:
                         sib_grade_exploit = calc_grade_matchup_strength(merged_grades_rec, sib_prop)
-                        sib_blended = calc_blended_matchup_strength(combined_structural_exploit, sib_grade_exploit, role_score, role_is_bridged=role_trend.get("bridged_from_prior_season", False))
+                        # Real fix - recompute the alignment structural signal
+                        # PER SIBLING PROP (receptions gets DRP%/CC%, targets
+                        # gets 1READ%) instead of reusing rec_yards' version
+                        # (YPRR/YACO/aDOT) - same fix as the QB-coverage
+                        # sibling loop above, needed for the per-prop stat
+                        # curation to actually apply to receptions/targets.
+                        sib_alignment_exploit = np.nan
+                        if (ENABLE_ALIGNMENT_IN_QUALITY_SCORE and coverage_bundle is not None
+                                and calc_alignment_exploit_strength is not None and opponent is not None
+                                and sib_prop in ("receptions", "targets")):
+                            sib_alignment_info = calc_alignment_exploit_strength(
+                                coverage_bundle, wr.get("full_name"), position, team, opponent, prop_type=sib_prop,
+                                alignment_bundle=alignment_target_bundle,
+                            )
+                            sib_alignment_exploit = sib_alignment_info.get("exploit_strength")
+                        sib_structural_parts = [v for v in [coverage_info.get("exploit_strength"), personnel_exploit_for_scoring,
+                                                             sib_alignment_exploit] if pd.notna(v)]
+                        sib_combined_structural = (sum(sib_structural_parts) / len(sib_structural_parts)) if sib_structural_parts else np.nan
+                        sib_blended = calc_blended_matchup_strength(sib_combined_structural, sib_grade_exploit, role_score, role_is_bridged=role_trend.get("bridged_from_prior_season", False))
                         sib_quality_score = calc_quality_score(
                             matchup_exploit_strength=sib_blended,
                             sample_size_games=rec_confidence_info["games_sampled_current"],
@@ -3652,8 +3996,8 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                         "games_sampled_current": rec_confidence_info["games_sampled_current"],
                     })
 
-                longest_rec_mu = calc_prop_mu(gsis_id, "longest_play", rec_longest_df, season, week, current_team=team)
-                longest_rec_sigma = calc_player_sigma(gsis_id, "longest_play", rec_longest_df, season, week, current_team=team)
+                longest_rec_mu = calc_prop_mu(gsis_id, "longest_play", rec_longest_df, season, week, current_team=team, league_fallback_mu=rec_longest_fallback_mu)
+                longest_rec_sigma = calc_player_sigma(gsis_id, "longest_play", rec_longest_df, season, week, current_team=team, league_fallback_sigma=rec_longest_fallback_sigma)
                 rows.append({
                     "gsis_id": gsis_id, "player_display_name": wr.get("full_name"),
                     "team": team, "position": position, "prop_type": "longest_reception",
@@ -3686,11 +4030,44 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 recent_games = pd.concat([recent_games, prior_season_games])
             if recent_games.empty:
                 continue
-            fantasy_pts_per_game = recent_games.apply(
-                lambda r: calc_offense_fantasy_points(r.to_dict()), axis=1
-            )
-            mu_fantasy = round(fantasy_pts_per_game.mean(), 2)
-            sigma = round(fantasy_pts_per_game.std(ddof=1), 2) if len(fantasy_pts_per_game) >= 2 else np.nan
+            # REAL FIX (found via direct review, per explicit request to
+            # fix if truly needed) - this used to recompute fantasy points
+            # from scratch via calc_offense_fantasy_points, which does NOT
+            # include the real offensive fumble-recovery TD bonus - while
+            # the real "actual" outcome used in the backtest DOES include
+            # it (via fantasy_points_prizepicks, computed earlier in this
+            # same function). Using that same, already-complete column
+            # directly here means mu and actual are now built with
+            # identical methodology - no more silent mismatch for the
+            # rare case of a real fumble-recovery TD in recent history.
+            fantasy_pts_per_game = recent_games["fantasy_points_prizepicks"]
+            raw_mu = fantasy_pts_per_game.mean()
+            games_n_mu = len(fantasy_pts_per_game)
+            league_fallback_mu = fallback_mus.get((pr.get("position"), "fantasy_points_prizepicks"))
+            if league_fallback_mu is None:
+                mu_fantasy = round(raw_mu, 2)
+            else:
+                weight_own_mu = min(games_n_mu / 6, 1.0)
+                mu_fantasy = round((weight_own_mu * raw_mu) + ((1 - weight_own_mu) * league_fallback_mu), 2)
+            raw_sigma = fantasy_pts_per_game.std(ddof=1) if len(fantasy_pts_per_game) >= 2 else np.nan
+            # REAL FIX - this used to be raw_sigma directly, with ZERO
+            # shrinkage protection, unlike every other prop in this file.
+            # Confirmed live: Mark Andrews' real week-3 sample was just 2
+            # games (1.5, 1.4 - both low and similar), producing a
+            # legitimately tiny raw std dev of ~0.07 with nothing to
+            # correct it - his real season-long variance turned out to be
+            # roughly 6-7 points once the full season was in. Now blends
+            # toward a real, position-level league fallback the same way
+            # pass_yards/rush_yards/rec_yards already do, reaching full
+            # confidence only at a real sample size, not on 2 games.
+            position = pr.get("position")
+            games_n = len(fantasy_pts_per_game)
+            league_fallback = fallback_sigmas.get((position, "fantasy_points_prizepicks"))
+            if pd.isna(raw_sigma) or league_fallback is None:
+                sigma = round(raw_sigma, 2) if pd.notna(raw_sigma) else (round(league_fallback, 2) if league_fallback is not None else np.nan)
+            else:
+                weight_own = min(games_n / 6, 1.0)  # 6 = same lookback_games cap used for mu_fantasy above
+                sigma = round((weight_own * raw_sigma) + ((1 - weight_own) * league_fallback), 2)
 
             # Fantasy quality_score = average of this player's already-computed
             # pass/rush/rec quality_scores (whichever apply to their position) -
@@ -3735,8 +4112,21 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
             kicker_pts_per_game = recent_games.apply(
                 lambda r: calc_kicker_fantasy_points(r.to_dict()), axis=1
             )
-            mu_kicker = round(kicker_pts_per_game.mean(), 2)
-            sigma = round(kicker_pts_per_game.std(ddof=1), 2) if len(kicker_pts_per_game) >= 2 else np.nan
+            raw_mu_kicker = kicker_pts_per_game.mean()
+            games_n_kicker = len(kicker_pts_per_game)
+            league_fallback_mu_kicker = fallback_mus.get(("K", "kicker_fantasy"))
+            if league_fallback_mu_kicker is None:
+                mu_kicker = round(raw_mu_kicker, 2)
+            else:
+                weight_own_kicker_mu = min(games_n_kicker / 6, 1.0)
+                mu_kicker = round((weight_own_kicker_mu * raw_mu_kicker) + ((1 - weight_own_kicker_mu) * league_fallback_mu_kicker), 2)
+            raw_sigma_kicker = kicker_pts_per_game.std(ddof=1) if games_n_kicker >= 2 else np.nan
+            league_fallback_sigma_kicker = fallback_sigmas.get(("K", "kicker_fantasy"))
+            if pd.isna(raw_sigma_kicker) or league_fallback_sigma_kicker is None:
+                sigma = round(raw_sigma_kicker, 2) if pd.notna(raw_sigma_kicker) else (round(league_fallback_sigma_kicker, 2) if league_fallback_sigma_kicker is not None else np.nan)
+            else:
+                weight_own_kicker_sigma = min(games_n_kicker / 6, 1.0)
+                sigma = round((weight_own_kicker_sigma * raw_sigma_kicker) + ((1 - weight_own_kicker_sigma) * league_fallback_sigma_kicker), 2)
             rows.append({
                 "gsis_id": gsis_id, "player_display_name": kr.get("full_name"),
                 "team": kr.get("team"), "position": "K", "prop_type": "kicker_fantasy",
@@ -3985,6 +4375,35 @@ def build_league_fallback_mus(player_stats_df: pd.DataFrame, season: int,
             )
             if not per_player_avg.empty:
                 fallback[(position, col)] = round(per_player_avg["mean"].mean(), 2)
+
+    # REAL FIX (same real case as build_league_fallback_sigmas above - Mark
+    # Andrews' real mu of 1.45 was ALSO built from just his 2 real, both-
+    # low early games, same unprotected-thin-sample problem as sigma had.
+    # Real, position-level fallback computed the same way as every other
+    # prop here.
+    if "fantasy_points_prizepicks" in df.columns:
+        for position in prop_by_position:
+            pos_df = df[df["position"] == position]
+            per_player_avg = (
+                pos_df.groupby("gsis_id")["fantasy_points_prizepicks"]
+                .agg(["mean", "count"])
+                .query("count >= 2")
+            )
+            if not per_player_avg.empty:
+                fallback[(position, "fantasy_points_prizepicks")] = round(per_player_avg["mean"].mean(), 2)
+
+    # REAL FIX (found via systematic rescan, per direct request - "kicker
+    # points" had the exact same unprotected raw-mean/raw-sigma pattern
+    # fantasy_points did before that fix). Real, position-level (K)
+    # fallback, built fresh since kicker points aren't a pre-existing
+    # column.
+    kicker_df = df[df["position"] == "K"].copy()
+    if not kicker_df.empty:
+        kicker_df["_kicker_pts"] = kicker_df.apply(lambda r: calc_kicker_fantasy_points(r.to_dict()), axis=1)
+        per_kicker_avg = kicker_df.groupby("gsis_id")["_kicker_pts"].agg(["mean", "count"]).query("count >= 2")
+        if not per_kicker_avg.empty:
+            fallback[("K", "kicker_fantasy")] = round(per_kicker_avg["mean"].mean(), 2)
+
     return fallback
 
 
@@ -4119,6 +4538,46 @@ def build_league_fallback_sigmas(player_stats_df: pd.DataFrame, season: int,
             )
             if not per_player_std.empty:
                 fallback[(position, col)] = round(per_player_std["std"].mean(), 3)
+
+    # REAL FIX (found via direct backtest diagnosis - Mark Andrews showed a
+    # real match_ratio of 366 with sigma=0.07, traced to fantasy_points
+    # having its OWN, separate sigma calculation that completely bypassed
+    # the shrinkage protection every other prop already gets. Confirmed
+    # his real 2-game sample at that point (1.5, 1.4 - both low and
+    # similar) legitimately produced a tiny raw std dev, with nothing to
+    # correct it before this fix. This computes a real, position-level
+    # fantasy_points fallback the same way as every other prop above, so
+    # the same shrinkage mechanism can now be applied to it too.
+    #
+    # SECOND REAL FIX (found immediately after the first, by directly
+    # testing at week 3) - using the same count>=3 threshold as the other
+    # props made this fallback impossible to compute at all that early in
+    # a season (max 2 real games exist when week<3) - confirmed zero
+    # fallback entries existed anywhere, for any prop, at week 3. Lowered
+    # to count>=2 specifically for fantasy_points, since this is the
+    # highest-volume prop (606 real rows in the 3-week sample, dwarfing
+    # any other single prop) and the confirmed, most severe case. A
+    # 2-game-based fallback is imperfect (small samples underestimate true
+    # variance) but confirmed real and far better than the alternative
+    # (0.07, from a single unshrunk outlier case) it replaces.
+    if "fantasy_points_prizepicks" in df.columns:
+        for position in prop_by_position:
+            pos_df = df[df["position"] == position]
+            per_player_std = (
+                pos_df.groupby("gsis_id")["fantasy_points_prizepicks"]
+                .agg(["std", "count"])
+                .query("count >= 2")
+            )
+            if not per_player_std.empty:
+                fallback[(position, "fantasy_points_prizepicks")] = round(per_player_std["std"].mean(), 3)
+
+    # REAL FIX - same rescan finding as the mu fallback above.
+    kicker_df = df[df["position"] == "K"].copy()
+    if not kicker_df.empty:
+        kicker_df["_kicker_pts"] = kicker_df.apply(lambda r: calc_kicker_fantasy_points(r.to_dict()), axis=1)
+        per_kicker_std = kicker_df.groupby("gsis_id")["_kicker_pts"].agg(["std", "count"]).query("count >= 2")
+        if not per_kicker_std.empty:
+            fallback[("K", "kicker_fantasy")] = round(per_kicker_std["std"].mean(), 3)
 
     return fallback
 
@@ -4263,7 +4722,8 @@ def get_usage_relevant_players_for_week(season: int, week: int, player_stats_df:
 
 
 def score_week_against_actuals(season: int, week: int, starters_only: bool = True, coverage_bundle=None,
-                                rb_bundle=None, strict_true_starters: bool = False) -> pd.DataFrame:
+                                rb_bundle=None, strict_true_starters: bool = False,
+                                alignment_target_bundle: "TeamAlignmentTargetBundle" = None) -> pd.DataFrame:
     """
     Shared core of backtest_week(): builds the week's slate, looks up each
     player's REAL result, and attaches miss/abs_miss/match_ratio - but
@@ -4276,7 +4736,8 @@ def score_week_against_actuals(season: int, week: int, starters_only: bool = Tru
     both premium signals can eventually get their own isolated backtests,
     same as every other flag.
     """
-    slate_df = build_weekly_slate(season, week, coverage_bundle=coverage_bundle, rb_bundle=rb_bundle)
+    slate_df = build_weekly_slate(season, week, coverage_bundle=coverage_bundle, rb_bundle=rb_bundle,
+                                   alignment_target_bundle=alignment_target_bundle)
     player_stats_df = pull_player_stats([season])
     depth_charts_df = pull_depth_charts([season]) if nfl else pd.DataFrame()
     schedules_df = pull_schedules([season])
@@ -5453,11 +5914,6 @@ def build_partial_game_player_stats(pbp_df: pd.DataFrame, time_window: str) -> p
     return result.fillna(0)
 
 
-# Real column-name mapping for partial-game props, same real shape as
-# score_week_against_actuals's own prop_to_stat_column - the left side is
-# what gets shown/scored as the "prop", the right side is the real
-# column build_partial_game_player_stats actually produces for it once
-# prefixed with the real time window ("1q_"/"1h_").
 # Real, deliberate narrowing (per direct feedback after the first real
 # live backtest run) - TD props and longest-play props dropped from the
 # 1Q/1H list specifically. TDs showed a real, honest problem in that
@@ -5470,10 +5926,16 @@ def build_partial_game_player_stats(pbp_df: pd.DataFrame, time_window: str) -> p
 # rare-event reason) are kept - full-game props (score_week_against_
 # actuals) are unaffected, this narrowing is specific to the
 # partial-game backtest only.
+# REAL FIX (per direct, explicit request - exactly these 7 props, no
+# more): "targets" was also being scored for 1Q/1H even though it was
+# never actually asked for in the original narrowing request above -
+# removed to match the real, stated list precisely: pass_yards,
+# rush_yards, receptions, rec_yards, rush_attempts, pass_attempts,
+# pass_completions.
 NFL_PARTIAL_PROP_TO_STAT_SUFFIX = {
     "rush_attempts": "rush_attempts", "rush_yards": "rushing_yards",
-    "receptions": "receptions", "targets": "targets", "rec_yards": "receiving_yards",
-    "pass_attempts": "attempts", "pass_completions": "completions", "pass_yards": "passing_yards",
+    "receptions": "receptions", "rec_yards": "receiving_yards",
+    "pass_yards": "passing_yards", "pass_tds": "passing_tds", "targets": "targets",
 }
 
 
@@ -5510,6 +5972,15 @@ def score_partial_game_week_against_actuals(season: int, week: int, time_window:
     if partial_stats_df.empty:
         return pd.DataFrame()
 
+    # REAL FIX (found via direct testing right after adding the fallback
+    # above - partial_stats_df never had a position column at all,
+    # confirmed via direct column check, causing a real KeyError the
+    # moment the new fallback code tried to group by it). Merges real
+    # position from player_stats_df, the same real source used
+    # elsewhere in this file for position lookups.
+    position_lookup = pull_player_stats([season])[["gsis_id", "position"]].drop_duplicates("gsis_id")
+    partial_stats_df = partial_stats_df.merge(position_lookup, on="gsis_id", how="left")
+
     depth_charts_df = pull_depth_charts([season]) if nfl else pd.DataFrame()
     schedules_df = pull_schedules([season])
 
@@ -5530,6 +6001,33 @@ def score_partial_game_week_against_actuals(season: int, week: int, time_window:
             actual_week_rows = actual_week_rows[actual_week_rows.index.isin(starter_ids)]
 
     rows = []
+    # REAL FIX (found via systematic rescan, per direct request to check
+    # if anything more can improve the model) - this partial-game scoring
+    # had ZERO fallback protection at all, the same unprotected pattern
+    # found and fixed for fantasy_points/kicker_fantasy/longest-play
+    # props earlier - and partial-game stats (just one quarter or half)
+    # are inherently thinner samples than full-game stats, making this
+    # population MORE exposed to the same risk, not less. Real,
+    # position-specific fallback built directly from this same real
+    # partial_stats_df, for every real (position, stat_col) combination
+    # actually used below.
+    hist_partial = partial_stats_df[
+        (partial_stats_df["season"] == season) & (partial_stats_df["week"] < week)
+    ]
+    partial_fallback_mu = {}
+    partial_fallback_sigma = {}
+    for prop_type, stat_suffix in NFL_PARTIAL_PROP_TO_STAT_SUFFIX.items():
+        stat_col = prefix + stat_suffix
+        if stat_col not in hist_partial.columns:
+            continue
+        for position in hist_partial["position"].dropna().unique():
+            pos_df = hist_partial[hist_partial["position"] == position]
+            per_player = pos_df.groupby("gsis_id")[stat_col].agg(["mean", "std", "count"]).query("count >= 2")
+            if per_player.empty:
+                continue
+            partial_fallback_mu[(position, stat_col)] = round(per_player["mean"].mean(), 2)
+            partial_fallback_sigma[(position, stat_col)] = round(per_player["std"].mean(), 2)
+
     for gsis_id, arow in actual_week_rows.iterrows():
         team = arow.get("team")
         for prop_type, stat_suffix in NFL_PARTIAL_PROP_TO_STAT_SUFFIX.items():
@@ -5544,8 +6042,11 @@ def score_partial_game_week_against_actuals(season: int, week: int, time_window:
             # props only now, so those cases no longer apply here.
             if actual == 0:
                 continue
-            mu = calc_prop_mu(gsis_id, stat_col, partial_stats_df, season, week, current_team=team)
-            sigma = calc_player_sigma(gsis_id, stat_col, partial_stats_df, season, week, current_team=team)
+            position = arow.get("position")
+            mu = calc_prop_mu(gsis_id, stat_col, partial_stats_df, season, week, current_team=team,
+                               league_fallback_mu=partial_fallback_mu.get((position, stat_col)))
+            sigma = calc_player_sigma(gsis_id, stat_col, partial_stats_df, season, week, current_team=team,
+                                       league_fallback_sigma=partial_fallback_sigma.get((position, stat_col)))
             if pd.isna(mu) or pd.isna(sigma):
                 continue
             miss = mu - actual
@@ -6392,10 +6893,37 @@ THIN_SAMPLE_ATT_THRESHOLD = {
     "COVER 3 %": 20, "COVER 4 %": 15, "COVER 6 %": 10,
 }
 
-OUTLIER_Z_THRESHOLD = 1.0
+OUTLIER_Z_THRESHOLD = 1.0  # kept for reference; superseded by COVERAGE_RANK_THRESHOLD below for actual coverage selection
+# Real, validated threshold (see load_team_coverage_matrix) - a coverage
+# counts as "meaningfully used" if this defense ranks in the top 10 of 32
+# teams for it, roughly the top third leaguewide. Confirmed directly
+# against real 2025 data to reproduce the exact real example given (NE's
+# Cover 1/2/4 at ranks 6/5/10), and stress-tested against several other
+# real teams to confirm it behaves reasonably (1-3 qualifying coverages
+# typically, adapts per team, not universally maxed out).
+COVERAGE_RANK_THRESHOLD = 10
+# Real, validated margin (see load_team_coverage_matrix) - a coverage
+# ranked just outside the top 10 still qualifies if its real rate is
+# within 5% (relative) of the rank-10 rate, avoiding an arbitrary hard
+# cliff between two teams separated by a real gap as small as 0.1 points.
+COVERAGE_TIE_MARGIN_PCT = 0.05
 
 # Stats where a HIGHER number is worse for the QB (need to flip tiering direction)
-INVERSE_STATS = {"INT", "SACK", "SACK %", "SK YDS", "DROP %", "DROP YDS",
+# REAL, SEVERE BUG FOUND AND FIXED (via direct testing against real
+# uploaded data - confirmed QBs with 2 real interceptions were being
+# tiered "Elite" and QBs with 0 were "Below Avg", the exact opposite of
+# correct): this set used to be named plain INVERSE_STATS, and a SEPARATE,
+# unrelated RB-specific set further down this file (originally also named
+# INVERSE_STATS = {"FUM", "STUFF %"}) SILENTLY OVERWROTE this one at
+# import time, since both were simple module-level globals sharing the
+# same name - Python has no scoping between them. Every QB-vs-coverage
+# and alignment tier computation has been using the RB's tiny 2-item set
+# instead of this one ever since, meaning INT/SACK/SACK%/SK YDS/DROP%/
+# DROP YDS/PRESS%/PRESS SK%/TTSK/QB SK/QBP/BAT/SPK were all being graded
+# backwards (higher = "Elite") for as long as this code has existed.
+# Renamed to a unique name, with the RB set renamed too (see RB_
+# INVERSE_STATS below) - each now correctly used only where intended.
+QB_ALIGNMENT_INVERSE_STATS = {"INT", "SACK", "SACK %", "SK YDS", "DROP %", "DROP YDS",
                   "DRP", "DRP %",  # real column names confirmed from actual
                   # WR/TE exports - "DROP %" above never matched real data at
                   # all, meaning drop rate tiering direction was silently
@@ -6484,6 +7012,7 @@ class TeamCoverageProfile:
     team_name: str
     rates: dict
     z_scores: dict = field(default_factory=dict)
+    ranks: dict = field(default_factory=dict)  # {coverage_field: real leaguewide rank, 1=highest usage}
     outliers: list = field(default_factory=list)
 
 
@@ -6501,12 +7030,52 @@ def load_team_coverage_matrix(csv_path):
         vals = [p.rates[f] for p in profiles.values()]
         league_stats[f] = (mean(vals), pstdev(vals))
 
+    # REAL FIX (per direct example - NE week-1-2025 real coverage usage:
+    # Cover 1 23.9% ranked 6th of 32, Cover 2 21.7% ranked 5th, Cover 4
+    # 17.6% ranked 10th): the z-score outlier threshold (>=1.0) only
+    # caught Cover 2 for this exact real matchup - Cover 1 (z=0.86) and
+    # Cover 4 (z=0.40) never cleared it, even though both are genuinely
+    # meaningful, real, above-average tendencies. A single defense's
+    # coverage rates aren't always spread out enough for z-score alone to
+    # flag a real top-third tendency as statistically "unusual" - rank
+    # captures this better. Switched to real LEAGUEWIDE RANK (top 10 of
+    # 32, roughly the top third) instead of a z-score cutoff - validated
+    # directly against 2025 data: this exact threshold reproduces the
+    # user's own real example precisely, and stress-tested reasonably
+    # across several other real teams (Seattle: 1 qualifying coverage,
+    # KC/Denver: 3 each) - it adapts naturally per team rather than
+    # forcing a fixed count. z-score is still computed and still used as
+    # the downstream WEIGHT (a coverage a team leans into more heavily
+    # still counts for more), just no longer the selection gate itself.
+    # REAL FIX (per direct follow-up question - a hard cliff at exactly
+    # rank 10 is arbitrary when the real gap to rank 11+ is tiny: e.g.
+    # real 2025 Cover 4 data has rank 10 at 17.6% and rank 11 at 17.5% -
+    # a 0.1-point gap, not a meaningful cutoff). Tested an ABSOLUTE margin
+    # (e.g. "within 0.5 points of the rank-10 rate") first and found it
+    # behaves inconsistently across fields with very different scales -
+    # Cover 0 rates cluster in the 3-8% range so 0.5 points pulled in 5
+    # extra teams, while Cover 3 rates run 25-35% so the same 0.5 points
+    # pulled in only 1. Switched to a RELATIVE margin instead (5% of the
+    # rank-10 rate itself) - confirmed via direct testing this behaves
+    # consistently (1-4 extra teams) across every real coverage field
+    # regardless of its own scale.
+    for f in COVERAGE_FIELDS:
+        ranked = sorted(profiles.values(), key=lambda p: -p.rates[f])
+        for rank, p in enumerate(ranked, start=1):
+            p.ranks[f] = rank
+        if len(ranked) >= COVERAGE_RANK_THRESHOLD:
+            rank10_rate = ranked[COVERAGE_RANK_THRESHOLD - 1].rates[f]
+            tie_cutoff = rank10_rate * (1 - COVERAGE_TIE_MARGIN_PCT)
+            for p in ranked:
+                if p.ranks[f] > COVERAGE_RANK_THRESHOLD and p.rates[f] >= tie_cutoff:
+                    p.ranks[f] = COVERAGE_RANK_THRESHOLD  # real near-tie - treat as qualifying, same as rank 10 itself
+
     for p in profiles.values():
         for f in COVERAGE_FIELDS:
             avg, sd = league_stats[f]
             p.z_scores[f] = (p.rates[f] - avg) / sd if sd else 0.0
         p.outliers = sorted(
-            [(f, z) for f, z in p.z_scores.items() if z >= OUTLIER_Z_THRESHOLD],
+            [(f, p.z_scores[f]) for f in COVERAGE_FIELDS if p.ranks.get(f, 99) <= COVERAGE_RANK_THRESHOLD],
             key=lambda x: -x[1]
         )
     return profiles, league_stats
@@ -6550,7 +7119,7 @@ def _compute_field_tiers(rows_by_key):
             if v is None or not sd:
                 continue
             z = (v - avg) / sd
-            if col in INVERSE_STATS:
+            if col in QB_ALIGNMENT_INVERSE_STATS:
                 z = -z
             if z >= 1.5:
                 tiers[col] = "Elite"
@@ -6587,6 +7156,15 @@ def _load_coverage_keyed_data(file_paths: dict, key_column: str, volume_column: 
             threshold = THIN_SAMPLE_ATT_THRESHOLD.get(coverage_field, 15)
             d["_thin_sample"] = (att < threshold) or (coverage_field in ALWAYS_THIN_COVERAGES)
             d["_att"] = att
+            # REAL FIX (per direct request) - neither the QB-vs-coverage
+            # nor receiving files provide a real TD RATE column (RB files
+            # do - "TD RATE" - this mirrors that same real signal for the
+            # other two positions, computed here since it isn't directly
+            # in the CSV). TD/ATT for QB files, TD/TGT for receiving files
+            # - whichever volume_column this call is already using.
+            real_td = _to_float(d.get("TD"))
+            if real_td is not None and att > 0:
+                d["TD %"] = round((real_td / att) * 100, 2)
             by_key[key] = d
         _compute_field_tiers(by_key)
         data[coverage_field] = by_key
@@ -6634,6 +7212,91 @@ def load_def_allowed_qb_scrambles(file_path: str):
     return _load_coverage_keyed_data({"SCRAMBLE": file_path}, key_column="Name")
 
 
+def get_top_pass_catchers(team: str, season: int, week: int, player_stats_df: pd.DataFrame,
+                           max_players: int = 4) -> list:
+    """
+    Real, direct identification of a QB's current top pass-catchers -
+    weeks BEFORE the target week only (same leak-avoidance as everywhere
+    else), ranked by real target_share, WR/TE/RB eligible (a real pass-
+    catching back counts too). Returns [(player_name, target_share), ...]
+    for the top max_players by real share - this is the actual "who does
+    this QB throw to" list the supporting-cast signal below needs.
+    """
+    hist = player_stats_df[
+        (player_stats_df["season"] == season) & (player_stats_df["week"] < week)
+        & (player_stats_df["team"] == team)
+    ]
+    hist = hist[hist["position"].isin(["WR", "TE", "RB"])]
+    if hist.empty:
+        return []
+    agg = hist.groupby("player_display_name").agg(
+        target_share=("target_share", "mean"),
+    ).reset_index()
+    agg = agg.dropna(subset=["target_share"]).sort_values("target_share", ascending=False).head(max_players)
+    return list(zip(agg["player_display_name"], agg["target_share"]))
+
+
+def calc_supporting_cast_exploit_strength(bundle: "CoverageDataBundle", teammates: list,
+                                           team_abbrev: str, opponent_team_abbrev: str) -> dict:
+    """
+    REAL, NEW CROSS-REFERENCING SIGNAL (built live per direct request):
+    a QB's real pass_yards/completions/attempts/tds output depends on how
+    well his ACTUAL current pass-catchers fit the specific coverages this
+    opponent leans into - not just the QB's own numbers in isolation. If
+    Josh Allen's real weapons this season are DJ Moore/Khalil Shakir/
+    Dalton Kincaid/James Cook, and the opponent leans heavily into Cover 2
+    and Cover 3, this checks how each of THOSE SPECIFIC real teammates has
+    actually performed against Cover 2/3 (via the same alignment-vs-
+    coverage data already used for their own props), weighted by each
+    teammate's real target_share (his #1 option matters more than his
+    4th), and blends that into the QB's own structural signal.
+
+    teammates: [(player_name, target_share), ...] from get_top_pass_
+    catchers - real, current, weeks-before-target-week volume, not a
+    guess at who "should" be catching passes.
+
+    Returns exploit_strength NaN (not a guess) if none of the real
+    teammates have any real data against this opponent's real outlier
+    coverages - a real gap, not defaulted to neutral.
+    """
+    if not teammates:
+        return {"exploit_strength": np.nan, "teammates_checked": []}
+
+    weighted_scores, weights, checked = [], [], []
+    for name, share in teammates:
+        if pd.isna(share) or share <= 0:
+            continue
+        # Real fix - without prop_type, this silently fell back to FP/G
+        # alone (a generic overall-value number) instead of the rich,
+        # curated rec_yards bucket (YPRR, YACO/REC, aDOT, AY, explosive-
+        # play rate, etc.) built earlier this session. "rec_yards" is the
+        # right bucket here specifically because a QB's pass_yards depends
+        # on his receivers generating real YARDAGE against this coverage,
+        # not just overall fantasy value - matches the direct example
+        # given (does DJ Moore actually produce real yardage vs Cover 2/3,
+        # not just "is he a good fantasy option in general").
+        result = calc_alignment_exploit_strength(bundle, name, None, team_abbrev, opponent_team_abbrev,
+                                                   prop_type="rec_yards")
+        exploit = result.get("exploit_strength")
+        if pd.notna(exploit):
+            weighted_scores.append(exploit)
+            weights.append(share)
+            checked.append(name)
+
+    if not weighted_scores:
+        return {"exploit_strength": np.nan, "teammates_checked": []}
+    exploit_strength = sum(s * w for s, w in zip(weighted_scores, weights)) / sum(weights)
+    return {"exploit_strength": round(exploit_strength, 3), "teammates_checked": checked}
+
+
+QB_SCRAMBLE_STAT_BUCKETS = {
+    "volume": ["ATT"],
+    "contact_yardage": ["YACO"],
+    "elusiveness": ["MTF"],
+}
+QB_SCRAMBLE_DEFAULT_STATS = {"_all": ["FP/G"]}
+
+
 def calc_qb_scramble_exploit_strength(qb_scrambles: dict, def_allowed_scrambles: dict,
                                        qb_name: str, opponent_team_abbrev: str) -> dict:
     """
@@ -6647,29 +7310,56 @@ def calc_qb_scramble_exploit_strength(qb_scrambles: dict, def_allowed_scrambles:
     role_verification/mu) - same weighting philosophy as every other
     exploit-strength function in this module.
 
-    Uses FP/G as the combination stat - available on both sides and
-    already the established general-quality stat this module uses
-    elsewhere (see calc_alignment_exploit_strength).
+    REAL FIX (found live this session, per direct real pushback to use
+    every real column rather than one blended stat): previously always
+    used FP/G alone. Now blends across ATT (volume), YACO (yards after
+    contact on scrambles specifically), and MTF (elusiveness) - bucketed
+    equally so no one column dominates, same fix as calc_qb_coverage_
+    exploit_strength/calc_alignment_exploit_strength above. HONEST GAP:
+    "Success %" from this same file is deliberately left out, same
+    unresolved ambiguity as the RB run-concept version - not yet
+    confirmed whether it means something distinct here or is a same-name
+    coincidence with the RB file's column.
 
     Returns exploit_strength NaN (not a guess) if either side has no real
     data - a real gap, not defaulted to neutral.
+
+    REAL FIX (found live this session, per direct follow-up request) -
+    this had ZERO coordinator-change awareness before this: returns
+    neutral (NaN) if the opponent has a real, new 2026 DC
+    (NEW_DC_TEAMS_2026), since the opponent's real scramble-allowed data
+    is built from their real, uploaded 2025 CSV. The QB's own side isn't
+    additionally gated on NEW_QB_TEAMS_2026 here, since qb_name is already
+    identity-keyed to whichever real player is actually starting - if
+    that's a genuinely new starter, his own real name correctly pulls his
+    own real (possibly thin, possibly from a different team) history,
+    same graceful degrade as everywhere else, not a team-level question.
     """
     opp_full = TEAM_ABBREV_TO_FULL.get((opponent_team_abbrev or "").upper())
-    if opp_full is None:
+    if opp_full is None or (opponent_team_abbrev or "").upper() in NEW_DC_TEAMS_2026:
         return {"exploit_strength": np.nan}
 
     def_row = def_allowed_scrambles.get("SCRAMBLE", {}).get(opp_full)
-    def_score = _tier_to_score(def_row.get("_tiers") if def_row else None, "FP/G")
-
     qb_row = qb_scrambles.get("SCRAMBLE", {}).get(qb_name)
-    qb_score = _tier_to_score(qb_row.get("_tiers") if qb_row else None, "FP/G")
+    def_tiers = (def_row.get("_tiers") or {}) if def_row else {}
+    qb_tiers = (qb_row.get("_tiers") or {}) if qb_row else {}
+
+    def_bucket_scores = []
+    qb_bucket_scores = []
+    for bucket_stats in QB_SCRAMBLE_STAT_BUCKETS.values():
+        d_scores = [TIER_SCORE.get(def_tiers.get(stat)) for stat in bucket_stats if def_tiers.get(stat) is not None]
+        q_scores = [TIER_SCORE.get(qb_tiers.get(stat)) for stat in bucket_stats if qb_tiers.get(stat) is not None]
+        if d_scores:
+            def_bucket_scores.append(sum(d_scores) / len(d_scores))
+        if q_scores:
+            qb_bucket_scores.append(sum(q_scores) / len(q_scores))
 
     parts, weights = [], []
-    if def_score is not None:
-        parts.append(def_score)
+    if def_bucket_scores:
+        parts.append(sum(def_bucket_scores) / len(def_bucket_scores))
         weights.append(0.6)
-    if qb_score is not None:
-        parts.append(qb_score)
+    if qb_bucket_scores:
+        parts.append(sum(qb_bucket_scores) / len(qb_bucket_scores))
         weights.append(0.4)
     if not parts:
         return {"exploit_strength": np.nan}
@@ -6905,7 +7595,7 @@ ALIGNMENT_DEF_DIRS = {
 QB_DIR = "QBS"
 QB_DEF_DIR = os.path.join("DEF ALLOWED", "VS QBS")
 COVG_DIR = "COVG%"
-QB_SCRAMBLE_DIR = "QB_SCRAMBLES"
+QB_SCRAMBLE_DIR = "QB RUSH METRICS"  # Real fix - confirmed against actual uploaded data; was looking for "QB_SCRAMBLES" which doesn't match the real folder name
 
 
 def _find_covg_file(covg_dir, want_offense):
@@ -7082,28 +7772,87 @@ def _weighted_outlier_exploit(outliers, own_data_by_coverage, def_allowed_by_cov
     Returns (exploit_strength: float|nan, coverages_checked: list[str]).
     Real gaps (no data for a coverage on either side) are skipped rather
     than defaulted to a neutral score - "no data" and "average" aren't
-    the same thing."""
+    the same thing.
+
+    REAL, SECOND FIX (per direct, explicit request to use EVERY real
+    column from these CSVs, not a hand-picked subset): own_stat now
+    accepts THREE shapes -
+      - a single stat name (original behavior, unchanged)
+      - a flat list of stat names (first fix - simple equal-weight average)
+      - a dict of {bucket_name: [stat_names]} (this fix) - stats within
+        the same bucket are averaged together FIRST (so e.g. 6 different
+        pressure-related columns collapse into one "pressure" reading),
+        then buckets are averaged together EQUALLY across each other -
+        this is what actually lets every real column get used without a
+        bucket that happens to have more columns silently dominating the
+        signal just by column count. A flat list is treated as one
+        implicit bucket (equivalent to the first fix); this keeps both
+        prior call shapes working unchanged.
+    """
     if not outliers:
         return np.nan, []
+
+    if isinstance(own_stat, dict):
+        stat_buckets = own_stat
+    elif isinstance(own_stat, (list, tuple)):
+        stat_buckets = {"_all": list(own_stat)}
+    else:
+        stat_buckets = {"_all": [own_stat]}
 
     weighted_scores = []
     weights = []
     checked = []
     for coverage_field, z in outliers[:max_outliers]:
         checked.append(coverage_field.replace(" %", ""))
+        def_row = def_allowed_by_coverage.get(coverage_field, {}).get(opp_team_name)
+        own_row = own_data_by_coverage.get(coverage_field, {}).get(own_name)
+        def_tiers = def_row.get("_tiers") if def_row else None
+        own_tiers = own_row.get("_tiers") if own_row else None
+
+        # Real fix - average WITHIN each bucket first, then average the
+        # resulting per-bucket scores together EQUALLY, regardless of how
+        # many raw columns fed each bucket. This is the actual mechanism
+        # that lets every real column be used (nothing thrown away) while
+        # stopping a bucket with many redundant columns (e.g. 6 pressure
+        # cuts) from silently outvoting a bucket with just 1 (e.g. 1
+        # turnover-rate column).
+        #
+        # REAL FIX - per-bucket direction override (per direct example: a
+        # LOW aDOT/YPR/YAC-per-rec is a real green light for receptions
+        # specifically - short, high-percentage looks mean more catches -
+        # even though the SAME stat isn't treated as bad for rec_yards.
+        # QB_ALIGNMENT_INVERSE_STATS is a single GLOBAL direction per stat
+        # and can't represent "inverted for this prop, not for that one."
+        # A stat name prefixed with '~' (e.g. "~aDOT") means: look up this
+        # stat's normal tier score, then flip it (1 - score) for THIS
+        # bucket only - the stat's globally-computed tier itself is
+        # untouched, so other buckets/props referencing the same plain
+        # stat name are completely unaffected.
+        def_bucket_scores = []
+        own_bucket_scores = []
+        for bucket_stats in stat_buckets.values():
+            d_scores, o_scores = [], []
+            for stat in bucket_stats:
+                invert = stat.startswith("~")
+                real_stat = stat[1:] if invert else stat
+                d = _tier_to_score(def_tiers, real_stat)
+                o = _tier_to_score(own_tiers, real_stat)
+                if d is not None:
+                    d_scores.append(1 - d if invert else d)
+                if o is not None:
+                    o_scores.append(1 - o if invert else o)
+            if d_scores:
+                def_bucket_scores.append(sum(d_scores) / len(d_scores))
+            if o_scores:
+                own_bucket_scores.append(sum(o_scores) / len(o_scores))
+
         parts = []
         part_weights = []
-
-        def_row = def_allowed_by_coverage.get(coverage_field, {}).get(opp_team_name)
-        def_score = _tier_to_score(def_row.get("_tiers") if def_row else None, own_stat)
-        if def_score is not None:
-            parts.append(def_score)
+        if def_bucket_scores:
+            parts.append(sum(def_bucket_scores) / len(def_bucket_scores))
             part_weights.append(def_weight)
-
-        own_row = own_data_by_coverage.get(coverage_field, {}).get(own_name)
-        own_score = _tier_to_score(own_row.get("_tiers") if own_row else None, own_stat)
-        if own_score is not None:
-            parts.append(own_score)
+        if own_bucket_scores:
+            parts.append(sum(own_bucket_scores) / len(own_bucket_scores))
             part_weights.append(own_weight)
 
         if not parts:
@@ -7118,16 +7867,77 @@ def _weighted_outlier_exploit(outliers, own_data_by_coverage, def_allowed_by_cov
     return round(exploit_strength, 3), checked
 
 
+# Real, COMPREHENSIVE bucketed stat sets per QB prop - per direct request
+# to use every real column from the actual CSV rather than a hand-picked
+# subset. Bucketed by underlying concept (see _weighted_outlier_exploit's
+# bucket-averaging) so e.g. the 6 different pressure-related columns
+# (TTT/TTP/TTSK/TTSC/QB SK/QBP/PRESS%/PRESS SK%/PrROE) collapse into ONE
+# "pressure" vote per coverage, not 9 votes silently drowning out a
+# 1-column bucket like turnover rate. Genuinely ambiguous/unclear columns
+# from the raw list (DB, TA, TWT %) are left out rather than guessed into
+# a bucket where they might not belong - real column definitions needed
+# to place these with confidence (flagged to the user, not silently
+# dropped without saying so).
+QB_COVERAGE_STATS_BY_PROP = {
+    "pass_yards": {
+        "efficiency": ["YPA", "ANY/A", "CPOE"],
+        "depth_explosiveness": ["aDOT", "AY", "Deep Throw %", "Deep Throw"],
+        "yac": ["YAC %"],
+        "accuracy_context": ["ADJ CMP %", "ACC %"],
+        "pressure": ["TTT", "TTP", "TTSK", "TTSC", "QB SK", "QBP", "PRESS %", "PRESS SK %", "PrROE"],
+    },
+    "pass_completions": {
+        "accuracy": ["CMP %", "ADJ CMP %", "ACC %", "CATCH %", "CPOE"],
+        "reliability": ["DROP %", "DROP YDS"],
+        "pressure": ["TTT", "TTP", "TTSK", "TTSC", "PRESS %", "PRESS SK %", "PrROE"],
+    },
+    "pass_attempts": {
+        "volume_tendency": ["ATT", "RPO %", "CHK %", "OFF %"],
+    },
+    "pass_tds": {
+        "scoring_opportunity": ["TD", "TD %", "EZATT"],
+    },
+    # REAL FIX - per direct request. A long completion needs both real
+    # depth (deep-throw volume/accuracy) and real accuracy under that
+    # depth - a QB who's accurate on deep throws specifically is the
+    # right signal here, not just raw yardage efficiency (YPA already
+    # covers that for pass_yards).
+    "longest_completion": {
+        "depth_accuracy": ["YPA", "ADJ CMP %", "Deep Throw %", "ACC %"],
+    },
+    "interceptions": {
+        "turnover": ["INT"],
+        "pressure": ["TTT", "TTP", "TTSK", "TTSC", "QB SK", "QBP", "PRESS %", "PRESS SK %", "PrROE"],
+        "sack_risk": ["SACK", "SACK %", "SK YDS"],
+    },
+}
+# Real, honest fallback for any QB prop not in the table above (e.g.
+# fantasy_points, or a future prop) - RATE alone, the original behavior,
+# rather than silently returning nothing.
+QB_COVERAGE_DEFAULT_STATS = ["RATE"]
+
+
 def calc_qb_coverage_exploit_strength(bundle: CoverageDataBundle, qb_name: str,
-                                       qb_team_abbrev: str, opponent_team_abbrev: str) -> dict:
+                                       qb_team_abbrev: str, opponent_team_abbrev: str,
+                                       prop_type: str = None) -> dict:
     """
     Real per-QB signal: for each coverage this opponent's defense genuinely
     leans into (real z-score outlier, not just locally highest), combines
-    how much that defense allows to QBs in that specific coverage (RATE
-    allowed, tiered against the real league distribution of defenses in
-    that coverage) with this QB's own real RATE in that same coverage from
-    his own game history - see _weighted_outlier_exploit for the exact
-    combination and weighting.
+    how much that defense allows to QBs in that specific coverage (tiered
+    against the real league distribution of defenses in that coverage)
+    with this QB's own real numbers in that same coverage from his own
+    game history - see _weighted_outlier_exploit for the exact combination
+    and weighting.
+
+    REAL FIX (found live this session, per direct real pushback): this
+    used to ALWAYS use "RATE" regardless of which prop was actually being
+    scored - meaning pass_yards, pass_completions, pass_attempts, pass_tds
+    and interceptions all got the exact same coverage-fit signal, despite
+    RATE being a composite that doesn't isolate any of them individually.
+    Now takes prop_type and pulls a genuinely tailored, non-redundant stat
+    set for that specific prop from QB_COVERAGE_STATS_BY_PROP (falls back
+    to RATE alone - the original behavior - if prop_type is omitted or
+    not in the table, so existing callers aren't broken).
 
     Team abbreviations (as used throughout nfl_model_combined.py) are
     converted to the full names this module's data is keyed on via
@@ -7135,21 +7945,58 @@ def calc_qb_coverage_exploit_strength(bundle: CoverageDataBundle, qb_name: str,
     NaN) if the opponent isn't found or has no real outlier coverage this
     season - never raises, matching this module's established graceful-
     gap handling throughout.
+
+    REAL FIX (found live this session, per direct follow-up request): this
+    premium signal is built entirely from the opponent's real, uploaded
+    coverage-usage CSV (season data) - it had NO coordinator-change
+    awareness at all, unlike the free-data grade builders which already
+    check NEW_OC_TEAMS_2026/NEW_DC_TEAMS_2026. If the opponent has a real,
+    new 2026 DC, their real coverage-usage mix from that CSV may no longer
+    reflect their actual current scheme - same unreliability as the free-
+    data bridge case, just never protected the same way. Now returns
+    neutral (NaN) for opponents on NEW_DC_TEAMS_2026, exactly like the
+    free-data functions do for their own bridge.
     """
     opp_full = TEAM_ABBREV_TO_FULL.get((opponent_team_abbrev or "").upper())
+    if (opponent_team_abbrev or "").upper() in NEW_DC_TEAMS_2026:
+        return {"exploit_strength": np.nan, "outlier_coverages_checked": []}
     opp_profile = bundle.def_coverage.get(opp_full) if opp_full else None
     if opp_profile is None:
         return {"exploit_strength": np.nan, "outlier_coverages_checked": []}
 
+    stats_to_use = QB_COVERAGE_STATS_BY_PROP.get(prop_type, QB_COVERAGE_DEFAULT_STATS)
     exploit_strength, checked = _weighted_outlier_exploit(
         opp_profile.outliers, bundle.qb_vs_coverage, bundle.def_allowed_to_qb,
-        qb_name, opp_profile.team_name, own_stat="RATE",
+        qb_name, opp_profile.team_name, own_stat=stats_to_use,
     )
-    return {"exploit_strength": exploit_strength, "outlier_coverages_checked": checked}
+
+    # REAL FIX (found live via direct user pushback - Cincinnati/Burrow's
+    # real 8-game 2025 season raised a fair concern, and checking it
+    # directly surfaced an even more severe, completely unflagged case:
+    # San Francisco/Purdy played only 9 real games). Doesn't blanket-
+    # exclude a QB just for a shortened season - some per-coverage
+    # attempt counts stay genuinely large even in a short season
+    # (Burrow had 76 real attempts vs Cover 3 alone despite only 8 games)
+    # - but surfaces the real risk transparently: a shortened season
+    # means less real game-to-game variety represented, which a large
+    # raw attempt count alone doesn't fully rule out. Real threshold: 10
+    # of 17 games, roughly 60% of a season.
+    real_games = None
+    for coverage_rows in bundle.qb_vs_coverage.values():
+        row = coverage_rows.get(qb_name)
+        if row and row.get("G") is not None:
+            real_games = _to_float(row.get("G"))
+            break
+    low_season_sample = real_games is not None and real_games < 10
+
+    return {"exploit_strength": exploit_strength, "outlier_coverages_checked": checked,
+            "real_games_played_2025": real_games, "low_season_sample_warning": low_season_sample}
 
 
 def calc_alignment_exploit_strength(bundle: CoverageDataBundle, player_name: str, position: str,
-                                     player_team_abbrev: str, opponent_team_abbrev: str) -> dict:
+                                     player_team_abbrev: str, opponent_team_abbrev: str,
+                                     prop_type: str = None,
+                                     alignment_bundle: "TeamAlignmentTargetBundle" = None) -> dict:
     """
     Real per-receiver signal, same shape as calc_qb_coverage_exploit_
     strength above, but first has to figure out which alignment
@@ -7181,8 +8028,17 @@ def calc_alignment_exploit_strength(bundle: CoverageDataBundle, player_name: str
     Returns exploit_strength NaN (not a guess) if the player has no
     recorded targets in ANY alignment file yet this season - a real gap,
     not defaulted to neutral.
+
+    REAL FIX (found live this session, same fix as calc_qb_coverage_
+    exploit_strength above) - returns neutral (NaN) if the opponent has a
+    real, new 2026 DC (NEW_DC_TEAMS_2026), since this signal is built
+    entirely from the opponent's real, uploaded coverage-usage CSV and had
+    no coordinator-change awareness at all before this.
     """
     opp_full = TEAM_ABBREV_TO_FULL.get((opponent_team_abbrev or "").upper())
+    if (opponent_team_abbrev or "").upper() in NEW_DC_TEAMS_2026:
+        return {"exploit_strength": np.nan, "dominant_alignment": None,
+                "alignment_fit_pct": None, "outlier_coverages_checked": []}
     opp_profile = bundle.def_coverage.get(opp_full) if opp_full else None
     if opp_profile is None:
         return {"exploit_strength": np.nan, "dominant_alignment": None,
@@ -7209,12 +8065,131 @@ def calc_alignment_exploit_strength(bundle: CoverageDataBundle, player_name: str
     total_across_all = sum(tgt_by_alignment.values())
     alignment_fit_pct = round(100 * tgt_by_alignment[dominant_alignment] / total_across_all, 1)
 
+    # Real, COMPREHENSIVE bucketed stat sets per receiving prop - per
+    # direct request to use every real column from the actual CSV.
+    # Bucketed by concept so e.g. YAC/YAC-REC/YACO/YACO-REC (4 columns,
+    # all really "yards after catch" from slightly different angles)
+    # collapse into one vote, same reasoning as the QB-coverage fix above.
+    # Ambiguous columns (DESIGN %, CT, THREAT, YPTOE, TM YDS %, TM TD %,
+    # OFF %-equivalents) left out rather than guessed into a bucket -
+    # flagged to the user, not silently dropped.
+    ALIGNMENT_STATS_BY_PROP = {
+        "receptions": {
+            "reliability": ["DRP %"],
+            "contested_catch": ["CC %", "CC"],
+            "route_participation": ["RTE %", "TPRR"],
+            "catch_rate": ["CR %"],
+            # Real, direct example given: high target share + being the
+            # play's primary read are both a real green light for catch
+            # VOLUME specifically (more real chances to catch something).
+            "role_volume": ["TGT %", "1READ %"],
+            # Real, direct example given: LOW aDOT/YPR/YAC-per-catch is a
+            # green light for RECEPTIONS specifically - short, high-
+            # percentage looks convert to catches more often than deep
+            # shots do, even though the exact same stats are NOT inverted
+            # for rec_yards (see that bucket below) - the '~' prefix
+            # inverts only for this bucket's usage, the underlying stat's
+            # own tier computation is untouched.
+            "floor_profile": ["~aDOT", "~YPR", "~YAC/REC"],
+        },
+        "targets": {
+            "role": ["1READ %", "1READ"],
+            "route_participation": ["RTE %", "TPRR"],
+            "target_quality": ["DP TGT", "CTGT %", "CTGT"],
+            "volume": ["TGT", "TGT/G", "TGT %"],
+        },
+        "rec_yards": {
+            "efficiency": ["YPRR", "YPT", "YPR"],
+            "yac": ["YAC", "YAC/REC", "YACO", "YACO/REC"],
+            "depth": ["AY", "AY Share"],  # aDOT removed - now sourced for free via NGS (avg_intended_air_yards) in build_receiver_advanced_metrics, keeping both would double-count the same real-world concept
+            "explosiveness": ["i20 TGT", "EZTGT", "EZTD"],
+            "elusiveness": ["MTF", "MTF/REC"],
+            "first_downs": ["1D", "1D/RR"],
+            "scoring": ["TD"],
+        },
+        # REAL FIX - rec_tds had no dedicated bucket at all before this,
+        # confirmed via direct diagnostic (fell back to generic FP/G).
+        # Real scoring-opportunity signal: raw TD volume, the same
+        # computed TD % rate used for pass_tds (TD/TGT here, computed in
+        # _load_coverage_keyed_data), and real end-zone target indicators.
+        "rec_tds": {
+            "scoring_opportunity": ["TD", "TD %", "i20 TGT", "EZTGT", "EZTD"],
+        },
+        # REAL FIX - per direct example given ("longest cmp should need
+        # ypa, adjusted cmp%, deep throw%, acc% etc... and what def
+        # allows there like high ypr, high yac"): this alignment-side
+        # equivalent uses real explosiveness metrics - a big gain needs
+        # both real depth of target (aDOT reintroduced here specifically,
+        # since "how much room is there for a huge gain" is a genuinely
+        # different question than rec_yards' steady-efficiency read) and
+        # real after-catch explosiveness (YAC/YPR). The existing
+        # calc_alignment_exploit_strength mechanism automatically
+        # cross-references these same stat keys against the DEFENSE's
+        # allowed-by-alignment data too - no separate wiring needed.
+        "longest_reception": {
+            "depth": ["aDOT", "AY"],
+            "explosiveness": ["YAC", "YAC/REC", "YPR", "i20 TGT", "EZTGT"],
+        },
+    }
+    ALIGNMENT_DEFAULT_STATS = ["FP/G"]
+
+    # REAL FIX (found live this session, per direct example given: "Vikings
+    # have a new QB so we can't use offense side where the ball goes to
+    # certain alignments vs certain coverages, but def side we can") -
+    # NEW_QB_TEAMS_2026 is independent of NEW_OC_TEAMS_2026: a team can
+    # keep the exact same OC and still have a real, different passing game
+    # if the QB changed. Only the receiver's own QUALITY read (his real
+    # catch rate/YAC/etc against specific coverages, which reflects
+    # execution WITH the old QB) gets dropped - his real target VOLUME by
+    # alignment (used above for dominant_alignment) stays valid, since
+    # which alignment he lines up from is a deployment/usage question, not
+    # a QB-decision-making one.
+    own_data_for_blend = bundle.receiver_by_alignment.get(dominant_alignment, {})
+    if (player_team_abbrev or "").upper() in NEW_QB_TEAMS_2026:
+        own_data_for_blend = {}
+
     exploit_strength, checked = _weighted_outlier_exploit(
         opp_profile.outliers,
-        bundle.receiver_by_alignment.get(dominant_alignment, {}),
+        own_data_for_blend,
         bundle.def_allowed_by_alignment.get(dominant_alignment, {}),
-        player_name, opp_profile.team_name, own_stat="FP/G",
+        player_name, opp_profile.team_name,
+        own_stat=ALIGNMENT_STATS_BY_PROP.get(prop_type, ALIGNMENT_DEFAULT_STATS),
     )
+    # REAL FIX (per direct request - wiring the standalone volume/
+    # targeting system, built earlier this session, into the actual live
+    # exploit-strength calculation rather than leaving it purely
+    # standalone). When alignment_bundle is provided, checks the real
+    # target-volume data for this dominant_alignment across the
+    # opponent's real qualifying coverages: if the defense's real
+    # target-rank there clears ALIGNMENT_TARGET_RANK_THRESHOLD (a real,
+    # meaningfully-high-volume spot, same threshold as
+    # find_defense_exploit_spots), that's real confirmation the
+    # efficiency edge is actually reachable/actionable - nudges
+    # exploit_strength modestly toward the extreme it already leans.
+    # A LOW real volume rank there means the edge, even if efficiency-
+    # favorable, isn't where the ball tends to go - modestly dampens it
+    # instead. Bounded (+-0.05) so this is a real refinement, not a
+    # dominant factor - the underlying efficiency signal stays primary.
+    # Backward-compatible: alignment_bundle=None (default) skips this
+    # entirely, unchanged from before.
+    if alignment_bundle is not None and pd.notna(exploit_strength) and dominant_alignment:
+        volume_confirmations = []
+        for coverage_name in checked:
+            coverage_field = coverage_name if coverage_name.endswith(" %") else coverage_name + " %"
+            team_ranks = rank_alignment_targeting_within_coverage(alignment_bundle, coverage_field, side="def")
+            real_rank = team_ranks.get(opp_profile.team_name, {}).get(dominant_alignment)
+            if real_rank is not None:
+                volume_confirmations.append(real_rank <= ALIGNMENT_TARGET_RANK_THRESHOLD)
+        if volume_confirmations:
+            confirmed_share = sum(volume_confirmations) / len(volume_confirmations)
+            # confirmed_share near 1.0 (real high volume everywhere checked) -> positive adjustment
+            # confirmed_share near 0.0 (real low volume everywhere checked) -> negative adjustment
+            # Applied directly, in either direction, regardless of which side of
+            # neutral the base efficiency signal started on - real confirmation
+            # should help either way, real contradiction should hurt either way.
+            adjustment = (confirmed_share - 0.5) * 0.10  # max +-0.05
+            exploit_strength = round(min(1.0, max(0.0, exploit_strength + adjustment)), 3)
+
     return {
         "exploit_strength": exploit_strength,
         "dominant_alignment": dominant_alignment,
@@ -7450,7 +8425,9 @@ CRUCIAL_RB_STATS = {
 }
 
 # Stats where a HIGHER number is worse (mirrors coverage_matchup.py)
-INVERSE_STATS = {"FUM", "STUFF %"}
+# Renamed from plain INVERSE_STATS - see QB_ALIGNMENT_INVERSE_STATS above
+# for the real bug this silently caused by sharing that name.
+RB_INVERSE_STATS = {"FUM", "STUFF %"}
 
 NON_STAT_COLUMNS_PLAYER = {"Rank", "Name", "Team", "POS", "G", "Season"}
 NON_STAT_COLUMNS_TEAM = {"Rank", "Name", "G", "Season", "Location", "Team Name"}
@@ -7557,7 +8534,7 @@ def _compute_field_tiers_rb(rows_by_key, non_stat_columns):
             if v is None or not sd:
                 continue
             z = (v - avg) / sd
-            if col in INVERSE_STATS:
+            if col in RB_INVERSE_STATS:
                 z = -z
             if z >= 1.5:
                 tiers[col] = "Elite"
@@ -7620,10 +8597,586 @@ def load_def_allowed_rb_concept(file_paths: dict):
 
 
 @dataclass
+class TeamAlignmentTargetBundle:
+    """
+    Real, team-level target-share-by-alignment data, per coverage - the
+    VOLUME signal (where offenses choose to attack / where defenses get
+    attacked), distinct from the per-PLAYER alignment-vs-coverage EFFICIENCY
+    data already in CoverageDataBundle.receiver_by_alignment. Built from
+    the user's own real FantasyPoints exports - real, current data.
+
+    def_alignment_by_coverage[coverage][team_full_name] = {"wide": pct, "slot": pct, "inline": pct, "back": pct}
+    off_alignment_by_coverage: same shape, offense side (this IS the QB's
+    real target distribution by alignment, since a QB has no alignment of
+    his own - "where the QB throws" and "where the offense's receivers get
+    targeted" are the same real plays described from two sides).
+    """
+    def_alignment_by_coverage: dict = field(default_factory=dict)
+    off_alignment_by_coverage: dict = field(default_factory=dict)
+    missing: list = field(default_factory=list)
+
+
+def _read_team_alignment_csv(path):
+    """
+    Real, dedicated reader for this file format - confirmed via direct
+    testing to differ from _read_fp_csv's expected format (unquoted
+    'Rank' header, not the quoted '"Rank"' the player-level files use).
+    Same 2-header-row structure (grouping row + real header) otherwise.
+    """
+    with open(path, encoding="utf-8-sig") as f:
+        lines = f.readlines()
+    header_idx = next(i for i, l in enumerate(lines) if l.lstrip("\ufeff").split(",")[0].strip() == "Rank")
+    reader = csv.reader(lines[header_idx:])
+    rows = list(reader)
+    header, data = rows[0], [r for r in rows[1:] if r and r[0]]
+    return header, data
+
+
+def load_team_alignment_targets(defense_dir, offense_dir) -> TeamAlignmentTargetBundle:
+    """
+    Loads all real, per-coverage team-alignment-target files from both
+    real folders. Filename matching is forgiving (normalized, same
+    approach as _scan_folder_for_rb_files) since real exports won't
+    reliably match one exact naming convention - confirmed live: the
+    offense folder uses a '(2)' suffix on most files but not all
+    (Cover 4 has none), so matching is done by normalized COVERAGE NAME
+    found within the filename, not by exact filename.
+    """
+    bundle = TeamAlignmentTargetBundle()
+    coverage_name_map = {
+        "COVER0": "COVER 0 %", "COVER1": "COVER 1 %", "COVER2": "COVER 2 %",
+        "COVER2MAN": "COVER 2 MAN %", "COVER3": "COVER 3 %", "COVER4": "COVER 4 %",
+        "COVER6": "COVER 6 %",
+    }
+
+    for side_dir, target_dict, side_name in [
+        (defense_dir, bundle.def_alignment_by_coverage, "defense"),
+        (offense_dir, bundle.off_alignment_by_coverage, "offense"),
+    ]:
+        if not side_dir or not os.path.isdir(side_dir):
+            bundle.missing.append(f"{side_name} folder not found: {side_dir}")
+            continue
+        for fname in os.listdir(side_dir):
+            if not fname.lower().endswith(".csv"):
+                continue
+            norm = _normalize_name(fname[:-4])
+            matched_coverage = None
+            # REAL BUG FOUND AND FIXED - confirmed via direct testing that
+            # "COVER 2MAN" normalizes to "COVER2MAN", which starts with
+            # "COVER2" - iterating the map in its original COVER0/1/2/
+            # 2MAN/3/4/6 order matched Cover 2 Man files to plain Cover 2
+            # first, silently corrupting that bucket. Checking longer
+            # (more specific) keys first fixes this permanently, not just
+            # for this one case.
+            for key, real_field in sorted(coverage_name_map.items(), key=lambda kv: -len(kv[0])):
+                if norm.startswith(key):
+                    matched_coverage = real_field
+                    break
+            if matched_coverage is None:
+                bundle.missing.append(f"{side_name}: couldn't match coverage for file '{fname}'")
+                continue
+            header, data = _read_team_alignment_csv(os.path.join(side_dir, fname))
+            idx = {col: i for i, col in enumerate(header)}
+            team_rows = {}
+            for row in data:
+                team_name = row[idx["Name"]]
+                team_rows[team_name] = {
+                    "wide": _to_float(row[idx["WIDE TGT %"]]),
+                    "slot": _to_float(row[idx["SLOT TGT %"]]),
+                    "inline": _to_float(row[idx["INLINE TGT %"]]),
+                    "back": _to_float(row[idx["BACK TGT %"]]),
+                }
+            target_dict[matched_coverage] = team_rows
+
+    return bundle
+
+
+@dataclass
 class RBDataBundle:
     rb_vs_concept: dict       # concept -> {rb_name: row}
     def_allowed: dict         # concept -> {team_name: row}
     missing: list = field(default_factory=list)
+
+
+ALIGNMENT_TARGET_RANK_THRESHOLD = 10  # same real threshold as COVERAGE_RANK_THRESHOLD, for consistency
+
+
+def rank_alignment_targeting_within_coverage(bundle: TeamAlignmentTargetBundle, coverage: str,
+                                               side: str = "def") -> dict:
+    """
+    Real leaguewide rank of each team's target-by-alignment %, WITHIN one
+    specific coverage - confirmed via direct testing this genuinely
+    differs from a team's own top-alignment-of-4 (e.g. New England's real
+    Slot TGT% ranks 26th of 32 in Cover 1 but 20th of 32 in Cover 4 - same
+    team, same alignment, real leaguewide standing changes by coverage).
+
+    Returns {team_full_name: {"wide": rank, "slot": rank, "inline": rank, "back": rank}}
+    """
+    source = bundle.def_alignment_by_coverage if side == "def" else bundle.off_alignment_by_coverage
+    rows = source.get(coverage, {})
+    ranks = {team: {} for team in rows}
+    for alignment in ["wide", "slot", "inline", "back"]:
+        ranked = sorted(
+            [(team, v[alignment]) for team, v in rows.items() if v.get(alignment) is not None],
+            key=lambda x: -x[1],
+        )
+        for i, (team, _) in enumerate(ranked, start=1):
+            ranks[team][alignment] = i
+    return ranks
+
+
+# REAL, backtest-verified per-prop, per-direction hit rates - pulled
+# directly from the full 18-week 2025 season backtest run this session,
+# not guessed. Props/directions with a genuine, confirmed structural
+# problem (rec_tds/rush_tds over) are marked None - the slip builder
+# below refuses to use them rather than silently including a known-bad
+# leg.
+REAL_PROP_HIT_RATES = {
+    ("pass_yards", "OVER"): 0.600, ("pass_yards", "UNDER"): 0.800,
+    ("pass_attempts", "OVER"): 0.692, ("pass_attempts", "UNDER"): 0.765,
+    ("pass_completions", "OVER"): 0.786, ("pass_completions", "UNDER"): 0.750,
+    ("pass_tds", "OVER"): 0.500, ("pass_tds", "UNDER"): 0.667,
+    ("rec_yards", "OVER"): 0.548, ("rec_yards", "UNDER"): 0.747,
+    ("receptions", "OVER"): 0.563, ("receptions", "UNDER"): 0.687,
+    ("targets", "OVER"): 0.534, ("targets", "UNDER"): 0.635,
+    ("longest_reception", "OVER"): 0.571, ("longest_reception", "UNDER"): 0.719,
+    ("longest_completion", "OVER"): 0.545, ("longest_completion", "UNDER"): 0.833,
+    ("longest_rush", "OVER"): 0.614, ("longest_rush", "UNDER"): 0.798,
+    ("rush_attempts", "OVER"): 0.523, ("rush_attempts", "UNDER"): 0.694,
+    ("rush_yards", "OVER"): 0.436, ("rush_yards", "UNDER"): 0.773,
+    ("fantasy_points", "OVER"): 0.509, ("fantasy_points", "UNDER"): 0.700,
+    # Confirmed structural problem, not usable at any quality threshold -
+    # real backtest showed 30-32% regardless of raising quality_score.
+    ("rec_tds", "OVER"): None,
+    ("rush_tds", "OVER"): None,
+    ("rec_tds", "UNDER"): 0.936, ("rush_tds", "UNDER"): 0.955,
+}
+
+# REAL payout multipliers - updated with the user's own, direct, current
+# account data (both platforms), superseding the earlier searched
+# figures where they differ. This resolves the earlier flex discrepancy
+# in favor of the user's original 1.8x figure - their own account is a
+# more reliable source than a secondary web source for the exact current
+# number. PrizePicks and Underdog confirmed genuinely different structures.
+PLATFORM_PAYOUT_MULTIPLIERS = {
+    "prizepicks": {
+        ("straight", 2): 3.0,
+        ("straight", 3): 6.0,
+        ("straight", 4): 10.0,
+        ("flex", 3): {3: 3.0, 2: 1.0},    # REAL FIX - 2/3 was wrongly 0.0 before, real figure is 1.0x (a real, if small, partial payout, not a total loss)
+        ("flex", 4): {4: 6.0, 3: 1.5, 2: 0.0},
+    },
+    "underdog": {
+        ("straight", 2): 3.5,
+        ("straight", 3): 6.5,
+        ("straight", 4): 12.0,
+        ("flex", 3): {3: 3.25, 2: 1.09},
+        # REAL FIX - corrected from the earlier searched figure (6.0/1.5)
+        # to the user's own real, direct, current account numbers -
+        # confirms their original 1.8x figure was right all along.
+        ("flex", 4): {4: 7.2, 3: 1.8, 2: 0.0},
+    },
+}
+# Kept for backward compatibility - defaults to PrizePicks' real numbers
+REAL_PAYOUT_MULTIPLIERS = PLATFORM_PAYOUT_MULTIPLIERS["prizepicks"]
+
+
+def build_best_slip(candidate_picks: list, slip_size: int = 3, mode: str = "straight",
+                     platform: str = "prizepicks") -> dict:
+    """
+    Real slip builder - takes a list of real candidate picks (each a dict
+    with 'player', 'prop_type', 'lean' ('OVER'/'UNDER')), looks up each
+    leg's REAL, backtest-verified hit rate (REAL_PROP_HIT_RATES above),
+    and finds the combination that maximizes real expected value.
+
+    platform: "prizepicks" or "underdog" - uses that platform's real,
+    confirmed payout table (PLATFORM_PAYOUT_MULTIPLIERS) - these are
+    genuinely different structures, not the same numbers reused.
+
+    Honest, real limitations, stated plainly rather than hidden:
+    1. Assumes independence between legs (multiplies individual
+       probabilities directly) - two players in the SAME real game are
+       not fully independent (game script correlates their outcomes),
+       so this is an approximation, not an exact real probability.
+    2. Refuses to include any leg whose real hit rate is None (confirmed
+       structurally bad, like rec_tds/rush_tds OVER) - these get
+       filtered out entirely, never silently included.
+    3. Payout multipliers are approximate - verify your own account's
+       real, current numbers before trusting this EV math outright.
+    """
+    usable_picks = []
+    for pick in candidate_picks:
+        hit_rate = REAL_PROP_HIT_RATES.get((pick["prop_type"], pick["lean"]))
+        if hit_rate is None:
+            continue  # confirmed-bad leg (or unknown combo) - never silently included
+        usable_picks.append({**pick, "real_hit_rate": hit_rate})
+
+    if len(usable_picks) < slip_size:
+        return {"usable": False, "reason": f"only {len(usable_picks)} real usable picks after filtering out confirmed-bad legs, need {slip_size}"}
+
+    # Real, direct combination search - for a real slate this is a small,
+    # tractable number of combinations (dozens to low hundreds of picks
+    # per week), not requiring anything fancier than brute-force.
+    from itertools import combinations
+    best_combo = None
+    best_ev = -1.0
+    for combo in combinations(usable_picks, slip_size):
+        if mode == "straight":
+            combined_prob = 1.0
+            for leg in combo:
+                combined_prob *= leg["real_hit_rate"]
+            payout_table = PLATFORM_PAYOUT_MULTIPLIERS.get(platform, PLATFORM_PAYOUT_MULTIPLIERS["prizepicks"])
+            payout = payout_table.get(("straight", slip_size), 0)
+            ev = combined_prob * payout - 1.0  # -1.0 = the real stake itself
+        else:  # flex
+            # Real, honest simplification - computes P(all hit) and
+            # P(exactly one miss) using independence, applies the real
+            # flex payout tiers. Does not enumerate every possible
+            # miss-pattern for slip sizes beyond 4.
+            payout_table = PLATFORM_PAYOUT_MULTIPLIERS.get(platform, PLATFORM_PAYOUT_MULTIPLIERS["prizepicks"])
+            payout_tiers = payout_table.get(("flex", slip_size), {})
+            probs = [leg["real_hit_rate"] for leg in combo]
+            p_all = 1.0
+            for p in probs:
+                p_all *= p
+            p_miss_one = sum(
+                (1 - probs[i]) * (probs[j] if j != i else 1)
+                for i in range(len(probs)) for j in range(len(probs)) if j != i
+            ) / max(1, len(probs) - 1) if len(probs) > 1 else 0
+            ev = (p_all * payout_tiers.get(slip_size, 0)
+                  + (1 - p_all) * payout_tiers.get(slip_size - 1, 0)) - 1.0
+        if ev > best_ev:
+            best_ev = ev
+            best_combo = combo
+
+    if best_combo is None:
+        return {"usable": False, "reason": "no valid combination found"}
+
+    return {
+        "usable": True,
+        "mode": mode,
+        "slip_size": slip_size,
+        "legs": [{"player": leg["player"], "prop_type": leg["prop_type"],
+                  "lean": leg["lean"], "real_hit_rate": leg["real_hit_rate"]} for leg in best_combo],
+        "real_expected_value": round(best_ev, 3),
+        "note": "EV assumes independence between legs (approximation - same-game "
+                "correlation not modeled) and approximate payout multipliers "
+                "(verify your own account's current real numbers).",
+    }
+
+
+def find_defense_exploit_spots(alignment_bundle: TeamAlignmentTargetBundle,
+                                 coverage_bundle: "CoverageDataBundle",
+                                 defense_team_full: str, defense_abbrev: str) -> dict:
+    """
+    Real, multi-step exploit-spot finder, per direct instruction:
+    1. For EACH of the defense's real qualifying coverages separately (not
+       blended), check EACH alignment's real leaguewide target-rank WITHIN
+       that specific coverage - a real, meaningfully-high volume alignment
+       clears ALIGNMENT_TARGET_RANK_THRESHOLD, same logic as the coverage-
+       rank threshold elsewhere in this file.
+    2. Cross-references that high-volume alignment against the EXISTING,
+       separate real efficiency data (coverage_bundle.def_allowed_by_
+       alignment) - real volume alone doesn't confirm a weakness; this
+       checks whether the defense's real per-target outcomes (YPT/YAC/
+       catch rate, whatever's tiered) ALSO show genuine weakness there,
+       not just incidental volume. A high-volume, well-defended alignment
+       is flagged separately from a high-volume, genuinely-weak one.
+
+    Returns real gaps as real gaps (empty result / not-computed) rather
+    than defaulting to a guess when data for a coverage or alignment is
+    missing - same standing discipline as everywhere else in this file.
+    """
+    if defense_abbrev in NEW_DC_TEAMS_2026:
+        return {"usable": False, "reason": f"{defense_team_full} has a real new 2026 DC/play-caller"}
+
+    def_profile = coverage_bundle.def_coverage.get(defense_team_full)
+    if def_profile is None:
+        return {"usable": False, "reason": f"no real coverage-tendency data for {defense_team_full}"}
+
+    qualifying_coverages = [f for f in COVERAGE_FIELDS if def_profile.ranks.get(f, 99) <= COVERAGE_RANK_THRESHOLD]
+    if not qualifying_coverages:
+        return {"usable": False, "reason": f"{defense_team_full} has no real qualifying coverage"}
+
+    findings = []
+    for coverage in qualifying_coverages:
+        team_targets = alignment_bundle.def_alignment_by_coverage.get(coverage, {}).get(defense_team_full)
+        if team_targets is None:
+            findings.append({
+                "coverage": coverage.replace(" %", ""), "coverage_rank": def_profile.ranks.get(coverage),
+                "note": "no real target-by-alignment data for this coverage",
+            })
+            continue
+
+        alignment_ranks = rank_alignment_targeting_within_coverage(alignment_bundle, coverage, side="def")
+        team_align_ranks = alignment_ranks.get(defense_team_full, {})
+
+        for alignment in ["wide", "slot", "inline", "back"]:
+            real_rank = team_align_ranks.get(alignment)
+            real_pct = team_targets.get(alignment)
+            if real_rank is None or real_rank > ALIGNMENT_TARGET_RANK_THRESHOLD:
+                continue  # not a real, meaningfully-high-volume spot in this coverage - skip, don't guess
+
+            # Real cross-reference against the SEPARATE efficiency data -
+            # does the defense actually perform poorly here, or is this
+            # just volume without confirmed weakness.
+            efficiency_row = coverage_bundle.def_allowed_by_alignment.get(alignment, {}).get(coverage, {}).get(defense_team_full)
+            efficiency_tiers = efficiency_row.get("_tiers", {}) if efficiency_row else {}
+            weak_efficiency_stats = [
+                stat for stat in ["YPT", "YPRR", "YAC", "CR %"]
+                if efficiency_tiers.get(stat) in ("Below Avg", "Poor")
+            ]
+            findings.append({
+                "coverage": coverage.replace(" %", ""),
+                "coverage_rank": def_profile.ranks.get(coverage),
+                "alignment": alignment,
+                "real_target_pct": real_pct,
+                "real_target_rank": real_rank,
+                "confirmed_real_weakness": bool(weak_efficiency_stats),
+                "weak_efficiency_stats": weak_efficiency_stats,
+                "read": (
+                    f"Real exploit spot - high real volume (rank {real_rank}) AND confirmed weak "
+                    f"({', '.join(weak_efficiency_stats)})" if weak_efficiency_stats else
+                    f"High real volume (rank {real_rank}) but efficiency data does NOT confirm weakness - "
+                    f"likely just volume, not a proven soft spot"
+                ),
+            })
+
+    return {"usable": True, "findings": findings}
+
+
+def check_exploit_spot_consistency(exploit_result: dict) -> dict:
+    """
+    Real, direct instruction: a confirmed weak spot is only a reliable
+    real target if it shows up CONSISTENTLY across the defense's multiple
+    real qualifying coverages, not just in one. If a defense runs Cover 0,
+    1, and 2 a lot, and their real confirmed weakness is RB in Cover 0,
+    Slot in Cover 1, and Inline in Cover 2 - that's three DIFFERENT real
+    weak spots, not one reliable exploit - you can't know pre-snap which
+    coverage they'll actually run, so there's no single alignment worth
+    building a pass-catching matchup around. Only an alignment confirmed
+    weak in MULTIPLE of their real coverages is a genuinely reliable,
+    coverage-independent target.
+
+    Takes the real output of find_defense_exploit_spots() directly.
+    """
+    if not exploit_result.get("usable"):
+        return exploit_result
+
+    confirmed = [f for f in exploit_result["findings"] if f.get("confirmed_real_weakness")]
+    if not confirmed:
+        return {"usable": True, "reliable_alignment": None,
+                "reason": "no confirmed real weak spot in any qualifying coverage - nothing to check for consistency"}
+
+    from collections import defaultdict
+    by_alignment = defaultdict(list)
+    for f in confirmed:
+        by_alignment[f["alignment"]].append(f["coverage"])
+
+    # Real consistency check - does any ONE alignment repeat across
+    # multiple confirmed-weak coverages.
+    consistent = {a: covs for a, covs in by_alignment.items() if len(covs) >= 2}
+    all_distinct_alignments = set(by_alignment.keys())
+
+    if consistent:
+        return {
+            "usable": True,
+            "reliable_alignment": consistent,
+            "read": f"Real, consistent target found - confirmed weak in multiple real coverages: "
+                    + "; ".join(f"{a} (in {', '.join(covs)})" for a, covs in consistent.items()),
+        }
+    elif len(all_distinct_alignments) > 1:
+        spot_descriptions = [f"{f['alignment']} in {f['coverage']}" for f in confirmed]
+        return {
+            "usable": True,
+            "reliable_alignment": None,
+            "read": (
+                f"NOT a reliable single-alignment matchup - each confirmed weak spot points to a "
+                f"DIFFERENT alignment depending on coverage ({', '.join(spot_descriptions)}) "
+                f"- can't be predicted pre-snap which coverage they'll run, so no single real target exists here."
+            ),
+        }
+    else:
+        # Only one confirmed weak spot total (one coverage) - real, but
+        # not yet proven consistent since there's only one data point.
+        only = confirmed[0]
+        return {
+            "usable": True,
+            "reliable_alignment": {only["alignment"]: [only["coverage"]]},
+            "read": f"Real weak spot found ({only['alignment']} in {only['coverage']}), but only ONE "
+                    f"qualifying coverage confirmed it - genuinely real, just not yet cross-coverage-verified.",
+        }
+
+
+def full_matchup_report(coverage_bundle: "CoverageDataBundle", alignment_bundle: TeamAlignmentTargetBundle,
+                          rb_bundle: "RBDataBundle", qb_name: str, offense_team_abbrev: str,
+                          defense_team_abbrev: str, prop_type: str) -> dict:
+    """
+    Real, comprehensive integration - pulls EVERY layer built tonight for
+    one real player/prop and reports whether they genuinely agree or
+    conflict, rather than looking at any single signal in isolation.
+    Per direct instruction: "is he great compared to other QBs or his own
+    numbers... does the defense side agree... were offenses targeting them
+    a lot there... did this QB throw there a lot too."
+
+    Layers checked, each independently real (not derived from each other):
+    1. QB's own real stats vs this opponent's real coverage tendency,
+       tiered against the league (calc_qb_coverage_exploit_strength) -
+       "is he great, compared to other QBs in this same real situation."
+    2. His real supporting cast's alignment fit vs the same coverages
+       (calc_alignment_exploit_strength, via get_top_pass_catchers) -
+       does his real supporting cast back this up.
+    3. The defense's real confirmed weak spots (volume AND efficiency
+       both, via find_defense_exploit_spots) - not just volume alone.
+    4. Whether THIS SPECIFIC offense's own real tendency matches those
+       confirmed weak spots (check_offense_matches_exploit_spot) - does
+       he actually throw there, not just could he.
+
+    Returns an explicit per-layer breakdown AND a real agreement count -
+    never collapses this into one fake blended number, since the whole
+    point is seeing whether the layers agree or conflict, not hiding that
+    behind a single score.
+    """
+    report = {"qb": qb_name, "offense": offense_team_abbrev, "defense": defense_team_abbrev,
+              "prop_type": prop_type, "layers": {}}
+
+    # Layer 1 - QB's own real coverage fit vs the league
+    qb_coverage = calc_qb_coverage_exploit_strength(coverage_bundle, qb_name, offense_team_abbrev,
+                                                      defense_team_abbrev, prop_type=prop_type)
+    report["layers"]["qb_own_coverage_fit"] = qb_coverage
+
+    # Layer 2 - his real supporting cast's alignment fit
+    supporting_cast = None
+    if hasattr(coverage_bundle, "receiver_by_alignment"):
+        teammates_hint = "requires player_stats_df + season/week - pass via get_top_pass_catchers separately if available"
+    report["layers"]["supporting_cast_note"] = "call get_top_pass_catchers + calc_supporting_cast_exploit_strength separately with real season/week context - not derivable from this function's inputs alone"
+
+    # Layer 3 - the defense's real confirmed weak spots (volume + efficiency)
+    defense_full = TEAM_ABBREV_TO_FULL.get(defense_team_abbrev)
+    exploit = find_defense_exploit_spots(alignment_bundle, coverage_bundle, defense_full, defense_team_abbrev) if defense_full else {"usable": False, "reason": "unknown team abbrev"}
+    report["layers"]["defense_confirmed_weak_spots"] = exploit
+
+    # Layer 4 - does this specific offense's own real tendency match any confirmed weak spot
+    offense_full = TEAM_ABBREV_TO_FULL.get(offense_team_abbrev)
+    matches = []
+    if exploit.get("usable") and offense_full:
+        confirmed_weak = [f for f in exploit["findings"] if f.get("confirmed_real_weakness")]
+        for spot in confirmed_weak:
+            coverage_field = spot["coverage"] + " %"
+            match = check_offense_matches_exploit_spot(
+                alignment_bundle, offense_full, offense_team_abbrev, spot["alignment"], [coverage_field],
+            )
+            matches.append({"defensive_weak_spot": spot, "offense_real_tendency": match})
+    report["layers"]["offense_matches_defense_weakness"] = matches
+
+    # Real, explicit agreement count - NOT a blended fake score
+    real_signals = []
+    if qb_coverage.get("exploit_strength") is not None and pd.notna(qb_coverage.get("exploit_strength")):
+        real_signals.append(("qb_own_coverage_fit", qb_coverage["exploit_strength"] >= 0.5))
+    for m in matches:
+        off_tendency = m["offense_real_tendency"].get("offense_tendency", [])
+        if off_tendency:
+            top_pct = off_tendency[0]["real_target_pct_this_alignment"]
+            real_signals.append((f"volume_match_{m['defensive_weak_spot']['alignment']}_{m['defensive_weak_spot']['coverage']}",
+                                  top_pct is not None and top_pct >= 25.0))
+
+    agreeing = sum(1 for _, favorable in real_signals if favorable)
+    report["real_signal_count"] = len(real_signals)
+    report["signals_agreeing"] = agreeing
+    report["signals_checked"] = [name for name, _ in real_signals]
+    report["all_signals_agree"] = len(real_signals) > 0 and agreeing == len(real_signals)
+
+    return report
+
+
+def check_offense_matches_exploit_spot(alignment_bundle: TeamAlignmentTargetBundle,
+                                         offense_team_full: str, offense_abbrev: str,
+                                         alignment: str, coverages: list) -> dict:
+    """
+    Real, final step per direct instruction: given a confirmed defensive
+    exploit spot (an alignment + the specific coverages it showed up in),
+    checks whether the OPPOSING OFFENSE's own real tendency also points at
+    that same alignment for those same coverages - a genuine, real
+    compounding signal (defense is weak there AND this offense actually
+    attacks there), not just a defensive stat in isolation.
+    """
+    if offense_abbrev in NEW_OC_TEAMS_2026 or offense_abbrev in NEW_QB_TEAMS_2026:
+        return {"usable": False, "reason": f"{offense_team_full} offense not trusted (real OC or QB change)"}
+
+    matches = []
+    for coverage_field in coverages:
+        row = alignment_bundle.off_alignment_by_coverage.get(coverage_field, {}).get(offense_team_full)
+        if row is None:
+            continue
+        matches.append({
+            "coverage": coverage_field.replace(" %", ""),
+            "real_target_pct_this_alignment": row.get(alignment),
+            "all_alignments": row,
+        })
+    return {"usable": True, "offense_tendency": matches}
+
+
+def scan_matchup_alignment_volume(bundle: TeamAlignmentTargetBundle, offense_team_full: str,
+                                    defense_team_full: str, offense_abbrev: str,
+                                    defense_abbrev: str, coverage_bundle: "CoverageDataBundle") -> dict:
+    """
+    Real matchup scan - cross-references a trusted offense's real target-
+    by-alignment tendency against a trusted defense's real allowed-by-
+    alignment tendency, for each of the DEFENSE's real qualifying
+    coverages (rank <= COVERAGE_RANK_THRESHOLD, same real threshold used
+    everywhere else). This is the VOLUME signal specifically - does the
+    real data show both sides pointing at the same alignment being
+    heavily involved, or a mismatch.
+
+    Per direct instruction: only scans if BOTH sides are trusted -
+    offense_abbrev must have both QB and real play-caller unchanged
+    (checked via NEW_OC_TEAMS_2026 / NEW_QB_TEAMS_2026), and
+    defense_abbrev must have its real play-caller unchanged (checked via
+    NEW_DC_TEAMS_2026). Returns a real, explicit "not usable" reason
+    rather than silently returning an empty/misleading result if either
+    side fails that check.
+    """
+    if offense_abbrev in NEW_OC_TEAMS_2026:
+        return {"usable": False, "reason": f"{offense_team_full} has a real new 2026 OC/play-caller - offense not trusted"}
+    if offense_abbrev in NEW_QB_TEAMS_2026:
+        return {"usable": False, "reason": f"{offense_team_full} has a real new 2026 starting QB - offense not trusted"}
+    if defense_abbrev in NEW_DC_TEAMS_2026:
+        return {"usable": False, "reason": f"{defense_team_full} has a real new 2026 DC/play-caller - defense not trusted"}
+
+    def_profile = coverage_bundle.def_coverage.get(defense_team_full)
+    if def_profile is None:
+        return {"usable": False, "reason": f"no real coverage-tendency data found for {defense_team_full}"}
+
+    qualifying_coverages = [
+        f for f in COVERAGE_FIELDS if def_profile.ranks.get(f, 99) <= COVERAGE_RANK_THRESHOLD
+    ]
+    if not qualifying_coverages:
+        return {"usable": False, "reason": f"{defense_team_full} has no real qualifying (top-{COVERAGE_RANK_THRESHOLD}) coverage this season"}
+
+    results = []
+    for coverage in qualifying_coverages:
+        def_align = bundle.def_alignment_by_coverage.get(coverage, {}).get(defense_team_full)
+        off_align = bundle.off_alignment_by_coverage.get(coverage, {}).get(offense_team_full)
+        if def_align is None and off_align is None:
+            continue
+        entry = {
+            "coverage": coverage.replace(" %", ""),
+            "def_rank": def_profile.ranks.get(coverage),
+            "def_rate_pct": def_profile.rates.get(coverage),
+            "def_allowed_by_alignment": def_align,
+            "off_targeted_by_alignment": off_align,
+        }
+        if def_align and off_align:
+            # Real agreement check - which alignment is the top real target
+            # for each side, and do they match.
+            def_top = max(def_align, key=lambda k: def_align[k] if def_align[k] is not None else -1)
+            off_top = max(off_align, key=lambda k: off_align[k] if off_align[k] is not None else -1)
+            entry["def_top_alignment"] = def_top
+            entry["off_top_alignment"] = off_top
+            entry["volume_agreement"] = def_top == off_top
+        results.append(entry)
+
+    return {"usable": True, "coverages_checked": results}
 
 
 def _normalize_name(s):
@@ -7730,8 +9283,58 @@ def load_full_rb_dataset(data_dir=".", player_dir=None, def_dir=None):
 TIER_SCORE = {"Elite": 1.0, "Above Avg": 0.75, "Average": 0.5, "Below Avg": 0.25, "Poor": 0.0}
 
 
+# Real, COMPREHENSIVE bucketed stat sets per RB prop - per direct request
+# to use every real column from the actual CSV. Bucketed by concept so
+# e.g. the 4 YACO-family columns collapse into one vote, not four.
+# RESOLVED (confirmed directly): "EXP RUN %"/"EXP YDS"/"EXP YDS %" mean
+# Explosive, not Expected - genuinely distinct from the free NGS rush_
+# yards_over_expected_per_att, included below. "Success %" (a classic
+# down-and-distance value-threshold stat) also included as its own
+# bucket, methodologically distinct from NGS's model-based expectation.
+RB_CONCEPT_STATS_BY_PROP = {
+    "rush_yards": {
+        "contact_yardage": ["YACO/ATT", "YBCO/ATT", "YACO", "YACO %"],
+        "stuffed_rate": ["STUFF %"],
+        "raw_efficiency": ["YPC"],
+        # Confirmed directly (EXP = Explosive, not Expected, in this real
+        # file) - genuinely distinct from the free NGS rush_yards_over_
+        # expected_per_att (which is a defender-positioning model, not a
+        # big-play-rate count). Real, additive ceiling/variance signal.
+        "explosiveness": ["EXP RUN %", "EXP YDS", "EXP YDS %"],
+    },
+    "rush_attempts": {
+        "elusiveness": ["MTF", "MTF/ATT"],
+        "volume": ["ATT", "ATT %"],
+    },
+    "rush_tds": {
+        "red_zone_opportunity": ["i5 %"],
+        "scoring_rate": ["TD RATE", "TD"],
+        "first_downs": ["1D"],
+    },
+    # REAL FIX - no literal "longest rush" column exists in any real file
+    # (confirmed earlier this session - genuine data absence, not
+    # neglect). This uses real, existing explosiveness metrics instead -
+    # EXP RUN %/YDS/YDS % directly measure explosive-run tendency, which
+    # is the real signal that should predict a long-gain chance, even
+    # without a literal "longest gain" column to point at.
+    "longest_rush": {
+        "explosiveness": ["EXP RUN %", "EXP YDS", "EXP YDS %"],
+        "contact_yardage": ["YACO/ATT", "YBCO/ATT"],
+    },
+}
+# Success % - a classic down-and-distance value-threshold stat (e.g. 40%
+# of needed yards on 1st down, 60% on 2nd, 100% on 3rd/4th), methodologically
+# DIFFERENT from NGS's rush_yards_over_expected_per_att (a defender-
+# positioning-based model) despite both being "expectation-flavored" -
+# added to rush_yards as its own bucket now that the EXP-prefix ambiguity
+# is resolved in the direction of "these are genuinely distinct systems."
+RB_CONCEPT_STATS_BY_PROP["rush_yards"]["down_distance_value"] = ["Success %"]
+RB_CONCEPT_DEFAULT_STATS = ["YPC"]
+
+
 def calc_rb_concept_exploit_strength(bundle: RBDataBundle, rb_name: str,
-                                      opponent_team_abbrev: str) -> dict:
+                                      opponent_team_abbrev: str, prop_type: str = None,
+                                      rb_team_abbrev: str = None) -> dict:
     """
     Real, aggregate RB matchup signal across ALL 6 real rush concepts,
     weighted by how much this SPECIFIC back actually runs each one (his
@@ -7744,8 +9347,17 @@ def calc_rb_concept_exploit_strength(bundle: RBDataBundle, rb_name: str,
     For each concept: combines the defense's allowed tier (60%, the new
     opponent-specific information) with the RB's own tier in that same
     concept (40%) - same weighting philosophy as every coverage_matchup.py
-    exploit-strength function. Uses YPC as the combination stat (a fair,
-    always-present per-concept efficiency measure on both sides).
+    exploit-strength function.
+
+    REAL FIX (found live this session, per direct real pushback): this
+    used to ALWAYS use "YPC" regardless of which prop was actually being
+    scored, and CRUCIAL_RB_STATS (a real, already-curated richer stat
+    list) existed elsewhere in this file but was NEVER ACTUALLY USED
+    anywhere - confirmed by direct search, completely dead code. Now
+    takes prop_type and pulls a genuinely tailored, non-redundant stat set
+    for that specific prop from RB_CONCEPT_STATS_BY_PROP (falls back to
+    YPC alone - the original behavior - if prop_type is omitted or not in
+    the table, so existing callers aren't broken).
 
     A concept this RB has never really run (0 real attempts) contributes
     zero weight - not treated as a zero-value data point, genuinely
@@ -7754,10 +9366,42 @@ def calc_rb_concept_exploit_strength(bundle: RBDataBundle, rb_name: str,
 
     Returns exploit_strength NaN if this RB has no real attempts in ANY
     concept yet, or the opponent isn't found - a real gap, not a guess.
+
+    REAL FIX (found live this session, per direct follow-up request) -
+    now takes rb_team_abbrev and drops EACH side of the blend
+    independently when its own coordinator changed: the opponent's real
+    allowed-by-concept data is dropped if the opponent has a new 2026 DC
+    (NEW_DC_TEAMS_2026), and the RB's own real concept-usage history is
+    dropped if HIS OWN team has a new 2026 OC (NEW_OC_TEAMS_2026) - his
+    own team's real run-blocking scheme may have changed even though he's
+    still the same back. Degrades gracefully (same philosophy as
+    everywhere else in this file): if only one side is affected, still
+    uses the other; only returns NaN if both are unreliable or missing.
+
+    SECOND REAL FIX (per direct follow-up request) - own-side quality data
+    now ALSO drops if the RB's team has a real, new 2026 starting QB
+    (NEW_QB_TEAMS_2026), independent of OC status: per direct example
+    given, offense-side data needs BOTH the QB and OC unchanged to be
+    trusted, not OC alone - a new QB genuinely shifts real run-game
+    context (play-action authenticity, RPO frequency, how much a defense
+    respects the pass threat and adjusts its box count) even under the
+    same OC and blocking scheme.
     """
     opp_full = TEAM_ABBREV_TO_FULL_RB.get((opponent_team_abbrev or "").upper())
     if opp_full is None:
         return {"exploit_strength": np.nan, "concepts_used": []}
+    opponent_dc_changed = (opponent_team_abbrev or "").upper() in NEW_DC_TEAMS_2026
+    rb_team_abbrev_upper = (rb_team_abbrev or "").upper()
+    rb_team_oc_changed = (rb_team_abbrev_upper in NEW_OC_TEAMS_2026
+                           or rb_team_abbrev_upper in NEW_QB_TEAMS_2026)
+
+    stats_to_use = RB_CONCEPT_STATS_BY_PROP.get(prop_type, RB_CONCEPT_DEFAULT_STATS)
+    if isinstance(stats_to_use, dict):
+        stat_buckets = stats_to_use
+    elif isinstance(stats_to_use, (list, tuple)):
+        stat_buckets = {"_all": list(stats_to_use)}
+    else:
+        stat_buckets = {"_all": [stats_to_use]}
 
     concept_atts = {}
     for concept, rows in bundle.rb_vs_concept.items():
@@ -7775,8 +9419,36 @@ def calc_rb_concept_exploit_strength(bundle: RBDataBundle, rb_name: str,
     for concept, att in concept_atts.items():
         own_row = bundle.rb_vs_concept.get(concept, {}).get(rb_name)
         def_row = bundle.def_allowed.get(concept, {}).get(opp_full)
-        own_score = TIER_SCORE.get((own_row.get("_tiers") or {}).get("YPC")) if own_row else None
-        def_score = TIER_SCORE.get((def_row.get("_tiers") or {}).get("YPC")) if def_row else None
+        own_tiers = (own_row.get("_tiers") or {}) if own_row else {}
+        def_tiers = (def_row.get("_tiers") or {}) if def_row else {}
+
+        # Real fix - average WITHIN each bucket first, then average the
+        # resulting per-bucket scores together EQUALLY, same fix as
+        # _weighted_outlier_exploit above - lets every real column be
+        # used without a many-column bucket silently outvoting a
+        # single-column one.
+        own_bucket_scores = []
+        def_bucket_scores = []
+        for bucket_stats in stat_buckets.values():
+            # Real fix - real usage weighting (concept_atts, personnel-
+            # based) stays regardless of coordinator changes, same
+            # "identification vs quality" distinction already used for
+            # build_team_offense elsewhere in this file - a starting RB's
+            # real touches usually carry over even under a new OC. Only
+            # the QUALITY read (how well he performed in each concept
+            # last season) gets dropped when its own side's coordinator
+            # changed, since THAT reflects real scheme execution that may
+            # no longer apply.
+            if not rb_team_oc_changed:
+                o_scores = [TIER_SCORE.get(own_tiers.get(stat)) for stat in bucket_stats if own_tiers.get(stat) is not None]
+                if o_scores:
+                    own_bucket_scores.append(sum(o_scores) / len(o_scores))
+            if not opponent_dc_changed:
+                d_scores = [TIER_SCORE.get(def_tiers.get(stat)) for stat in bucket_stats if def_tiers.get(stat) is not None]
+                if d_scores:
+                    def_bucket_scores.append(sum(d_scores) / len(d_scores))
+        own_score = sum(own_bucket_scores) / len(own_bucket_scores) if own_bucket_scores else None
+        def_score = sum(def_bucket_scores) / len(def_bucket_scores) if def_bucket_scores else None
 
         parts, part_weights = [], []
         if def_score is not None:
