@@ -6734,7 +6734,8 @@ def build_team_offense(team: str, opponent: str, season: int, week: int,
                         pbp_df: pd.DataFrame, prior_pbp_df: pd.DataFrame,
                         rosters_df: pd.DataFrame,
                         coverage_bundle=None, rb_bundle=None,
-                        n_rushers: int = 3, n_targets: int = 5) -> "TeamOffense":
+                        n_rushers: int = 3, n_targets: int = 5,
+                        player_stats_df: pd.DataFrame = None) -> "TeamOffense":
     """
     Builds one team's real, matchup-aware TeamOffense for the simulation.
     Real starters/usage shares come from real recent pbp (weeks before
@@ -6769,11 +6770,76 @@ def build_team_offense(team: str, opponent: str, season: int, week: int,
     etc.).
     """
     hist = pbp_df[(pbp_df["season"] == season) & (pbp_df["week"] < week) & (pbp_df["posteam"] == team)]
-    if hist.empty and prior_pbp_df is not None and not prior_pbp_df.empty:
+    using_prior_season_fallback = hist.empty and prior_pbp_df is not None and not prior_pbp_df.empty
+    if using_prior_season_fallback:
         hist = prior_pbp_df[(prior_pbp_df["season"] == season - 1) & (prior_pbp_df["posteam"] == team)]
     name_lookup = rosters_df[rosters_df["season"] == season][["gsis_id", "full_name"]].drop_duplicates().set_index("gsis_id")["full_name"]
 
+    # REAL FIX (found live via a real, confirmed case - Kenneth Walker III
+    # rushed for Seattle in 2025, but signed with Kansas City in real
+    # March 2026 free agency. Confirmed directly: pull_rosters([2026])
+    # correctly shows him on KC, but the simulation still showed him on
+    # SEA - traced to the prior-season fallback, which identified "who
+    # plays for this team" purely from who rushed/passed/caught for them
+    # LAST season. A first fix (excluding players confirmed to have moved
+    # away) caught the wrong-team-removal half of this, but testing
+    # directly exposed a second, deeper gap: it didn't add Walker to KC
+    # either, since KC's own prior-season pbp has zero real history of
+    # him (he never played a real down for them in 2025) - a real, new
+    # arrival is invisible to a purely team-history-based approach no
+    # matter which side of it you check.
+    #
+    # REAL, PROPER FIX: when using the prior-season fallback specifically
+    # (the cold-start case this whole problem lives in), candidates are
+    # now identified from the CURRENT ROSTER at the right position first,
+    # then ranked using each player's own real prior-season volume from
+    # player_stats_df (keyed by his own gsis_id only, NOT filtered by
+    # which team he was on) - correctly surfacing a real offseason
+    # arrival like Walker using his own real 2025 volume, regardless of
+    # which team he accumulated it with, while still correctly reflecting
+    # his CURRENT team for who he's now simulated as playing for.
+    current_roster_team = rosters_df[rosters_df["season"] == season].set_index("gsis_id")["team"]
+
+    def _still_on_team(gsis_id):
+        real_current_team = current_roster_team.get(gsis_id)
+        return real_current_team is None or real_current_team == team
+
+    if player_stats_df is None:
+        player_stats_df = pull_player_stats([season, season - 1])
+
+    def _roster_ranked_candidates(position_list, volume_col, n):
+        """Real, roster-first candidate ranking for the cold-start case -
+        current roster at this team + position, ranked by each player's
+        own real prior-season volume (any team), confirmed still on this
+        team by construction (pulled from the current roster itself)."""
+        team_roster = rosters_df[(rosters_df["season"] == season) & (rosters_df["team"] == team)
+                                  & (rosters_df["position"].isin(position_list))]
+        candidate_ids = team_roster["gsis_id"].dropna().unique().tolist()
+        if not candidate_ids:
+            return pd.Series(dtype=float)
+        prior_stats = player_stats_df[
+            (player_stats_df["season"] == season - 1) & (player_stats_df["gsis_id"].isin(candidate_ids))
+        ]
+        if prior_stats.empty or volume_col not in prior_stats.columns:
+            return pd.Series(dtype=float)
+        volumes = prior_stats.groupby("gsis_id")[volume_col].sum().sort_values(ascending=False)
+        return volumes.head(n)
+
     qb_counts = hist["passer_player_id"].dropna().value_counts()
+    qb_counts = qb_counts[[gid for gid in qb_counts.index if _still_on_team(gid)]]
+    if using_prior_season_fallback:
+        # REAL FIX (caught via direct testing) - using team-own-history
+        # counts as a gap-filler only never actually triggers, since a
+        # team's own prior-season history almost always already fills
+        # the real quota before the roster-based logic gets a chance to
+        # run - confirmed directly, KC's own 2025 history had 4+ real
+        # rushers before any fallback logic ran, so a real, new arrival
+        # like Walker never got a chance to be considered. The roster-
+        # based ranking is now the PRIMARY source for the whole cold-
+        # start case, not a gap-filler - it correctly captures a
+        # continuing veteran's own real volume (wherever it's counted
+        # from) AND a genuine new arrival's, uniformly.
+        qb_counts = _roster_ranked_candidates(["QB"], "attempts", 1)
     qb_id = qb_counts.idxmax() if not qb_counts.empty else None
     qb_pool = build_qb_pass_pool(qb_id, season, week, pbp_df, prior_pbp_df) if qb_id else QBPassPool(pd.DataFrame())
 
@@ -6791,7 +6857,10 @@ def build_team_offense(team: str, opponent: str, season: int, week: int,
     qb_rush_pool = build_player_play_pool(qb_id, "rush", season, week, pbp_df, prior_pbp_df,
                                            exploit_strength=qb_scramble_exploit) if qb_id else None
 
-    rush_counts = hist["rusher_player_id"].dropna().value_counts().head(n_rushers)
+    rush_counts = hist["rusher_player_id"].dropna().value_counts()
+    rush_counts = rush_counts[[gid for gid in rush_counts.index if _still_on_team(gid)]].head(n_rushers)
+    if using_prior_season_fallback:
+        rush_counts = _roster_ranked_candidates(["RB"], "carries", n_rushers)
     rushers = []
     for gid in rush_counts.index:
         exploit = None
@@ -6804,7 +6873,10 @@ def build_team_offense(team: str, opponent: str, season: int, week: int,
                 pass
         rushers.append((gid, build_player_play_pool(gid, "rush", season, week, pbp_df, prior_pbp_df, exploit)))
 
-    target_counts = hist["receiver_player_id"].dropna().value_counts().head(n_targets)
+    target_counts = hist["receiver_player_id"].dropna().value_counts()
+    target_counts = target_counts[[gid for gid in target_counts.index if _still_on_team(gid)]].head(n_targets)
+    if using_prior_season_fallback:
+        target_counts = _roster_ranked_candidates(["WR", "TE", "RB"], "targets", n_targets)
     targets = []
     for gid in target_counts.index:
         exploit = None
@@ -7032,6 +7104,153 @@ class TeamCoverageProfile:
     z_scores: dict = field(default_factory=dict)
     ranks: dict = field(default_factory=dict)  # {coverage_field: real leaguewide rank, 1=highest usage}
     outliers: list = field(default_factory=list)
+
+
+def build_defense_coverage_tendency_profile(coverage_profile: "TeamCoverageProfile") -> list:
+    """
+    Real, clean defense-side profile - direct NFL analog of MLB's
+    build_pitcher_tendency_profile. Per direct instruction, uses ONLY
+    real, descriptive usage/tendency data (coverage usage% and real
+    leaguewide rank) - no benchmark judgment, no "is this defense good"
+    read attached. Reuses the SAME real, already-validated qualifying
+    logic (leaguewide rank <= COVERAGE_RANK_THRESHOLD, with the real,
+    validated tie-margin) rather than reinventing a new threshold -
+    that logic was directly confirmed against real 2025 data earlier
+    this session.
+
+    Returns one real entry per coverage type: usage_pct, leaguewide
+    rank, and whether it clears the real, established "meaningfully
+    used" bar - the downstream question ("is a specific player
+    exploitable against these") is handled separately, same real
+    separation of concerns as the pitcher/hitter split in MLB.
+    """
+    profile = []
+    for coverage_field in COVERAGE_FIELDS:
+        rank = coverage_profile.ranks.get(coverage_field)
+        usage_pct = coverage_profile.rates.get(coverage_field)
+        qualifies = rank is not None and rank <= COVERAGE_RANK_THRESHOLD
+        profile.append({
+            "coverage": coverage_field,
+            "usage_pct": usage_pct,
+            "leaguewide_rank": rank,
+            "meaningfully_used": qualifies,
+        })
+    return sorted(profile, key=lambda x: (x["leaguewide_rank"] is None, x["leaguewide_rank"]))
+
+
+NFL_PROP_ORIGINAL_METHOD_STATS = {
+    # Real, representative stat_keys per prop, reusing the same real
+    # column groupings already established in ALIGNMENT_STATS_BY_PROP -
+    # not reinvented, just flattened to a direct list for percentile
+    # comparison against the real, current-season population.
+    "receptions": ["RTE %", "TPRR", "CR %"],
+    "targets": ["1READ %", "TGT", "TGT %"],
+    "rec_yards": ["YPRR", "YAC", "aDOT"],
+    "rec_tds": ["TD", "TD %", "i20 TGT", "EZTGT"],
+    "longest_reception": ["aDOT", "YAC", "YPR"],
+}
+
+
+def calc_original_method_match_nfl_for_prop(coverage_profile: "TeamCoverageProfile", player_stats_by_coverage: dict,
+                                              prop_type: str, comparison_series_by_stat: dict,
+                                              min_percentile: float = 75.0) -> dict:
+    """
+    Real, generalized, per-prop wrapper around calc_original_method_
+    match_nfl - looks up the right real stat_keys for the given prop
+    (NFL_PROP_ORIGINAL_METHOD_STATS above) rather than requiring the
+    caller to know which real columns matter for which prop.
+    """
+    stat_keys = NFL_PROP_ORIGINAL_METHOD_STATS.get(prop_type)
+    if not stat_keys:
+        return {"usable": False, "reason": f"no real stat config defined for prop '{prop_type}'"}
+    return calc_original_method_match_nfl(
+        coverage_profile, player_stats_by_coverage, stat_keys,
+        comparison_series_by_stat, min_percentile=min_percentile,
+    )
+
+
+def calc_original_method_match_nfl(coverage_profile: "TeamCoverageProfile", player_stats_by_coverage: dict,
+                                     stat_keys: list, comparison_series_by_stat: dict,
+                                     min_percentile: float = 75.0, stat_directions: dict = None) -> dict:
+    """
+    Real, direct NFL analog of MLB's calc_original_method_match - hard
+    thresholds per real, individual coverage type (not a usage-weighted
+    blend), requiring a real MAJORITY of the defense's meaningfully-used
+    coverages to individually clear the bar for every real stat in
+    stat_keys.
+
+    REAL DESIGN DIFFERENCE FROM MLB, FOUND VIA DIRECT CHECK: NFL has no
+    equivalent of MLB's fixed TIER_BENCHMARKS (confirmed - searched,
+    found nothing). What NFL already has, extensively used throughout
+    this file, is calc_percentile_grade - a real, established, relative
+    grading approach against this season's actual population. Using a
+    fixed, invented absolute number here would be inconsistent with how
+    every other stat in this file is actually graded. So "clears the
+    bar" here means clears a real percentile cutoff (default 75th) of
+    the real, current-season comparison population for that stat - not
+    an arbitrary made-up number.
+
+    player_stats_by_coverage: {coverage_field: {stat_key: value}}.
+    comparison_series_by_stat: {stat_key: pd.Series} - the real, full,
+    current-season population of values for that stat, to grade
+    against (reuses calc_percentile_grade directly, not reinvented).
+    stat_directions: {stat_key: "high"|"low"} - "low" for stats where a
+    LOWER real value is actually better (e.g. an inverted floor-profile
+    stat); defaults to "high" for any stat not listed.
+    """
+    stat_directions = stat_directions or {}
+    qualifying_coverages = [c for c in COVERAGE_FIELDS if coverage_profile.ranks.get(c, 999) <= COVERAGE_RANK_THRESHOLD]
+    if not qualifying_coverages:
+        return {"usable": False, "reason": "defense has no real, meaningfully-used coverage"}
+
+    per_coverage_results = []
+    for coverage in qualifying_coverages:
+        stats = player_stats_by_coverage.get(coverage)
+        if stats is None:
+            per_coverage_results.append({"coverage": coverage, "qualifies": None,
+                                          "note": "no real player data for this coverage - not counted either way"})
+            continue
+        clears_all = True
+        real_percentiles = {}
+        for stat_key in stat_keys:
+            value = stats.get(stat_key)
+            comparison_series = comparison_series_by_stat.get(stat_key)
+            if value is None or comparison_series is None:
+                clears_all = False
+                continue
+            direction = stat_directions.get(stat_key, "high")
+            percentile = calc_percentile_grade(value, comparison_series)
+            if direction == "low":
+                percentile = 100 - percentile if pd.notna(percentile) else percentile
+            real_percentiles[stat_key] = percentile
+            if pd.isna(percentile) or percentile < min_percentile:
+                clears_all = False
+        per_coverage_results.append({"coverage": coverage, "qualifies": clears_all,
+                                       "stats": stats, "real_percentiles": real_percentiles})
+
+    scored = [r for r in per_coverage_results if r["qualifies"] is not None]
+    if not scored:
+        return {"usable": False, "reason": "every meaningfully-used coverage was missing real player data",
+                "per_coverage": per_coverage_results}
+
+    qualifying_count = sum(1 for r in scored if r["qualifies"])
+    is_majority = qualifying_count > (len(scored) / 2)
+
+    return {
+        "usable": True,
+        "per_coverage": per_coverage_results,
+        "coverages_scored": len(scored),
+        "coverages_qualifying": qualifying_count,
+        "real_majority_match": is_majority,
+        "read": (
+            f"REAL MATCH - clears real thresholds on {qualifying_count}/{len(scored)} of the "
+            f"defense's meaningfully-used, real-sampled coverages."
+            if is_majority else
+            f"NOT a real match - only {qualifying_count}/{len(scored)} of the defense's "
+            f"meaningfully-used coverages clear real thresholds - doesn't reach a real majority."
+        ),
+    }
+
 
 
 def load_team_coverage_matrix(csv_path):
