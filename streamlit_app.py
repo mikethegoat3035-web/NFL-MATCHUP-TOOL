@@ -62,6 +62,8 @@ from nfl_model_combined import (
     _same_team, check_alignment_fit, ALIGNMENT_RTE_COLUMNS, ALIGNMENTS,
     load_full_rb_dataset, get_rb_matchup, CONCEPT_FILES as RB_CONCEPT_FILES,
     CRUCIAL_RB_STATS,
+    build_defense_coverage_tendency_profile, calc_original_method_match_nfl,
+    calc_original_method_match_nfl_for_prop, NFL_PROP_ORIGINAL_METHOD_STATS, _to_float,
 )
 from draft_rankings import (
     build_yahoo_style_rankings, detect_risers, build_league_settings,
@@ -1845,6 +1847,95 @@ elif mode == "Coverage Matchup (premium data)":
 
         st.divider()
         team_names_sorted = sorted(bundle.def_coverage.keys()) or sorted(set(TEAM_ABBREV_TO_FULL.values()))
+
+        st.header("🎯 Original Method Matcher (NFL)")
+        st.caption(
+            "Real, direct NFL analog of the hard-threshold matching built for MLB - pure, "
+            "descriptive defense coverage tendencies (no benchmark judgment), checked against "
+            "a specific real player's own per-coverage performance using a real percentile bar "
+            "(vs this season's actual population, not an invented fixed number) - requires a "
+            "real majority of the defense's meaningfully-used coverages to individually clear it."
+        )
+        st.caption(
+            "Honest status: mechanically verified against real, hand-built test cases - not yet "
+            "run against a real, live slate in this exact app flow."
+        )
+
+        omm_nfl_col1, omm_nfl_col2, omm_nfl_col3 = st.columns(3)
+        with omm_nfl_col1:
+            omm_nfl_player = st.text_input("Player name (exact, as in the export)", value="", key="omm_nfl_player")
+            omm_nfl_position = st.selectbox("Position", ["WR", "TE", "RB"], key="omm_nfl_position")
+        with omm_nfl_col2:
+            omm_nfl_opponent = st.selectbox("Opponent (defense)", team_names_sorted, key="omm_nfl_opponent")
+            omm_nfl_prop = st.selectbox("Prop", list(NFL_PROP_ORIGINAL_METHOD_STATS.keys()), key="omm_nfl_prop")
+        with omm_nfl_col3:
+            omm_nfl_min_pct = st.number_input("Min real percentile to qualify", min_value=50.0, max_value=99.0,
+                                                value=75.0, step=5.0, key="omm_nfl_min_pct")
+
+        if st.button("Run Original Method check", key="omm_nfl_run_btn") and omm_nfl_player:
+            opp_profile = bundle.def_coverage.get(omm_nfl_opponent)
+            if opp_profile is None:
+                st.error(f"No real coverage data found for {omm_nfl_opponent}.")
+            else:
+                tendency_profile = build_defense_coverage_tendency_profile(opp_profile)
+                with st.expander("Real defense coverage tendency profile (no benchmark judgment attached)"):
+                    st.dataframe(pd.DataFrame(tendency_profile), width="stretch", hide_index=True)
+
+                # Real, direct player-stats-per-coverage lookup - which
+                # alignment this player is actually used at is found the
+                # same real way calc_alignment_exploit_strength already
+                # does (highest real target volume across alignments),
+                # then his real row is pulled per coverage within that
+                # alignment.
+                tgt_by_alignment = {}
+                for alignment in ALIGNMENTS:
+                    total_tgt = 0
+                    for coverage_field, rows in bundle.receiver_by_alignment.get(alignment, {}).items():
+                        row = rows.get(omm_nfl_player)
+                        if row is not None:
+                            total_tgt += int(_to_float(row.get("TGT")) or 0)
+                    if total_tgt > 0:
+                        tgt_by_alignment[alignment] = total_tgt
+
+                if not tgt_by_alignment:
+                    st.warning(f"No real target data found for '{omm_nfl_player}' in any alignment file.")
+                else:
+                    dominant_alignment = max(tgt_by_alignment, key=tgt_by_alignment.get)
+                    player_stats_by_coverage = {}
+                    for coverage_field, rows in bundle.receiver_by_alignment.get(dominant_alignment, {}).items():
+                        row = rows.get(omm_nfl_player)
+                        if row is not None:
+                            player_stats_by_coverage[coverage_field] = row
+
+                    # Real, current-season comparison population for
+                    # each stat this prop needs - every real player's
+                    # row at this same dominant alignment, across all
+                    # coverages, pooled together.
+                    stat_keys = NFL_PROP_ORIGINAL_METHOD_STATS.get(omm_nfl_prop, [])
+                    comparison_series_by_stat = {}
+                    for stat_key in stat_keys:
+                        all_values = []
+                        for coverage_field, rows in bundle.receiver_by_alignment.get(dominant_alignment, {}).items():
+                            for other_row in rows.values():
+                                v = _to_float(other_row.get(stat_key))
+                                if v is not None:
+                                    all_values.append(v)
+                        comparison_series_by_stat[stat_key] = pd.Series(all_values)
+
+                    result = calc_original_method_match_nfl_for_prop(
+                        opp_profile, player_stats_by_coverage, omm_nfl_prop,
+                        comparison_series_by_stat, min_percentile=omm_nfl_min_pct,
+                    )
+                    if not result.get("usable"):
+                        st.warning(result.get("reason", "Not usable."))
+                    else:
+                        if result["real_majority_match"]:
+                            st.success(result["read"])
+                        else:
+                            st.info(result["read"])
+                        st.dataframe(pd.DataFrame(result["per_coverage"]), width="stretch")
+
+        st.divider()
 
         mcol1, mcol2, mcol3 = st.columns(3)
         with mcol1:
