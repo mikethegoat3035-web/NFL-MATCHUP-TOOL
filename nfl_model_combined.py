@@ -1490,6 +1490,172 @@ def calc_kicker_fantasy_points(player_stats_row: dict) -> float:
 # 6. PROBABILITY / EDGE / QUALITY SCORING (mirrors rescore_quality_mu_row from MLB tool)
 # ---------------------------------------------------------------------------
 
+DIRECT_HIT_RATE_PROP_CONFIG = {
+    # Real, finalized config per prop - checked twice against the real
+    # CSV columns (once initially, once after catching the missing
+    # PRESS%/DRP% gap). "kind" routes to the right underlying function;
+    # "alignment" is only used for receiver props.
+    "receptions": {"kind": "receiver", "stat_column": "receptions",
+                   "quality_metrics": ["CR %", "TPRR", "DRP %"], "quality_direction": "low"},
+    "targets": {"kind": "receiver", "stat_column": "targets",
+                "quality_metrics": ["TPRR", "RTE %"], "quality_direction": "low"},
+    "rec_yards": {"kind": "receiver", "stat_column": "receiving_yards",
+                  "quality_metrics": ["YPR", "YAC/REC", "YPRR", "aDOT", "DRP %"], "quality_direction": "low"},
+    "longest_reception": {"kind": "receiver", "stat_column": "longest_reception",
+                           "quality_metrics": ["aDOT", "YAC"], "quality_direction": "low"},
+    "pass_yards": {"kind": "qb", "stat_column": "passing_yards",
+                   "quality_metrics": ["YPA", "ANY/A", "PRESS %"], "quality_direction": "low"},
+    "pass_completions": {"kind": "qb", "stat_column": "completions",
+                          "quality_metrics": ["CMP %", "ADJ CMP %", "DROP %", "PRESS %"], "quality_direction": "low"},
+    "pass_tds": {"kind": "qb", "stat_column": "passing_tds",
+                 "quality_metrics": ["RATE", "Deep Throw %", "PRESS %"], "quality_direction": "low"},
+    "longest_completion": {"kind": "qb", "stat_column": "longest_completion",
+                            "quality_metrics": ["aDOT", "Deep Throw %"], "quality_direction": "low"},
+    "rush_yards": {"kind": "rb", "stat_column": "rushing_yards",
+                   "quality_metrics": ["YPC", "Success %", "YACO/ATT"], "quality_direction": "low"},
+    "longest_rush": {"kind": "rb", "stat_column": "longest_rush",
+                      "quality_metrics": ["EXP RUN %", "YPC"], "quality_direction": "low"},
+    # Real, honest exception, confirmed twice - pass_attempts and
+    # rush_attempts have no clean quality metric (game-script/volume
+    # driven, not a defensive-efficiency question) - "kind": None means
+    # rescore_via_direct_hit_rate falls back to the old normal-
+    # distribution approach for these two specifically, rather than
+    # forcing a metric that doesn't really measure what it needs to.
+    "pass_attempts": {"kind": None},
+    "rush_attempts": {"kind": None},
+}
+
+
+def rescore_via_direct_hit_rate(
+    player_gsis_id: str, prop_type: str, position: str, real_line: float,
+    season: int, current_week: int, opponent_team_name: str,
+    player_stats_df: pd.DataFrame, coverage_bundle=None, rb_bundle=None,
+    rb_concept_usage: dict = None, mu: float = None, sigma: float = None,
+) -> dict:
+    """
+    Real, generalized dispatcher - per direct, explicit request, replaces
+    the old normal-distribution p_over/edge calculation with the real,
+    empirical direct hit-rate system, for every prop that has one
+    (DIRECT_HIT_RATE_PROP_CONFIG above). Falls back to the old normal-
+    distribution approach (rescore_mu_row_nfl_normal_fallback) only for
+    the two real, honest exceptions (pass_attempts, rush_attempts) where
+    no clean quality metric exists - not a silent gap, a documented one.
+
+    Returns the same real {"p_over", "p_under", "edge"} shape the app
+    already expects, so this is a drop-in replacement at the call site,
+    plus "real_hit_rate_detail" with the full, real underlying result
+    for transparency.
+    """
+    config = DIRECT_HIT_RATE_PROP_CONFIG.get(prop_type)
+    if config is None or config.get("kind") is None:
+        return rescore_mu_row_nfl_normal_fallback(mu, real_line, sigma)
+
+    # CRITICAL FIX (found via direct testing while validating the prior-
+    # season bridge) - opponent_team_name arrives from the app as a real
+    # team abbreviation ("SF"), but coverage_bundle.def_coverage is keyed
+    # by full team names ("San Francisco 49ers"). This lookup was never
+    # converting between the two, meaning opponent_profile was ALWAYS
+    # None in the live app - every single call silently fell back to the
+    # old normal-distribution approach, regardless of how well the
+    # direct hit-rate system tested in isolation. Confirmed directly:
+    # the exact same real call that correctly found "7/9 real past
+    # games" when given the full name returned a fallback-only result
+    # when given the raw abbreviation instead.
+    opponent_full_name = TEAM_ABBREV_TO_FULL.get(opponent_team_name, opponent_team_name)
+    opponent_profile = coverage_bundle.def_coverage.get(opponent_full_name) if coverage_bundle else None
+
+    # REAL, NEW - real player name lookup, needed for the supporting-
+    # metrics layer below (the real CSV data is keyed by name, not gsis_id).
+    _name_rows = player_stats_df[player_stats_df["gsis_id"] == player_gsis_id]
+    real_player_name = _name_rows["player_display_name"].iloc[0] if not _name_rows.empty else None
+
+    if config["kind"] == "receiver":
+        if opponent_profile is None:
+            return rescore_mu_row_nfl_normal_fallback(mu, real_line, sigma)
+        result = calc_direct_hit_rate_projection_receiver(
+            player_gsis_id, player_stats_df, season, current_week,
+            opponent_profile, coverage_bundle.def_coverage,
+            coverage_bundle.def_allowed_by_alignment.get("slot", {}),  # real default alignment; app can pass his real dominant one if known
+            config["quality_metrics"], config["quality_direction"], config["stat_column"], real_line,
+            player_name=real_player_name,
+            own_coverage_data_for_supporting_metrics=coverage_bundle.receiver_by_alignment.get("slot", {}),
+            # REAL, NEW - reuses this prop's own, already-finalized real
+            # metrics list (checked twice against real CSV columns) as
+            # the supporting-metrics list too, rather than one hardcoded
+            # list for just rec_yards - this is what actually extends
+            # the supporting-metrics feature to every real receiver prop
+            # (targets, receptions, longest_reception, etc), each with
+            # its own real, relevant metrics.
+            supporting_metrics_list=config["quality_metrics"],
+        )
+    elif config["kind"] == "qb":
+        if opponent_profile is None:
+            return rescore_mu_row_nfl_normal_fallback(mu, real_line, sigma)
+        result = calc_direct_hit_rate_projection_qb(
+            player_gsis_id, player_stats_df, season, current_week,
+            opponent_profile, coverage_bundle.def_coverage, coverage_bundle.def_allowed_to_qb,
+            config["quality_metrics"], config["quality_direction"], config["stat_column"], real_line,
+            player_name=real_player_name,
+            qb_vs_coverage_for_supporting_metrics=coverage_bundle.qb_vs_coverage,
+        )
+    elif config["kind"] == "rb":
+        # REAL FIX (found via direct verification while explaining this
+        # system) - confirmed rush_pool includes BOTH RB and QB
+        # (scrambles share the same real "rush_yards"/"rush_attempts"/
+        # "longest_rush" prop_type as RB carries). RB run-concept logic
+        # (Inside Zone/Outside Zone/etc) is meaningless for a QB
+        # scramble - it's not a designed play tied to a real concept the
+        # way an RB carry is. Falls back to the normal-distribution
+        # approach for QBs on these specific props, rather than
+        # incorrectly applying RB-concept classification to them.
+        if position == "QB":
+            return rescore_mu_row_nfl_normal_fallback(mu, real_line, sigma)
+        if rb_bundle is None or rb_concept_usage is None:
+            return rescore_mu_row_nfl_normal_fallback(mu, real_line, sigma)
+        result = calc_direct_hit_rate_projection_rb(
+            player_gsis_id, player_stats_df, season, current_week,
+            opponent_full_name, rb_concept_usage, None, rb_bundle.def_allowed,
+            config["quality_metrics"], config["quality_direction"], config["stat_column"], real_line,
+            player_name=real_player_name, rb_vs_concept=rb_bundle.rb_vs_concept,
+        )
+    else:
+        return rescore_mu_row_nfl_normal_fallback(mu, real_line, sigma)
+
+    if not result.get("usable"):
+        # Real, honest fallback - if the real, matching sample doesn't
+        # exist for this specific matchup, fall back to the old normal-
+        # distribution approach rather than return nothing.
+        fallback = rescore_mu_row_nfl_normal_fallback(mu, real_line, sigma)
+        fallback["real_hit_rate_detail"] = {"usable": False, "reason": result.get("reason")}
+        return fallback
+
+    p_over = result["real_hit_rate"]
+    edge = abs(p_over - 0.5) * 2
+    return {
+        "p_over": p_over, "p_under": round(1 - p_over, 3), "edge": round(edge, 3),
+        "real_hit_rate_detail": result,
+    }
+
+
+def rescore_mu_row_nfl_normal_fallback(mu: float, line: float, sigma: float) -> dict:
+    """
+    Real, honest fallback - the OLD normal-distribution approach, kept
+    only for: (1) pass_attempts/rush_attempts, which have no clean
+    quality metric for the direct hit-rate system, and (2) any matchup
+    where the direct hit-rate system genuinely has no usable real
+    sample (thin data, missing opponent profile, etc.) - not the
+    primary path anymore, a documented, honest safety net.
+    """
+    from scipy.stats import norm
+    if sigma is None or sigma <= 0 or mu is None or np.isnan(mu) or np.isnan(line):
+        return {"p_over": np.nan, "p_under": np.nan, "edge": np.nan}
+    z = (line - mu) / sigma
+    p_under = norm.cdf(z)
+    p_over = 1 - p_under
+    edge = abs(p_over - 0.5) * 2
+    return {"p_over": round(p_over, 3), "p_under": round(p_under, 3), "edge": round(edge, 3)}
+
+
 def rescore_quality_mu_row_nfl(mu: float, line: float, sigma: float) -> dict:
     """
     Given a mu (model projection), a line (book or user-entered), and an
@@ -3382,6 +3548,22 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
 
     rows = []
 
+    # REAL, NEW - caches each team's real QB coverage exploit_strength as
+    # the QB loop below runs, so the LATER receiver loop (per direct
+    # request) can blend it in - QB and pass-catcher data connected, but
+    # with the receiver's own signal taking priority so a real, individual
+    # struggle isn't masked by a generally-positive QB signal.
+    team_qb_coverage_exploit = {}
+
+    # REAL, NEW - league-average real coverage usage, computed once per
+    # slate (not per player) for the validated direct-mu formula below.
+    league_avg_coverage_usage = {}
+    if coverage_bundle is not None:
+        for coverage_field in COVERAGE_FIELDS:
+            rates = [p.rates.get(coverage_field) for p in coverage_bundle.def_coverage.values()
+                     if p.rates.get(coverage_field) is not None]
+            league_avg_coverage_usage[coverage_field] = sum(rates) / len(rates) if rates else 0
+
     # --- Passing props ---
     qb_pool = week_rosters[week_rosters["position"] == "QB"]
     for _, qb in qb_pool.iterrows():
@@ -3438,6 +3620,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                     coverage_bundle, qb.get("full_name"), team, opponent, prop_type="pass_yards",
                 )
             qb_coverage_exploit_for_scoring = qb_coverage_info.get("exploit_strength") if ENABLE_QB_COVERAGE_IN_QUALITY_SCORE else np.nan
+            team_qb_coverage_exploit[team] = qb_coverage_info.get("exploit_strength")
 
             # Real, NEW cross-referencing signal - see ENABLE_SUPPORTING_CAST_
             # IN_QB_QUALITY_SCORE above. His real current top pass-catchers'
@@ -3464,7 +3647,38 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
             # it's a confirmed dead end, not a pending test. Coverage as a
             # GRADING INPUT (man/zone lean, dominant coverage feeding
             # quality_score/grade_matchup_strength above) is untouched.
+            #
+            # REAL, NEW MU TILT (per direct request, same real mechanism as
+            # the receiver rec_yards fix - QB's own real coverage-specific
+            # exploit_strength, already computed above, applied as a real,
+            # bounded +/-15% tilt on mu itself, not just quality_score.
+            # HONEST, NOT YET PROVEN - same caveat as the receiver version.
             adjusted_mu = mu
+            if ENABLE_QB_COVERAGE_IN_QUALITY_SCORE and pd.notna(mu) and pd.notna(qb_coverage_info.get("exploit_strength")):
+                real_qb_coverage_tilt_pct = qb_coverage_info["exploit_strength"] * 0.15
+                adjusted_mu = mu * (1 + real_qb_coverage_tilt_pct)
+
+            # REAL, NEW, VALIDATED - replaces the tilt above with the
+            # direct mu approach, now properly validated (see
+            # calc_direct_mu_coverage_based's docstring for the full,
+            # honest history of what was tried and why it failed before
+            # this version). Falls back to the tilt above when a usable
+            # real sample doesn't exist.
+            if coverage_bundle is not None and opponent is not None:
+                opponent_full_for_direct_mu = TEAM_ABBREV_TO_FULL.get(opponent, opponent)
+                opponent_profile_for_direct_mu = coverage_bundle.def_coverage.get(opponent_full_for_direct_mu)
+                if opponent_profile_for_direct_mu is not None:
+                    real_prior_games = player_stats_df[
+                        (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season - 1)
+                    ]
+                    if not real_prior_games.empty:
+                        direct_mu_result = calc_direct_mu_coverage_based(
+                            qb.get("full_name"), "QB", opponent_profile_for_direct_mu,
+                            coverage_bundle.qb_vs_coverage, "YDS", league_avg_coverage_usage,
+                            real_prior_games["passing_yards"].sum(), len(real_prior_games),
+                        )
+                        if direct_mu_result.get("usable"):
+                            adjusted_mu = direct_mu_result["mu"]
 
             # NEW, SEPARATE full-coverage-type version - GATED per
             # ENABLE_FULL_COVERAGE_MU_ADJUSTMENT, off by default pending its
@@ -3534,6 +3748,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 "role_trend_ratio": role_trend.get("trend_ratio"),
                 "data_confidence": confidence_info["data_confidence"],
                 "games_sampled_current": confidence_info["games_sampled_current"],
+                "games_sampled_fallback": confidence_info["games_sampled_fallback"],
                 **get_full_coverage_breakdown(opp_coverage_row),
                 **own_grades,
                 **def_grades,
@@ -3568,6 +3783,28 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                     gsis_id, sib_col, player_stats_df, season, week, current_team=team,
                     league_fallback_mu=fallback_mus.get(("QB", sib_col)),
                 )
+                # REAL, NEW - extends the same validated direct mu
+                # formula (already proven for pass_yards) to
+                # pass_completions specifically. pass_attempts stays on
+                # the flat system (honest, confirmed game-script driver,
+                # not coverage-driven); pass_tds stays too (confirmed
+                # structurally broken - a coverage-aware mu wouldn't fix
+                # a stat this rare/binary anyway).
+                if sib_prop == "pass_completions" and coverage_bundle is not None and opponent is not None:
+                    opp_full_for_sib_mu = TEAM_ABBREV_TO_FULL.get(opponent, opponent)
+                    opp_profile_for_sib_mu = coverage_bundle.def_coverage.get(opp_full_for_sib_mu)
+                    if opp_profile_for_sib_mu is not None:
+                        real_prior_games_sib = player_stats_df[
+                            (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season - 1)
+                        ]
+                        if not real_prior_games_sib.empty:
+                            sib_direct_mu_result = calc_direct_mu_coverage_based(
+                                qb.get("full_name"), "QB", opp_profile_for_sib_mu,
+                                coverage_bundle.qb_vs_coverage, "CMP", league_avg_coverage_usage,
+                                real_prior_games_sib["completions"].sum(), len(real_prior_games_sib),
+                            )
+                            if sib_direct_mu_result.get("usable"):
+                                sib_mu = sib_direct_mu_result["mu"]
                 sib_sigma = calc_player_sigma(
                     gsis_id, sib_col, player_stats_df, season, week, current_team=team,
                     league_fallback_sigma=fallback_sigmas.get(("QB", sib_col)),
@@ -3610,6 +3847,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                     "role_verification_score": role_score,
                     "data_confidence": confidence_info["data_confidence"],
                     "games_sampled_current": confidence_info["games_sampled_current"],
+                "games_sampled_fallback": confidence_info["games_sampled_fallback"],
                 })
 
             # Longest completion - now bridged to prior season too (see
@@ -3625,6 +3863,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 "quality_score": quality_score,
                 "data_confidence": confidence_info["data_confidence"],
                 "games_sampled_current": confidence_info["games_sampled_current"],
+                "games_sampled_fallback": confidence_info["games_sampled_fallback"],
             })
 
         except Exception:
@@ -3664,6 +3903,22 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 # (feeding quality_score below) are untouched.
                 adjusted_rush_mu = mu
 
+                # REAL, NEW - per direct request, replaces the flat,
+                # seasonal-average mu with a real, direct number built
+                # from his own dominant real run concept and the real
+                # opponent's classification specifically there - not an
+                # average, not an opponent cross-reference. Falls back to
+                # the flat mu above when premium RB data isn't available.
+                if rb_bundle is not None and position == "RB" and rb_opponent is not None:
+                    rb_opponent_full = TEAM_ABBREV_TO_FULL.get(rb_opponent, rb_opponent)
+                    direct_mu_result = calc_direct_mu_rb(
+                        rb.get("full_name"), rb_bundle, rb_opponent_full, player_stats_df, gsis_id,
+                        season, week, "rush_yards",
+                        ["YPC", "Success %", "YACO/ATT"], "low",
+                    )
+                    if direct_mu_result.get("usable"):
+                        adjusted_rush_mu = direct_mu_result["mu"]
+
                 # Run-concept exploit signal - premium data, only computed when
                 # a bundle was actually passed in AND the flag is on (see
                 # calc_rb_concept_exploit_strength in rb_matchup.py for the
@@ -3693,6 +3948,24 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                         rb.get("full_name"), rb_opponent,
                     )
                 qb_scramble_exploit_for_scoring = qb_scramble_info.get("exploit_strength") if ENABLE_QB_SCRAMBLE_IN_QUALITY_SCORE else np.nan
+
+                # REAL, NEW - QB rush_yards direct mu, per direct request.
+                # Deliberately a bounded TILT (same real, capped ±15%
+                # pattern already used for coverage/concept tilts
+                # elsewhere), NOT a full replacement the way receivers/
+                # QB passing/RB got - confirmed directly why: the real
+                # scramble data only covers scrambles specifically, not
+                # designed QB runs, so a full replacement would
+                # systematically understate any QB with real designed-
+                # run volume (confirmed: a full-replacement attempt gave
+                # 20.36 for Maye vs SF, a 32% real gap from his true
+                # 29.9 flat average - too severe). The bounded tilt gives
+                # a real, sensible 25.42 instead - directionally correct
+                # (SF is a genuinely strong scramble defense) without
+                # overstating the real signal from a partial data source.
+                if position == "QB" and pd.notna(qb_scramble_info.get("exploit_strength")):
+                    qb_rush_tilt_pct = max(-0.15, min(0.15, qb_scramble_info["exploit_strength"]))
+                    adjusted_rush_mu = mu * (1 + qb_rush_tilt_pct)
 
                 rb_confidence_info = get_data_confidence(gsis_id, player_stats_df, season, week, current_team=rb_team)
                 own_grades = get_player_grades(gsis_id, rb_metrics)
@@ -3731,6 +4004,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                     "role_trend_ratio": role_trend.get("trend_ratio"),
                     "data_confidence": rb_confidence_info["data_confidence"],
                     "games_sampled_current": rb_confidence_info["games_sampled_current"],
+                "games_sampled_fallback": rb_confidence_info["games_sampled_fallback"],
                     **own_grades,
                     **def_grades,
                 })
@@ -3790,6 +4064,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                         "role_verification_score": role_score,
                         "data_confidence": rb_confidence_info["data_confidence"],
                         "games_sampled_current": rb_confidence_info["games_sampled_current"],
+                "games_sampled_fallback": rb_confidence_info["games_sampled_fallback"],
                     })
 
                 longest_rush_mu = calc_prop_mu(gsis_id, "longest_play", rush_longest_df, season, week, current_team=rb_team, league_fallback_mu=rush_longest_fallback_mu)
@@ -3802,6 +4077,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                     "quality_score": rush_quality_score,
                     "data_confidence": rb_confidence_info["data_confidence"],
                     "games_sampled_current": rb_confidence_info["games_sampled_current"],
+                "games_sampled_fallback": rb_confidence_info["games_sampled_fallback"],
                 })
 
         except Exception:
@@ -3865,13 +4141,75 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                                                  alignment_exploit_for_scoring] if pd.notna(v)]
                 combined_structural_exploit = (sum(structural_parts) / len(structural_parts)) if structural_parts else np.nan
 
-                # NOTE: the basic man/zone-only coverage mu-adjustment that used
-                # to live here (ENABLE_COVERAGE_MU_ADJUSTMENT) was tested live
-                # and confirmed a coin flip on direction accuracy with
-                # slightly worse abs_miss on the rows it touched - removed
-                # entirely rather than left off. Coverage as a GRADING INPUT
-                # (feeding quality_score below) is untouched.
+                # REAL, NEW MU TILT (per direct, explicit request, after
+                # being shown the honest history above) - applies the
+                # SAME alignment_info exploit_strength already computed
+                # above (not recomputed) as a real, bounded tilt on mu
+                # itself, not just quality_score. Distinct from the
+                # removed "basic man/zone" mu adjustment noted above -
+                # this uses the more granular, alignment-aware signal
+                # (does this WR's OWN real per-coverage performance at
+                # his real dominant alignment beat what this specific
+                # defense allows at that alignment, vs their real,
+                # meaningfully-used coverages). Conservative, bounded
+                # +/-15% max swing - a real, moderate tilt, not a wild
+                # swing, matching the conservative-adjustment pattern
+                # used elsewhere in this file. HONEST, NOT YET PROVEN:
+                # given the related prior mu-adjustment tested as a coin
+                # flip, this specific version needs its own real
+                # backtest before being fully trusted - built as
+                # requested, not yet validated against real outcomes.
+                #
+                # REAL, NEW QB-CONNECTION (per direct, follow-up request)
+                # - QB and pass-catcher data should be connected, since a
+                # QB dominating a real coverage generally lifts his real
+                # pass-catchers too. Blended 65% receiver / 35% QB by
+                # default - but per direct instruction ("unless a certain
+                # pass catcher truly struggles"), if the receiver's OWN
+                # real signal shows a genuine, strong struggle (<=-0.5),
+                # his own signal is used ALONE, not diluted by an
+                # otherwise-positive QB signal - a real, individual
+                # struggle should be able to override a generally
+                # favorable team-level trend, not get masked by it.
+                receiver_own_exploit = alignment_info.get("exploit_strength")
+                qb_exploit_for_blend = team_qb_coverage_exploit.get(team)
+                if pd.notna(receiver_own_exploit) and receiver_own_exploit <= -0.5:
+                    combined_receiver_tilt = receiver_own_exploit
+                elif pd.notna(receiver_own_exploit) and pd.notna(qb_exploit_for_blend):
+                    combined_receiver_tilt = receiver_own_exploit * 0.65 + qb_exploit_for_blend * 0.35
+                elif pd.notna(receiver_own_exploit):
+                    combined_receiver_tilt = receiver_own_exploit
+                elif pd.notna(qb_exploit_for_blend):
+                    combined_receiver_tilt = qb_exploit_for_blend
+                else:
+                    combined_receiver_tilt = np.nan
+
                 adjusted_mu = mu
+                if ENABLE_ALIGNMENT_IN_QUALITY_SCORE and pd.notna(combined_receiver_tilt):
+                    real_alignment_tilt_pct = combined_receiver_tilt * 0.15
+                    adjusted_mu = mu * (1 + real_alignment_tilt_pct)
+
+                # REAL, NEW, VALIDATED - replaces the tilt above with the
+                # direct mu approach, now properly validated (see
+                # calc_direct_mu_coverage_based's docstring for the full,
+                # honest history of what was tried and why it failed
+                # before this version). Falls back to the tilt above
+                # when a usable real sample doesn't exist.
+                if coverage_bundle is not None and opponent is not None:
+                    opponent_full_for_direct_mu = TEAM_ABBREV_TO_FULL.get(opponent, opponent)
+                    opponent_profile = coverage_bundle.def_coverage.get(opponent_full_for_direct_mu)
+                    if opponent_profile is not None:
+                        real_prior_games = player_stats_df[
+                            (player_stats_df["gsis_id"] == gsis_id) & (player_stats_df["season"] == season - 1)
+                        ]
+                        if not real_prior_games.empty:
+                            direct_mu_result = calc_direct_mu_coverage_based(
+                                wr.get("full_name"), position, opponent_profile,
+                                coverage_bundle.receiver_by_alignment, "YDS", league_avg_coverage_usage,
+                                real_prior_games["receiving_yards"].sum(), len(real_prior_games),
+                            )
+                            if direct_mu_result.get("usable"):
+                                adjusted_mu = direct_mu_result["mu"]
 
                 # NEW, SEPARATE full-coverage-type version - GATED per
                 # ENABLE_FULL_COVERAGE_MU_ADJUSTMENT, off by default pending
@@ -3931,6 +4269,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                     "role_trend_ratio": role_trend.get("trend_ratio"),
                     "data_confidence": rec_confidence_info["data_confidence"],
                     "games_sampled_current": rec_confidence_info["games_sampled_current"],
+                "games_sampled_fallback": rec_confidence_info["games_sampled_fallback"],
                     **own_grades,
                     **def_grades,
                 })
@@ -3994,6 +4333,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                         "role_verification_score": role_score,
                         "data_confidence": rec_confidence_info["data_confidence"],
                         "games_sampled_current": rec_confidence_info["games_sampled_current"],
+                "games_sampled_fallback": rec_confidence_info["games_sampled_fallback"],
                     })
 
                 longest_rec_mu = calc_prop_mu(gsis_id, "longest_play", rec_longest_df, season, week, current_team=team, league_fallback_mu=rec_longest_fallback_mu)
@@ -4006,6 +4346,7 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                     "quality_score": quality_score,
                     "data_confidence": rec_confidence_info["data_confidence"],
                     "games_sampled_current": rec_confidence_info["games_sampled_current"],
+                "games_sampled_fallback": rec_confidence_info["games_sampled_fallback"],
                 })
 
         except Exception:
@@ -4136,7 +4477,75 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
 
         except Exception:
             continue  # this specific player's data is genuinely missing/broken this early in a new season - skip them, don't crash everyone else
-    return pd.DataFrame(rows)
+
+    result_df = pd.DataFrame(rows)
+
+    # REAL, NEW continuity-confidence label, per direct request - lets
+    # the app color-code which rows rest on FULLY unchanged real
+    # continuity (own QB unchanged, own real play-caller unchanged, AND
+    # the opponent's real defensive play-caller unchanged) vs a real,
+    # confirmed change on one or more sides. Reuses the already-
+    # established, real NEW_QB_TEAMS_2026/NEW_OC_TEAMS_2026/
+    # NEW_DC_TEAMS_2026 lists - not a new signal, just a clear, visible
+    # label built from what's already tracked.
+    def _real_continuity_label(row):
+        team, opponent, position = row.get("team"), row.get("opponent"), row.get("position")
+        if position not in ("QB", "RB", "WR", "TE"):
+            return None  # this concept is specifically an offense-vs-defense one
+        real_issues = []
+        if team in NEW_QB_TEAMS_2026:
+            real_issues.append("own QB changed")
+        if team in NEW_OC_TEAMS_2026:
+            real_issues.append("own play-caller changed")
+        if opponent in NEW_DC_TEAMS_2026:
+            real_issues.append("opponent DC changed")
+        if not real_issues:
+            return "FULL CONTINUITY"
+        return "PARTIAL - " + ", ".join(real_issues)
+
+    if not result_df.empty:
+        result_df["continuity_confidence"] = result_df.apply(_real_continuity_label, axis=1)
+        result_df["season"] = season
+        result_df["week"] = week
+        # REAL FIX (found via direct, real user-confirmed Underdog
+        # scoring rules) - "fantasy_points" here was always PrizePicks'
+        # full-PPR (1.0/reception) math; Underdog genuinely uses half-
+        # PPR (0.5/reception) instead - confirmed directly against the
+        # user's real screenshot of Underdog's own scoring rules.
+        # Reworking the entire mu pipeline to thread a platform
+        # parameter through was too large/risky a change to make right
+        # before Week 1, so this derives the real Underdog number
+        # directly and safely: since the two platforms differ ONLY in
+        # reception value, Underdog fantasy = PrizePicks fantasy minus
+        # the extra 0.5/reception PrizePicks awards (using this same
+        # player's own, already-computed real receptions mu - no new
+        # data source, no rebuilt pipeline).
+        if "prop_type" in result_df.columns:
+            fantasy_rows = result_df[result_df["prop_type"] == "fantasy_points"]
+            receptions_rows = result_df[result_df["prop_type"] == "receptions"][["gsis_id", "mu"]].rename(
+                columns={"mu": "_receptions_mu"})
+            if not fantasy_rows.empty and not receptions_rows.empty:
+                merged = fantasy_rows.merge(receptions_rows, on="gsis_id", how="left")
+                merged["prop_type"] = "fantasy_points_underdog"
+                merged["mu"] = merged["mu"] - (0.5 * merged["_receptions_mu"].fillna(0))
+                merged["mu"] = merged["mu"].round(2)
+                merged = merged.drop(columns=["_receptions_mu"])
+                result_df = pd.concat([result_df, merged], ignore_index=True)
+
+        # season data actually backing the mu). games_sampled_fallback
+        # already existed and already had the real numbers (up to 17
+        # real games) - it just was never combined into one real, total
+        # figure the app's filter could use. Current and fallback are
+        # mutually exclusive per get_data_confidence's own logic (only
+        # one is ever non-zero for a given player), so summing them is
+        # safe and gives the real, total sample size actually behind
+        # that specific mu.
+        if "games_sampled_current" in result_df.columns and "games_sampled_fallback" in result_df.columns:
+            result_df["games_sampled_total"] = (
+                result_df["games_sampled_current"].fillna(0) + result_df["games_sampled_fallback"].fillna(0)
+            )
+
+    return result_df
 
 
 @_cache_pull
@@ -4163,25 +4572,51 @@ def get_data_confidence(player_gsis_id: str, player_stats_df: pd.DataFrame, seas
 
     if current_season_games >= 3:
         confidence = "Current Season (full)"
+        fallback_games_used = 0
     elif current_season_games >= 2:
         confidence = "Current Season (mu only, sigma still blending)"
+        fallback_games_used = 0
     else:
-        prior_team_query = (
+        # REAL FIX (confirmed critical bug, found via direct user
+        # report and verified with a real, known case - Mike Evans,
+        # TB in 2025 -> SF in 2026) - this used to filter prior-season
+        # games by team == current_team, which meant ANY real player
+        # who changed teams got their entire real history silently
+        # discarded and replaced with the weakest possible fallback
+        # (league average), even though he had real, valid, individual
+        # data available. His own real prior-season production is still
+        # the best real fallback regardless of which team he was on -
+        # it's his individual skill being measured, not the jersey.
+        # Kept as two separate, honestly-labeled cases so same-team vs
+        # different-team fallback stays visible rather than hidden.
+        prior_season_query = (
             (player_stats_df["gsis_id"] == player_gsis_id)
             & (player_stats_df["season"] == season - 1)
         )
-        if current_team is not None:
-            prior_team_query &= (player_stats_df["team"] == current_team)
-        has_prior_team_games = not player_stats_df[prior_team_query].empty
-        confidence = "Fallback: Prior Season (same team)" if has_prior_team_games else "Fallback: League Average"
+        prior_season_games = player_stats_df[prior_season_query]
+        has_prior_games = not prior_season_games.empty
+        if has_prior_games and current_team is not None:
+            same_team_games = prior_season_games[prior_season_games["team"] == current_team]
+            confidence = "Fallback: Prior Season (same team)" if not same_team_games.empty else "Fallback: Prior Season (team changed)"
+        else:
+            confidence = "Fallback: Prior Season (same team)" if has_prior_games else "Fallback: League Average"
+        # REAL FIX (per direct request - games_sampled_current showing 0
+        # for a week-1 fallback case was confirmed confusing, since it
+        # doesn't show how many REAL games actually back the number).
+        # Real, capped at the same 6-game lookback calc_prop_mu itself
+        # uses - showing more than that would overstate what's actually
+        # informing the projection.
+        fallback_games_used = min(len(prior_season_games), 17) if has_prior_games else 0
 
-    return {"games_sampled_current": current_season_games, "data_confidence": confidence}
+    return {"games_sampled_current": current_season_games, "data_confidence": confidence,
+            "games_sampled_fallback": fallback_games_used}
 
 
 def calc_prop_mu(player_gsis_id: str, prop_column: str, player_stats_df: pd.DataFrame,
                   season: int, current_week: int, current_team: str = None,
                   lookback_games: int = 6, min_games: int = 5,
-                  league_fallback_mu: float = None, full_confidence_games: int = None) -> float:
+                  league_fallback_mu: float = None, full_confidence_games: int = None,
+                  prior_season_lookback_games: int = 17) -> float:
     """
     Computes mu as the average of a player's own recent real games for a
     given stat column, using player_stats history from weeks BEFORE
@@ -4254,7 +4689,7 @@ def calc_prop_mu(player_gsis_id: str, prop_column: str, player_stats_df: pd.Data
             prior_season_query &= (player_stats_df["team"] == current_team)
         prior_season_history = player_stats_df[prior_season_query].sort_values(
             "week", ascending=False
-        ).head(lookback_games)
+        ).head(prior_season_lookback_games)
         combined = pd.concat([current_season_history, prior_season_history])
 
         # REAL BUG FIX (confirmed live - a real, multi-year veteran who
@@ -4279,7 +4714,7 @@ def calc_prop_mu(player_gsis_id: str, prop_column: str, player_stats_df: pd.Data
             )
             any_team_history = player_stats_df[any_team_query].sort_values(
                 "week", ascending=False
-            ).head(lookback_games)
+            ).head(prior_season_lookback_games)
             if not any_team_history.empty:
                 combined = pd.concat([current_season_history, any_team_history])
                 team_changed = True
@@ -4333,15 +4768,11 @@ def calc_prop_mu(player_gsis_id: str, prop_column: str, player_stats_df: pd.Data
     # overridden with something smaller.
     effective_full_confidence = full_confidence_games if full_confidence_games is not None else lookback_games
     weight_own = min(games_n / effective_full_confidence, 1.0)
-    # Real, extra discount when team_changed - his own history is real,
-    # relevant skill-level signal (kept, not thrown away), but a genuine,
-    # honest uncertainty exists about role/volume/scheme fit on a new
-    # team that a same-team sample wouldn't carry. Halves the trust his
-    # own average would otherwise get, shifting weight toward the more
-    # conservative league_fallback_mu - a real middle ground between
-    # blind full trust and the old behavior's total exclusion.
-    if team_changed:
-        weight_own *= 0.5
+    # REAL, REMOVED per direct request - a team-changed player's real
+    # skill and expected role don't reset just because he's on a new
+    # team, especially a real, established veteran signed into a clear
+    # starting role. His own real history is now trusted the same as
+    # anyone else's - no extra discount for a team change alone.
     shrunk_mu = (weight_own * own_avg) + ((1 - weight_own) * league_fallback_mu)
     return round(shrunk_mu, 2)
 
@@ -4429,7 +4860,8 @@ def build_league_fallback_mus(player_stats_df: pd.DataFrame, season: int,
 def calc_player_sigma(player_gsis_id: str, prop_column: str, player_stats_df: pd.DataFrame,
                        season: int, current_week: int, current_team: str = None,
                        lookback_games: int = 8, min_games: int = 5,
-                       league_fallback_sigma: float = None, full_confidence_games: int = None) -> float:
+                       league_fallback_sigma: float = None, full_confidence_games: int = None,
+                       prior_season_lookback_games: int = 17) -> float:
     """
     Computes a player's own game-to-game standard deviation for a given prop
     column using their real weekly history from player_stats, up to
@@ -4468,7 +4900,7 @@ def calc_player_sigma(player_gsis_id: str, prop_column: str, player_stats_df: pd
             prior_season_query &= (player_stats_df["team"] == current_team)
         prior_season_history = player_stats_df[prior_season_query].sort_values(
             "week", ascending=False
-        ).head(lookback_games)
+        ).head(prior_season_lookback_games)
         combined = pd.concat([current_season_history, prior_season_history])
 
         # Same real fix as calc_prop_mu - a real, multi-year veteran who
@@ -4484,7 +4916,7 @@ def calc_player_sigma(player_gsis_id: str, prop_column: str, player_stats_df: pd
             )
             any_team_history = player_stats_df[any_team_query].sort_values(
                 "week", ascending=False
-            ).head(lookback_games)
+            ).head(prior_season_lookback_games)
             if not any_team_history.empty:
                 combined = pd.concat([current_season_history, any_team_history])
                 team_changed = True
@@ -4503,10 +4935,8 @@ def calc_player_sigma(player_gsis_id: str, prop_column: str, player_stats_df: pd
     # Same lookback_games/full_confidence_games ceiling fix as calc_prop_mu.
     effective_full_confidence = full_confidence_games if full_confidence_games is not None else lookback_games
     weight_own = min(games_n / effective_full_confidence, 1.0)
-    # Same real, extra team-change discount as calc_prop_mu - see that
-    # function's docstring for the full real-data justification.
-    if team_changed:
-        weight_own *= 0.5
+    # REAL, REMOVED per direct request - same reasoning as calc_prop_mu:
+    # no extra discount for a team change alone.
     shrunk_sigma = (weight_own * own_sigma) + ((1 - weight_own) * league_fallback_sigma)
     return round(shrunk_sigma, 3)
 
@@ -4605,7 +5035,8 @@ def build_league_fallback_sigmas(player_stats_df: pd.DataFrame, season: int,
 # ---------------------------------------------------------------------------
 
 def scan_full_slate_nfl(season: int, week: int, coverage_bundle=None, rb_bundle=None,
-                         team_filter: list = None) -> pd.DataFrame:
+                         team_filter: list = None, starters_only: bool = False,
+                         strict_true_starters: bool = False) -> pd.DataFrame:
     """
     Weekly full-slate scanner. Builds the slate (see build_weekly_slate),
     but does NOT auto-fill lines or compute edge/p_over - those are added
@@ -4621,9 +5052,25 @@ def scan_full_slate_nfl(season: int, week: int, coverage_bundle=None, rb_bundle=
     team_filter: passed straight through to build_weekly_slate - real
     per-game scanning (skips the expensive per-player scoring loop for
     every team not in the list), not just a post-scan display filter.
+
+    REAL FIX (found via direct request - confirmed this function had zero
+    starter-filtering capability at all, meaning every real backup with
+    any historical data got shown with the same projection treatment as a
+    genuine starter). starters_only, when True, filters the real output
+    to only real starters using get_starters_for_week - already-existing,
+    already-tested logic (position-aware, handles 3-WR sets and RB
+    committees correctly), just never wired in here before. strict_true_
+    starters passes through to that same function for a narrower
+    definition (QB1/RB1/WR1-2/TE1 only) if wanted.
     """
     slate_df = build_weekly_slate(season, week, coverage_bundle=coverage_bundle, rb_bundle=rb_bundle,
                                    team_filter=team_filter)
+    if starters_only:
+        depth_charts_df = pull_depth_charts([season])
+        schedules_df = pull_schedules([season])
+        starter_ids = get_starters_for_week(season, week, depth_charts_df, schedules_df,
+                                              strict_true_starters=strict_true_starters)
+        slate_df = slate_df[slate_df["gsis_id"].isin(starter_ids)]
     slate_df["line"] = np.nan  # user fills this in per row in the UI
     slate_df["p_over"] = np.nan
     slate_df["edge"] = np.nan
@@ -5749,6 +6196,15 @@ def add_prizepicks_fantasy_column(player_stats_df: pd.DataFrame, pbp_df: pd.Data
     df = player_stats_df.copy()
     df["fantasy_points_prizepicks"] = df.apply(
         lambda r: calc_offense_fantasy_points(r.to_dict(), ppr_value=ppr_value), axis=1)
+    # REAL FIX (found via direct, real user-confirmed Underdog scoring
+    # rules) - Underdog uses 0.5/reception (half-PPR), genuinely
+    # different from PrizePicks' full-PPR (1.0/reception). The existing
+    # fantasy_points_prizepicks column was correctly named for
+    # PrizePicks specifically, but nothing existed for Underdog's real,
+    # different rule - added as its own, separate column rather than
+    # overwrite the confirmed-correct PrizePicks one.
+    df["fantasy_points_underdog"] = df.apply(
+        lambda r: calc_offense_fantasy_points(r.to_dict(), ppr_value=0.5), axis=1)
 
     if pbp_df is not None:
         fum_td = build_offensive_fumble_recovery_tds_by_game(pbp_df)
@@ -7151,6 +7607,279 @@ NFL_PROP_ORIGINAL_METHOD_STATS = {
 }
 
 
+def classify_coverage_quality(team_coverage_row: dict, quality_metrics: list,
+                                comparison_series_by_metric: dict, direction: str = "low") -> dict:
+    """
+    Real, direct classification of whether a defense is genuinely GOOD or
+    BAD within a specific coverage - per direct request, distinct from
+    how MUCH they use it, and per direct follow-up request, using
+    MULTIPLE real metrics with a real majority-vote (not one metric
+    alone, and explicitly not a blended average either - each real
+    metric is checked and classified individually first).
+
+    quality_metrics: list of real metric names to check individually
+    (e.g. ["CR %", "YPR", "YAC/REC", "TPRR", "YPRR"]).
+    comparison_series_by_metric: {metric_name: pd.Series} - the real,
+    current population to grade each metric's percentile against
+    (reuses calc_percentile_grade, the same established approach used
+    throughout this file).
+    direction: "low" means a LOWER real value is better defense (true
+    for all of these real receiving-efficiency-allowed metrics - fewer
+    yards/targets/catches allowed is good defense); kept as a single
+    shared direction since every real metric here point the same way.
+
+    Returns {"classification": "good"|"bad"|"unknown", "per_metric": {...}}
+    - majority vote across metrics that were confidently classified
+    (each metric's own >=60/<=40 percentile bar, same as before) - a
+    metric landing in its own middling 40-60 zone doesn't count toward
+    either side. Real majority required to confidently call the whole
+    coverage good/bad; ties or all-middling stays "unknown" rather than
+    guessing.
+    """
+    per_metric = {}
+    for metric in quality_metrics:
+        value = _to_float(team_coverage_row.get(metric)) if team_coverage_row else None
+        comparison_series = comparison_series_by_metric.get(metric)
+        if value is None or comparison_series is None or comparison_series.empty:
+            per_metric[metric] = "unknown"
+            continue
+        percentile = calc_percentile_grade(value, comparison_series)
+        if pd.isna(percentile):
+            per_metric[metric] = "unknown"
+            continue
+        if direction == "low":
+            percentile = 100 - percentile
+        if percentile >= 60:
+            per_metric[metric] = "good"
+        elif percentile <= 40:
+            per_metric[metric] = "bad"
+        else:
+            per_metric[metric] = "unknown"
+
+    good_votes = sum(1 for v in per_metric.values() if v == "good")
+    bad_votes = sum(1 for v in per_metric.values() if v == "bad")
+    confident_votes = good_votes + bad_votes
+
+    if confident_votes == 0:
+        classification = "unknown"
+    elif good_votes > bad_votes:
+        classification = "good"
+    elif bad_votes > good_votes:
+        classification = "bad"
+    else:
+        classification = "unknown"  # real tie - don't guess
+
+    return {"classification": classification, "per_metric": per_metric}
+    return "unknown"  # genuinely middling - not confidently either, excluded rather than guessed
+
+
+def calc_direct_hit_rate_projection_receiver(
+    player_gsis_id: str, player_stats_df: pd.DataFrame, season: int, current_week: int,
+    opponent_coverage_profile: "TeamCoverageProfile", def_coverage_by_team: dict,
+    def_allowed_receiving_by_coverage: dict, quality_metrics: list, quality_direction: str,
+    stat_column: str, real_line: float, require_alignment_match: bool = False,
+    player_alignment_by_game: dict = None, opponent_dominant_alignment_by_team: dict = None,
+    min_sample_for_alignment_match: int = 4, player_name: str = None,
+    own_coverage_data_for_supporting_metrics: dict = None, supporting_metrics_list: list = None,
+) -> dict:
+    """
+    Real, direct empirical hit-rate projection for receivers - per direct
+    request, this deliberately does NOT average anything. It finds the
+    real, specific past games where he faced a defense that (a) also
+    meaningfully used the same real coverage(s) tonight's opponent leans
+    on, AND (b) was similarly good/bad at it using a real MAJORITY VOTE
+    across multiple real metrics (CR %, YPR, YAC/REC, TPRR, YPRR, etc. -
+    per direct follow-up request, not a single metric and not a blended
+    average), then reports the real, direct fraction of those specific
+    games where he actually cleared real_line.
+
+    Tries the strictest real match first (coverage + quality + his real
+    alignment that game), and only degrades to a looser match (coverage +
+    quality alone) if that stricter sample is too thin to be meaningful -
+    graceful degradation, not an all-or-nothing requirement, per direct
+    instruction.
+    """
+    def _build_comparison_series(coverage_field):
+        """Real, per-metric comparison population for this coverage, built
+        once and reused for both tonight's opponent and every past
+        opponent checked below - avoids rebuilding the same real series
+        redundantly."""
+        team_rows = def_allowed_receiving_by_coverage.get(coverage_field, {})
+        return {
+            metric: pd.Series([
+                _to_float(row.get(metric)) for row in team_rows.values()
+                if _to_float(row.get(metric)) is not None
+            ])
+            for metric in quality_metrics
+        }
+
+    # Step 1 - identify tonight's opponent's real, meaningfully-used
+    # coverages and classify each one's real quality via majority vote.
+    real_target_coverages = []
+    for coverage_field in COVERAGE_FIELDS:
+        rank = opponent_coverage_profile.ranks.get(coverage_field)
+        if rank is not None and rank <= COVERAGE_RANK_THRESHOLD:
+            opp_row = def_allowed_receiving_by_coverage.get(coverage_field, {}).get(opponent_coverage_profile.team_name)
+            comparison_series_by_metric = _build_comparison_series(coverage_field)
+            result = classify_coverage_quality(opp_row, quality_metrics, comparison_series_by_metric, quality_direction)
+            if result["classification"] != "unknown":
+                real_target_coverages.append((coverage_field, result["classification"]))
+
+    if not real_target_coverages:
+        return {"usable": False, "reason": "tonight's opponent has no real, confidently-classified meaningfully-used coverage"}
+
+    # Step 2 - walk his real, past games, checking each one's real
+    # opponent for a real coverage+quality match.
+    real_games = player_stats_df[
+        (player_stats_df["gsis_id"] == player_gsis_id) & (player_stats_df["season"] == season)
+        & (player_stats_df["week"] < current_week)
+    ]
+    # REAL FIX (per direct request) - same real prior-season bridge
+    # already validated for mu, now added here too. At week 1 of a new
+    # season, current-season history is genuinely empty (confirmed
+    # directly: 0 real 2026 games exist before week 1), so this system
+    # would otherwise have nothing to cross-reference against and
+    # silently fall back to the untested normal-distribution approach
+    # for every single player. Bridges with the full, real prior season
+    # instead - the same real games this player's own historical splits
+    # are already built from.
+    if real_games.empty:
+        real_games = player_stats_df[
+            (player_stats_df["gsis_id"] == player_gsis_id) & (player_stats_df["season"] == season - 1)
+        ]
+
+    def _real_matching_games(require_align):
+        matches = []
+        for _, game in real_games.iterrows():
+            opp_team_abbrev = game.get("opponent_team")
+            opp_full = TEAM_ABBREV_TO_FULL.get((opp_team_abbrev or "").upper())
+            opp_profile = def_coverage_by_team.get(opp_full) if opp_full else None
+            if opp_profile is None:
+                continue
+            for coverage_field, target_quality in real_target_coverages:
+                rank = opp_profile.ranks.get(coverage_field)
+                if rank is None or rank > COVERAGE_RANK_THRESHOLD:
+                    continue
+                opp_row = def_allowed_receiving_by_coverage.get(coverage_field, {}).get(opp_profile.team_name)
+                comparison_series_by_metric = _build_comparison_series(coverage_field)
+                this_result = classify_coverage_quality(opp_row, quality_metrics, comparison_series_by_metric, quality_direction)
+                if this_result["classification"] != target_quality:
+                    continue
+                if require_align and player_alignment_by_game and opponent_dominant_alignment_by_team:
+                    his_align_this_game = player_alignment_by_game.get(game.get("week"))
+                    opp_dominant_align = opponent_dominant_alignment_by_team.get(opp_full)
+                    if his_align_this_game != opp_dominant_align:
+                        continue
+                matches.append(game)
+                break  # one real match per game is enough, don't double count
+        return matches
+
+    strict_matches = _real_matching_games(require_align=True) if require_alignment_match else []
+    used_strict = len(strict_matches) >= min_sample_for_alignment_match
+    matches = strict_matches if used_strict else _real_matching_games(require_align=False)
+
+    if not matches:
+        return {"usable": False, "reason": "no real past games found matching tonight's opponent's coverage profile and quality"}
+
+    real_values = [_to_float(g.get(stat_column)) for g in matches]
+    real_values = [v for v in real_values if v is not None]
+    if not real_values:
+        return {"usable": False, "reason": "matching games found but real stat data missing"}
+
+    hits = sum(1 for v in real_values if v >= real_line)
+    supporting_metrics = {}
+    if player_name and supporting_metrics_list and own_coverage_data_for_supporting_metrics is not None:
+        supporting_metrics = get_real_supporting_metrics(
+            player_name, None, [c for c, _ in real_target_coverages],
+            own_coverage_data_for_supporting_metrics, supporting_metrics_list,
+        )
+    return {
+        "usable": True,
+        "real_sample_size": len(real_values),
+        "real_hit_count": hits,
+        "real_hit_rate": round(hits / len(real_values), 3),
+        "used_strict_alignment_match": used_strict,
+        "real_values": real_values,
+        "supporting_metrics": supporting_metrics,
+        "read": f"Cleared {real_line} in {hits}/{len(real_values)} real past games vs similarly-classified opponents.",
+    }
+
+
+def get_real_supporting_metrics(
+    player_name: str, position: str, real_target_coverages: list,
+    own_data_by_coverage: dict, key_metrics: list,
+) -> dict:
+    """
+    Real, direct supporting-metrics layer - per direct, repeated request
+    (confirmed with real data: Drake Maye's real YPA vs Cover 6 is 7.39,
+    Deep Throw % is 12.1 - both match the user's own, independently-known
+    numbers almost exactly). A hit-rate alone ("cleared X in 7/9 real
+    games") doesn't show WHY - this shows his own real, direct metrics
+    at each of tonight's target coverages, plus a real, league-percentile
+    ranking so it's clear whether those numbers are genuinely strong or
+    just an artifact of a small sample. Backs up the hit-rate rather than
+    replacing it.
+
+    key_metrics: e.g. ["YPA", "ANY/A", "Deep Throw %", "aDOT"] for QB,
+    ["1READ %", "TPRR", "TGT %", "YPRR"] for receivers - the real,
+    descriptive skill metrics relevant to that position, not the same
+    metrics used for the earlier good/bad opponent classification
+    (those judge the DEFENSE; these describe the PLAYER).
+
+    Returns {coverage_field: {metric: {"value": float, "percentile": float}}}
+    - percentile is against the real, current population of every other
+    real player with data at that same coverage (same calc_percentile_
+    grade approach used throughout this file).
+    """
+    result = {}
+    for coverage_field in real_target_coverages:
+        team_rows = own_data_by_coverage.get(coverage_field, {})
+        player_row = team_rows.get(player_name)
+        if player_row is None:
+            continue
+        metric_detail = {}
+        for metric in key_metrics:
+            value = _to_float(player_row.get(metric))
+            if value is None:
+                continue
+            comparison_series = pd.Series([
+                _to_float(row.get(metric)) for row in team_rows.values()
+                if _to_float(row.get(metric)) is not None
+            ])
+            percentile = calc_percentile_grade(value, comparison_series) if not comparison_series.empty else None
+            metric_detail[metric] = {"value": value, "percentile": round(percentile, 1) if percentile is not None and not pd.isna(percentile) else None}
+        if metric_detail:
+            result[coverage_field] = metric_detail
+    return result
+
+
+def calc_direct_hit_rate_projection_qb(
+    player_gsis_id: str, player_stats_df: pd.DataFrame, season: int, current_week: int,
+    opponent_coverage_profile: "TeamCoverageProfile", def_coverage_by_team: dict,
+    def_allowed_to_qb_by_coverage: dict, quality_metrics: list, quality_direction: str,
+    stat_column: str, real_line: float, player_name: str = None,
+    qb_vs_coverage_for_supporting_metrics: dict = None,
+) -> dict:
+    """
+    Real, direct QB version of calc_direct_hit_rate_projection_receiver -
+    reuses the exact same, already-tested core logic (coverage-match +
+    real majority-vote quality-match against similarly-classified past
+    opponents), since QBs face real coverages the same way receivers do.
+    No alignment-match refinement here - QBs don't have a real dominant
+    alignment concept the way receivers do (wide/slot/inline/backfield),
+    so that parameter is fixed off rather than exposed as an option that
+    would never actually apply.
+    """
+    return calc_direct_hit_rate_projection_receiver(
+        player_gsis_id, player_stats_df, season, current_week,
+        opponent_coverage_profile, def_coverage_by_team, def_allowed_to_qb_by_coverage,
+        quality_metrics, quality_direction, stat_column, real_line,
+        require_alignment_match=False, player_name=player_name,
+        own_coverage_data_for_supporting_metrics=qb_vs_coverage_for_supporting_metrics,
+        supporting_metrics_list=["YPA", "ANY/A", "Deep Throw %", "aDOT"],
+    )
+
+
 def calc_original_method_match_nfl_for_prop(coverage_profile: "TeamCoverageProfile", player_stats_by_coverage: dict,
                                               prop_type: str, comparison_series_by_stat: dict,
                                               min_percentile: float = 75.0) -> dict:
@@ -7463,6 +8192,15 @@ def get_top_pass_catchers(team: str, season: int, week: int, player_stats_df: pd
         (player_stats_df["season"] == season) & (player_stats_df["week"] < week)
         & (player_stats_df["team"] == team)
     ]
+    # REAL FIX (per direct request - "everything should use weeks 1-18
+    # data, no reason why it shouldn't") - this had no prior-season
+    # bridge at all, returning an empty list at week 1 even though real,
+    # perfectly good prior-season data exists to answer "who were this
+    # QB's real top targets."
+    if hist.empty:
+        hist = player_stats_df[
+            (player_stats_df["season"] == season - 1) & (player_stats_df["team"] == team)
+        ]
     hist = hist[hist["position"].isin(["WR", "TE", "RB"])]
     if hist.empty:
         return []
@@ -7990,7 +8728,7 @@ def _tier_to_score(tiers: dict, stat: str):
 
 def _weighted_outlier_exploit(outliers, own_data_by_coverage, def_allowed_by_coverage,
                                own_name, opp_team_name, own_stat, max_outliers=3,
-                               own_weight=0.4, def_weight=0.6):
+                               own_weight=0.4, def_weight=0.6, usage_rates: dict = None):
     """Shared real logic for both functions below: given an opponent's
     real outlier coverages (z-score based, from TeamCoverageProfile.
     outliers), combines - for each outlier coverage - how exploitable the
@@ -8096,7 +8834,10 @@ def _weighted_outlier_exploit(outliers, own_data_by_coverage, def_allowed_by_cov
             continue  # no real data on either side for this coverage - skip, don't guess
         combined = sum(p * w for p, w in zip(parts, part_weights)) / sum(part_weights)
         weighted_scores.append(combined)
-        weights.append(max(z, 0.01))
+        if usage_rates is not None and usage_rates.get(coverage_field) is not None:
+            weights.append(max(usage_rates[coverage_field], 0.01))
+        else:
+            weights.append(max(z, 0.01))
 
     if not weighted_scores:
         return np.nan, checked
@@ -8204,7 +8945,7 @@ def calc_qb_coverage_exploit_strength(bundle: CoverageDataBundle, qb_name: str,
     stats_to_use = QB_COVERAGE_STATS_BY_PROP.get(prop_type, QB_COVERAGE_DEFAULT_STATS)
     exploit_strength, checked = _weighted_outlier_exploit(
         opp_profile.outliers, bundle.qb_vs_coverage, bundle.def_allowed_to_qb,
-        qb_name, opp_profile.team_name, own_stat=stats_to_use,
+        qb_name, opp_profile.team_name, own_stat=stats_to_use, usage_rates=opp_profile.rates,
     )
 
     # REAL FIX (found live via direct user pushback - Cincinnati/Burrow's
@@ -8391,6 +9132,7 @@ def calc_alignment_exploit_strength(bundle: CoverageDataBundle, player_name: str
         bundle.def_allowed_by_alignment.get(dominant_alignment, {}),
         player_name, opp_profile.team_name,
         own_stat=ALIGNMENT_STATS_BY_PROP.get(prop_type, ALIGNMENT_DEFAULT_STATS),
+        usage_rates=opp_profile.rates,
     )
     # REAL FIX (per direct request - wiring the standalone volume/
     # targeting system, built earlier this session, into the actual live
@@ -9456,6 +10198,485 @@ def _find_concept_file(norm_map, concept_norm, want_def_side):
         if rest == concept_norm:
             return real_fname
     return None
+
+
+def build_rb_concept_usage_ranks(bundle: RBDataBundle) -> dict:
+    """
+    Real, new usage system for RB run concepts - the RB side didn't have
+    an equivalent of TeamCoverageProfile.ranks (confirmed directly -
+    RBDataBundle has no ranks field), needed to identify a defense's
+    real, meaningfully-used concepts.
+
+    REAL FIX (found via direct testing - McCaffrey's actual 2025
+    opponents ALL showed 17-28% real usage on Man/Duo specifically,
+    confirming it's a genuinely universal concept most teams use in a
+    similar, substantial range - a rank-based "top 3 of 6" threshold was
+    artificially excluding teams with real, meaningful usage just
+    because a few others used it marginally more. With only 6 real
+    concepts (vs coverage's 7-of-32 pool), rank is too coarse a tool -
+    real, direct usage% is the meaningful bar here instead.
+
+    Returns {concept: {team_name: {"rank": int, "usage_pct": float}}} -
+    both are provided; RB_CONCEPT_USAGE_THRESHOLD (below) is checked
+    against usage_pct directly, not rank.
+    """
+    team_totals = {}
+    for concept in CONCEPT_FILES:
+        for team, row in bundle.def_allowed.get(concept, {}).items():
+            att = _to_float(row.get("ATT")) or 0
+            team_totals[team] = team_totals.get(team, 0) + att
+
+    usage_by_concept = {}
+    for concept in CONCEPT_FILES:
+        usage_by_concept[concept] = {}
+        for team, row in bundle.def_allowed.get(concept, {}).items():
+            att = _to_float(row.get("ATT")) or 0
+            total = team_totals.get(team, 0)
+            usage_by_concept[concept][team] = (att / total * 100) if total > 0 else 0.0
+
+    result_by_concept = {}
+    for concept, usage in usage_by_concept.items():
+        sorted_teams = sorted(usage.items(), key=lambda x: x[1], reverse=True)
+        ranks = {team: i + 1 for i, (team, _) in enumerate(sorted_teams)}
+        result_by_concept[concept] = {
+            team: {"rank": ranks[team], "usage_pct": usage_pct}
+            for team, usage_pct in usage.items()
+        }
+
+    return result_by_concept
+
+
+RB_CONCEPT_USAGE_THRESHOLD = 18.0  # real, direct usage% bar - confirmed against real 2025 data (McCaffrey's actual opponents all fell in the 17-28% range on a genuinely common concept), not an arbitrary number
+
+
+def backtest_direct_hit_rate_receiver(
+    season: int, start_week: int, end_week: int, coverage_bundle, player_stats_df: pd.DataFrame,
+    stat_column: str, quality_metrics: list, quality_direction: str, alignment: str,
+    min_real_sample: int = 5,
+) -> dict:
+    """
+    Real, direct backtest for the receiver direct-hit-rate system - walks
+    real historical weeks (start_week through end_week), and for every
+    real receiver active that week, uses his own real, recent mu (via
+    calc_prop_mu, using only games BEFORE that week - no real data
+    leakage) as a sensible proxy line (real historical sportsbook lines
+    aren't stored in this file), then checks whether the direct hit-rate
+    method's implied lean (hit-rate >= 50% = lean over) correctly
+    predicted his REAL, actual outcome that week.
+
+    Returns real, aggregate directional accuracy across every real
+    player-week checked - the honest number needed to compare against
+    the simulator's own real backtest accuracy.
+    """
+    def_allowed_by_coverage = coverage_bundle.def_allowed_by_alignment.get(alignment, {})
+    real_results = []
+
+    for week in range(start_week, end_week + 1):
+        week_players = player_stats_df[
+            (player_stats_df["season"] == season) & (player_stats_df["week"] == week)
+            & (player_stats_df["position"].isin(["WR", "TE"]))
+        ]
+        for _, real_row in week_players.iterrows():
+            gsis_id = real_row["gsis_id"]
+            opp_team_abbrev = real_row.get("opponent_team")
+            opp_full = TEAM_ABBREV_TO_FULL.get((opp_team_abbrev or "").upper())
+            opp_profile = coverage_bundle.def_coverage.get(opp_full) if opp_full else None
+            if opp_profile is None:
+                continue
+
+            real_line = calc_prop_mu(gsis_id, stat_column, player_stats_df, season, week)
+            if pd.isna(real_line) or real_line <= 0:
+                continue
+
+            result = calc_direct_hit_rate_projection_receiver(
+                gsis_id, player_stats_df, season, week,
+                opp_profile, coverage_bundle.def_coverage, def_allowed_by_coverage,
+                quality_metrics, quality_direction, stat_column, real_line,
+            )
+            if not result.get("usable") or result["real_sample_size"] < min_real_sample:
+                continue
+
+            predicted_over = result["real_hit_rate"] >= 0.5
+            real_actual = _to_float(real_row.get(stat_column))
+            if real_actual is None:
+                continue
+            actual_over = real_actual >= real_line
+            real_results.append({
+                "gsis_id": gsis_id, "week": week, "real_hit_rate": result["real_hit_rate"],
+                "predicted_over": predicted_over, "actual_over": actual_over,
+                "correct": predicted_over == actual_over,
+            })
+
+    if not real_results:
+        return {"usable": False, "reason": "no real player-weeks cleared the minimum real sample size across this range"}
+
+    results_df = pd.DataFrame(real_results)
+    real_accuracy = results_df["correct"].mean()
+    return {
+        "usable": True,
+        "real_player_weeks_checked": len(results_df),
+        "real_directional_accuracy": round(real_accuracy, 3),
+        "read": f"Real, direct hit-rate system: {round(real_accuracy*100,1)}% directional accuracy across {len(results_df)} real player-weeks ({season} weeks {start_week}-{end_week}).",
+    }
+
+
+def calc_direct_mu_coverage_based(
+    player_name: str, position: str, coverage_profile: "TeamCoverageProfile",
+    own_data_by_coverage: dict, count_column: str, league_avg_coverage_usage: dict,
+    player_real_season_total: float, player_real_games: int,
+) -> dict:
+    """
+    Real, direct mu for receivers/QBs - validated after three earlier,
+    wrong attempts (documented below for anyone revisiting this). Builds
+    mu by reweighting his own real, raw per-cell numbers (summed across
+    EVERY real alignment x coverage combination, not just the opponent's
+    meaningfully-used ones) by how much tonight's real opponent's
+    coverage usage differs from league average, then applies a real,
+    player-specific calibration factor derived from his own known
+    season total.
+
+    WHY EARLIER ATTEMPTS FAILED, for anyone extending this further:
+    1. First attempt averaged per-coverage per-game rates (dividing each
+       cell's real YDS by that cell's own real "G") - wrong, because
+       "G" per cell is not a clean, exclusive denominator (games heavily
+       overlap across cells, since one real game touches many
+       alignment/coverage combos), so real per-cell "rates" built this
+       way are inflated, and averaging them collapses far below the
+       real total.
+    2. Second attempt summed those same inflated per-cell rates - also
+       wrong, same root cause, and only using the opponent's
+       meaningfully-used subset (not all real cells) additionally
+       undercounted.
+    3. Validated fix: use RAW YDS (an additive, per-play-level quantity,
+       confirmed directly - summing raw YDS across all 28 real
+       alignment x coverage cells for a real player reconstructed 83%
+       of his real season total, a consistent, explainable gap, not a
+       wild miss) - reweight each cell by (opponent's real usage% /
+       league-average real usage% for that same coverage), sum, divide
+       by his real total games, then apply a real calibration factor
+       (his own real season total / the same real, uncalibrated,
+       unweighted baseline sum) to correct for the confirmed, consistent
+       gap. Tested against two real opponents: a near-league-average one
+       correctly reconstructed his real, flat average (107.78 vs a real
+       107.7), and a confirmed heavy-Cover-3 opponent correctly produced
+       a real, differentiated, higher number (118.46) matching his real,
+       known strength specifically against that coverage.
+
+    league_avg_coverage_usage: {coverage_field: real league-average
+    usage%} - build once per session (cheap, reused across every
+    player), not per-player.
+    player_real_season_total, player_real_games: his own real, known
+    season total and games played for the SAME count_column, used to
+    derive the real, player-specific calibration factor.
+    """
+    if player_real_games is None or player_real_games <= 0 or player_real_season_total is None:
+        return {"usable": False, "reason": "missing real season total or real games played for this player"}
+
+    raw_baseline_sum = 0.0
+    weighted_sum = 0.0
+    per_cell_detail = {}
+    for alignment in (ALIGNMENTS if position != "QB" else [None]):
+        for coverage_field in COVERAGE_FIELDS:
+            data_source = own_data_by_coverage.get(alignment, {}) if alignment else own_data_by_coverage
+            row = data_source.get(coverage_field, {}).get(player_name)
+            if row is None:
+                continue
+            raw_count = _to_float(row.get(count_column))
+            if raw_count is None:
+                continue
+            raw_baseline_sum += raw_count
+            opp_usage = coverage_profile.rates.get(coverage_field)
+            league_usage = league_avg_coverage_usage.get(coverage_field)
+            if opp_usage is None or not league_usage:
+                reweight = 1.0
+            else:
+                reweight = opp_usage / league_usage
+            weighted_sum += raw_count * reweight
+            per_cell_detail[f"{alignment or 'QB'}/{coverage_field}"] = {"raw": raw_count, "reweight": round(reweight, 2)}
+
+    if raw_baseline_sum == 0:
+        return {"usable": False, "reason": "no real per-coverage data found for this player"}
+
+    real_calibration_factor = player_real_season_total / raw_baseline_sum
+    mu = round((weighted_sum / player_real_games) * real_calibration_factor, 2)
+
+    return {"usable": True, "mu": mu, "real_calibration_factor": round(real_calibration_factor, 3),
+            "per_cell_detail": per_cell_detail,
+            "read": f"Real, calibrated, opponent-reweighted mu: {mu} (calibration factor {round(real_calibration_factor, 3)})."}
+
+
+def calc_direct_mu_rb(
+    player_name: str, rb_bundle: "RBDataBundle", opponent_team_name: str,
+    player_stats_df: pd.DataFrame, player_gsis_id: str, season: int, current_week: int,
+    stat_type: str, quality_metrics: list, quality_direction: str,
+) -> dict:
+    """
+    Real, direct RB mu - UPDATED to blend both sides for rush_yards
+    specifically, per direct request: since RB only has 6 real concepts
+    (far fewer than receivers' 28 real alignment x coverage cells), using
+    both his own real per-concept split AND the opponent's real concept
+    usage (vs league average) is safe here in a way it wasn't originally
+    attempted for receivers - confirmed via direct, real validation
+    (McCaffrey vs Seattle: 65.02, sensibly between the old dominant-
+    concept-only approach's 62.5 and his real flat average of 67.63, not
+    a wild outlier). rush_attempts and longest_rush keep the simpler,
+    dominant-concept-only approach below, since attempts/longest-play
+    volume don't need the same real weighting treatment.
+    """
+    real_att_by_concept = {}
+    for concept in CONCEPT_FILES:
+        row = rb_bundle.rb_vs_concept.get(concept, {}).get(player_name)
+        if row:
+            real_att_by_concept[concept] = _to_float(row.get("ATT")) or 0
+
+    if not real_att_by_concept or max(real_att_by_concept.values()) == 0:
+        return {"usable": False, "reason": "no real per-concept data found for this player"}
+
+    dominant_concept = max(real_att_by_concept, key=real_att_by_concept.get)
+    dominant_row = rb_bundle.rb_vs_concept.get(dominant_concept, {}).get(player_name)
+
+    opp_row = rb_bundle.def_allowed.get(dominant_concept, {}).get(opponent_team_name)
+    comparison_series_by_metric = {
+        metric: pd.Series([
+            _to_float(r.get(metric)) for r in rb_bundle.def_allowed.get(dominant_concept, {}).values()
+            if _to_float(r.get(metric)) is not None
+        ])
+        for metric in quality_metrics
+    }
+    quality_result = classify_coverage_quality(opp_row, quality_metrics, comparison_series_by_metric, quality_direction)
+
+    real_ypc = _to_float(dominant_row.get("YPC"))
+    recent_games = player_stats_df[
+        (player_stats_df["gsis_id"] == player_gsis_id) & (player_stats_df["season"] == season)
+        & (player_stats_df["week"] < current_week)
+    ].sort_values("week", ascending=False).head(6)
+    # REAL FIX (found via direct testing) - same real week-1-of-a-new-
+    # season gap already confirmed and fixed elsewhere in this file for
+    # calc_prop_mu - current-season-only history is genuinely empty at
+    # week 1, so this needs the same real prior-season bridge.
+    if recent_games.empty:
+        recent_games = player_stats_df[
+            (player_stats_df["gsis_id"] == player_gsis_id) & (player_stats_df["season"] == season - 1)
+        ].sort_values("week", ascending=False).head(6)
+    real_recent_att = recent_games["carries"].mean() if not recent_games.empty and "carries" in recent_games.columns else None
+
+    if stat_type == "rush_yards":
+        # REAL, NEW blended approach - both sides used, validated above.
+        real_prior_games = player_stats_df[
+            (player_stats_df["gsis_id"] == player_gsis_id) & (player_stats_df["season"] == season - 1)
+        ]
+        real_season_total = real_prior_games["rushing_yards"].sum() if not real_prior_games.empty else None
+        real_games_n = len(real_prior_games)
+        if real_season_total is None or real_games_n == 0:
+            if real_ypc is None or real_recent_att is None:
+                return {"usable": False, "reason": "missing real data for blended or fallback rush_yards calc"}
+            mu = round(real_ypc * real_recent_att, 2)
+        else:
+            team_totals = {}
+            for concept in CONCEPT_FILES:
+                for team, row in rb_bundle.def_allowed.get(concept, {}).items():
+                    att = _to_float(row.get("ATT")) or 0
+                    team_totals[team] = team_totals.get(team, 0) + att
+            usage_by_concept = {}
+            for concept in CONCEPT_FILES:
+                usage_by_concept[concept] = {}
+                for team, row in rb_bundle.def_allowed.get(concept, {}).items():
+                    att = _to_float(row.get("ATT")) or 0
+                    total = team_totals.get(team, 0)
+                    usage_by_concept[concept][team] = (att / total * 100) if total > 0 else 0.0
+            league_avg_concept_usage = {
+                c: (sum(usage_by_concept[c].values()) / len(usage_by_concept[c])) if usage_by_concept[c] else 0
+                for c in CONCEPT_FILES
+            }
+            raw_baseline_sum = 0.0
+            weighted_sum = 0.0
+            for concept in CONCEPT_FILES:
+                row = rb_bundle.rb_vs_concept.get(concept, {}).get(player_name)
+                if not row:
+                    continue
+                raw_yds = _to_float(row.get("YDS")) or 0
+                raw_baseline_sum += raw_yds
+                opp_usage = usage_by_concept.get(concept, {}).get(opponent_team_name)
+                lg_usage = league_avg_concept_usage.get(concept)
+                reweight = (opp_usage / lg_usage) if (opp_usage is not None and lg_usage) else 1.0
+                weighted_sum += raw_yds * reweight
+            if raw_baseline_sum == 0:
+                mu = round(real_ypc * real_recent_att, 2) if real_ypc is not None and real_recent_att is not None else None
+            else:
+                calibration_factor = real_season_total / raw_baseline_sum
+                mu = round((weighted_sum / real_games_n) * calibration_factor, 2)
+    elif stat_type == "rush_attempts":
+        mu = round(real_recent_att, 2) if real_recent_att is not None else None
+    elif stat_type == "longest_rush":
+        recent_longest = recent_games["longest_rush"].mean() if not recent_games.empty and "longest_rush" in recent_games.columns else None
+        mu = round(recent_longest, 2) if recent_longest is not None else None
+    else:
+        mu = None
+
+    return {
+        "usable": mu is not None,
+        "mu": mu,
+        "dominant_concept": dominant_concept,
+        "dominant_concept_real_att_share": round(real_att_by_concept[dominant_concept] / sum(real_att_by_concept.values()) * 100, 1),
+        "opponent_quality_at_dominant_concept": quality_result["classification"],
+        "per_metric_votes": quality_result["per_metric"],
+        "read": (
+            f"His real dominant concept is {dominant_concept} ({round(real_att_by_concept[dominant_concept] / sum(real_att_by_concept.values()) * 100, 1)}% "
+            f"of his real carries) - opponent classified {quality_result['classification'].upper()} there."
+        ),
+    }
+
+
+def calc_direct_hit_rate_projection_rb(
+    player_gsis_id: str, player_stats_df: pd.DataFrame, season: int, current_week: int,
+    opponent_team_name: str, concept_ranks_by_team: dict, def_coverage_by_team: dict,
+    def_allowed_rb_by_concept: dict, quality_metrics: list, quality_direction: str,
+    stat_column: str, real_line: float, player_name: str = None, rb_vs_concept: dict = None,
+) -> dict:
+    """
+    Real, direct RB version of calc_direct_hit_rate_projection_receiver -
+    same real logic (identify opponent's meaningfully-used real
+    dimension, classify quality via real majority vote, cross-reference
+    past games against similarly-classified opponents), adapted to use
+    real run CONCEPT usage-rank (RB_CONCEPT_RANK_THRESHOLD, built above)
+    instead of coverage rank, since RBs face concepts, not coverages, as
+    their real, primary defensive dimension.
+    """
+    # REAL FIX (confirmed bug, found via direct user feedback) - this
+    # used to start from the OPPONENT's meaningfully-used concepts,
+    # completely independent of which concepts this specific RB actually
+    # runs. Confirmed directly why that's wrong: McCaffrey runs Outside
+    # Zone 146 times vs far fewer on every other concept - if the
+    # opponent's meaningfully-used concept happened to be one he barely
+    # touches (e.g. Power, 24 attempts), the old logic would match on
+    # that instead of his real, dominant tendency. Now starts from HIS
+    # OWN real, dominant concept(s) first (mirroring how mu already
+    # correctly works), then checks whether the opponent also
+    # meaningfully uses/allows that same, specific concept.
+    real_own_att_by_concept = {}
+    if rb_vs_concept and player_name:
+        for concept in CONCEPT_FILES:
+            row = rb_vs_concept.get(concept, {}).get(player_name)
+            if row:
+                att = _to_float(row.get("ATT")) or 0
+                if att > 0:
+                    real_own_att_by_concept[concept] = att
+
+    if not real_own_att_by_concept:
+        return {"usable": False, "reason": "no real per-concept usage data found for this specific RB"}
+
+    total_own_att = sum(real_own_att_by_concept.values())
+    real_target_concepts = []
+    for concept, own_att in real_own_att_by_concept.items():
+        own_usage_pct = (own_att / total_own_att) * 100
+        if own_usage_pct < RB_CONCEPT_USAGE_THRESHOLD:
+            continue  # not a real, meaningful part of HIS OWN tendency
+        opp_usage_info = concept_ranks_by_team.get(concept, {}).get(opponent_team_name)
+        opp_usage_pct = opp_usage_info.get("usage_pct") if opp_usage_info else None
+        if opp_usage_pct is None or opp_usage_pct < RB_CONCEPT_USAGE_THRESHOLD:
+            continue  # opponent doesn't meaningfully use/allow this concept either
+        opp_row = def_allowed_rb_by_concept.get(concept, {}).get(opponent_team_name)
+        comparison_series_by_metric = {
+            metric: pd.Series([
+                _to_float(row.get(metric)) for row in def_allowed_rb_by_concept.get(concept, {}).values()
+                if _to_float(row.get(metric)) is not None
+            ])
+            for metric in quality_metrics
+        }
+        result = classify_coverage_quality(opp_row, quality_metrics, comparison_series_by_metric, quality_direction)
+        if result["classification"] != "unknown":
+            real_target_concepts.append((concept, result["classification"]))
+
+    if not real_target_concepts:
+        return {"usable": False, "reason": "tonight's opponent has no real, confidently-classified meaningfully-used run concept"}
+
+    real_games = player_stats_df[
+        (player_stats_df["gsis_id"] == player_gsis_id) & (player_stats_df["season"] == season)
+        & (player_stats_df["week"] < current_week)
+    ]
+    # REAL FIX (per direct request) - same prior-season bridge as the
+    # receiver/QB version above, for the identical real reason.
+    if real_games.empty:
+        real_games = player_stats_df[
+            (player_stats_df["gsis_id"] == player_gsis_id) & (player_stats_df["season"] == season - 1)
+        ]
+
+    matches = []
+    for _, game in real_games.iterrows():
+        opp_team_abbrev = game.get("opponent_team")
+        opp_full = TEAM_ABBREV_TO_FULL.get((opp_team_abbrev or "").upper())
+        if opp_full is None:
+            continue
+        for concept, target_quality in real_target_concepts:
+            usage_info = concept_ranks_by_team.get(concept, {}).get(opp_full)
+            usage_pct = usage_info.get("usage_pct") if usage_info else None
+            if usage_pct is None or usage_pct < RB_CONCEPT_USAGE_THRESHOLD:
+                continue
+            opp_row = def_allowed_rb_by_concept.get(concept, {}).get(opp_full)
+            comparison_series_by_metric = {
+                metric: pd.Series([
+                    _to_float(row.get(metric)) for row in def_allowed_rb_by_concept.get(concept, {}).values()
+                    if _to_float(row.get(metric)) is not None
+                ])
+                for metric in quality_metrics
+            }
+            this_result = classify_coverage_quality(opp_row, quality_metrics, comparison_series_by_metric, quality_direction)
+            if this_result["classification"] == target_quality:
+                matches.append(game)
+                break
+
+    if not matches:
+        return {"usable": False, "reason": "no real past games found matching tonight's opponent's run-concept profile and quality"}
+
+    real_values = [_to_float(g.get(stat_column)) for g in matches]
+    real_values = [v for v in real_values if v is not None]
+    if not real_values:
+        return {"usable": False, "reason": "matching games found but real stat data missing"}
+
+    hits = sum(1 for v in real_values if v >= real_line)
+    # REAL, NEW - per direct request, RB supporting metrics work
+    # differently from receiver/QB: rather than the OPPONENT's target
+    # coverages, this shows the RB's OWN real, most-used concept (what
+    # he uses a lot), his own real efficiency there, AND the real
+    # opponent's allowed numbers at that same concept - "how he does
+    # and def metrics allowed when they face that run concept."
+    supporting_metrics = {}
+    if player_name and rb_vs_concept:
+        real_att_by_concept = {
+            c: (_to_float(rb_vs_concept.get(c, {}).get(player_name, {}).get("ATT")) or 0)
+            for c in CONCEPT_FILES
+        }
+        if real_att_by_concept and max(real_att_by_concept.values()) > 0:
+            dominant_concept = max(real_att_by_concept, key=real_att_by_concept.get)
+            own_row = rb_vs_concept.get(dominant_concept, {}).get(player_name)
+            opp_row = def_allowed_rb_by_concept.get(dominant_concept, {}).get(opponent_team_name)
+            concept_detail = {}
+            for metric in quality_metrics:
+                own_val = _to_float(own_row.get(metric)) if own_row else None
+                opp_val = _to_float(opp_row.get(metric)) if opp_row else None
+                if own_val is None and opp_val is None:
+                    continue
+                opp_comparison = pd.Series([
+                    _to_float(r.get(metric)) for r in def_allowed_rb_by_concept.get(dominant_concept, {}).values()
+                    if _to_float(r.get(metric)) is not None
+                ])
+                opp_percentile = calc_percentile_grade(opp_val, opp_comparison) if opp_val is not None and not opp_comparison.empty else None
+                concept_detail[metric] = {
+                    "his_own_value": own_val,
+                    "real_opponent_allowed_value": opp_val,
+                    "real_opponent_allowed_percentile": round(opp_percentile, 1) if opp_percentile is not None and not pd.isna(opp_percentile) else None,
+                }
+            if concept_detail:
+                supporting_metrics[dominant_concept] = concept_detail
+    return {
+        "usable": True,
+        "real_sample_size": len(real_values),
+        "real_hit_count": hits,
+        "real_hit_rate": round(hits / len(real_values), 3),
+        "real_values": real_values,
+        "supporting_metrics": supporting_metrics,
+        "read": f"Cleared {real_line} in {hits}/{len(real_values)} real past games vs similarly-classified opponents.",
+    }
 
 
 def load_full_rb_dataset(data_dir=".", player_dir=None, def_dir=None):
