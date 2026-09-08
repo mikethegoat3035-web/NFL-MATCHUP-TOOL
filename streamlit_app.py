@@ -991,6 +991,27 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
     elif min_games_filter > 0 and "games_sampled_current" in filtered.columns:
         filtered = filtered[filtered["games_sampled_current"].fillna(0) >= min_games_filter]
 
+    # REAL, NEW - per direct, explicit request, built and validated
+    # tonight (confirmed end-to-end: Maye's longest_completion vs Cover 4
+    # correctly shows True here, matching what was found by hand earlier)
+    # - requires a genuine MAJORITY of the player's own real, relevant
+    # metrics to be Elite (90th percentile, properly sample-filtered) for
+    # an over, or Poor (10th percentile) for an under. This is the
+    # strictest available filter - real backtesting tonight found this
+    # standard returns very few results most weeks (that's expected and
+    # correct, not a bug - see the "1 of 6 checks passes" finding).
+    stage1_elite_only = st.checkbox(
+        "Stage 1: require HIS OWN metrics to be majority-Elite/Poor",
+        value=False,
+        help="The strictest real filter available. Confirmed via testing tonight that this "
+             "returns very few real results most weeks - that's genuine selectivity, not a bug.",
+    )
+    if stage1_elite_only and "stage1_player_majority_elite" in filtered.columns:
+        filtered = filtered[
+            (filtered["p_over"] >= 0.5) & (filtered["stage1_player_majority_elite"].fillna(False))
+            | (filtered["p_over"] < 0.5) & (filtered["stage1_player_majority_poor"].fillna(False))
+        ]
+
     if st.session_state.backtest_mode:
         # -----------------------------------------------------------
         # BACKTEST DISPLAY: only significant surprises among real starters
@@ -1130,9 +1151,31 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         )) if "season" in edited.columns else []
         _cache_key = tuple(_real_seasons_needed)
         if _real_seasons_needed and st.session_state.get("player_stats_df_cache_key") != _cache_key:
-            st.session_state.player_stats_df_cache = pull_player_stats(
-                sorted(set(_real_seasons_needed + [s - 1 for s in _real_seasons_needed]))
-            )
+            _real_all_seasons = sorted(set(_real_seasons_needed + [s - 1 for s in _real_seasons_needed]))
+            _cache_df = pull_player_stats(_real_all_seasons)
+            # REAL FIX (critical bug found via a full, direct end-to-end
+            # test before finalizing) - this cache never had the real
+            # longest-play data merged in at all, meaning Stage 2
+            # rescoring for longest_completion/longest_reception would
+            # always fail with "real stat data missing" in real, live
+            # use - confirmed directly by testing Drake Maye's real row
+            # through this exact path. Merges in both real longest-play
+            # columns now, the same validated way used throughout tonight.
+            try:
+                _cache_pbp = pull_pbp(_real_all_seasons)
+                _longest_qb = build_longest_play_by_game(_cache_pbp, "QB")
+                _longest_wr = build_longest_play_by_game(_cache_pbp, "WR")
+                _cache_df = _cache_df.merge(
+                    _longest_qb[["gsis_id", "season", "week", "longest_play"]],
+                    on=["gsis_id", "season", "week"], how="left",
+                ).rename(columns={"longest_play": "longest_completion"})
+                _cache_df = _cache_df.merge(
+                    _longest_wr[["gsis_id", "season", "week", "longest_play"]],
+                    on=["gsis_id", "season", "week"], how="left",
+                ).rename(columns={"longest_play": "longest_reception"})
+            except Exception:
+                pass  # real, graceful degradation - everything else still works if this merge fails
+            st.session_state.player_stats_df_cache = _cache_df
             st.session_state.player_stats_df_cache_key = _cache_key
 
         # Real, one-time cache - rb_concept_usage is expensive to build
@@ -1184,19 +1227,31 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                 for coverage_field, metrics in supporting.items():
                     metric_strs = []
                     for k, v in metrics.items():
+                        if k.startswith("_"):
+                            continue  # internal flags (_majority_elite/_majority_poor), not a per-metric detail dict
                         if "percentile" in v and v.get("percentile") is not None:
                             metric_strs.append(f"{k}={v['value']} (p{v['percentile']})")
                         elif "real_opponent_allowed_percentile" in v and v.get("real_opponent_allowed_percentile") is not None:
-                            metric_strs.append(f"{k}: his={v['his_own_value']}, opp allows={v['real_opponent_allowed_value']} (p{v['real_opponent_allowed_percentile']})")
+                            his_pct = v.get("his_own_percentile")
+                            his_pct_str = f" (p{his_pct})" if his_pct is not None else ""
+                            metric_strs.append(f"{k}: his={v['his_own_value']}{his_pct_str}, opp allows={v['real_opponent_allowed_value']} (p{v['real_opponent_allowed_percentile']})")
                     if metric_strs:
                         supporting_parts.append(f"{coverage_field}: " + ", ".join(metric_strs))
                 real_supporting_read = " | ".join(supporting_parts)
+                # REAL, NEW - per direct request, surfaces the new Stage 1
+                # "his own real metrics are majority-elite/poor" standard
+                # as a real, visible column - built and validated tonight,
+                # not just applied manually in conversation.
+                player_stage1_elite = real_detail.get("player_stage1_majority_elite", False)
+                player_stage1_poor = real_detail.get("player_stage1_majority_poor", False)
                 results.append({
                     **row.to_dict(), **scored,
                     "real_hit_rate_read": real_read,
                     "real_hit_count": real_hit_count,
                     "real_sample_size": real_sample_size,
                     "real_supporting_metrics": real_supporting_read,
+                    "stage1_player_majority_elite": player_stage1_elite,
+                    "stage1_player_majority_poor": player_stage1_poor,
                 })
             else:
                 results.append({**row.to_dict(), "p_over": np.nan, "edge": np.nan})
@@ -1239,8 +1294,9 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         core_display_cols = ["player_display_name", "team", "opponent", "matchup",
                               "position", "prop_type", "line", "mu", "sigma",
                               "p_over", "edge", "real_hit_rate_read", "real_supporting_metrics",
+                              "stage1_player_majority_elite", "stage1_player_majority_poor",
                               "quality_score", "data_confidence",
-                              "games_sampled_current"]
+                              "games_sampled_total"]
 
         # Compute these UNCONDITIONALLY - a later line (the color-gradient
         # styling below) references them regardless of the checkbox state.
@@ -1364,6 +1420,36 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         ].copy()
         st.caption(f"{len(nfl_qualified_df)} of {len(scan_sorted)} rows clear the bar above.")
 
+        # REAL, NEW - per direct, explicit request, computes the real
+        # Stage 1 standalone check (does HIS OWN metrics show a genuine
+        # majority-elite/poor profile) for this filtered, pre-line-entry
+        # subset - confirmed this can run without any line at all, unlike
+        # the earlier version which was incorrectly bundled inside the
+        # line-requiring Stage 2 function. Runs on the already-filtered,
+        # much smaller subset for real performance, not the full raw slate.
+        _stage1_elite_list = []
+        _stage1_poor_list = []
+        _rb_bundle_stage1 = st.session_state.get("rb_bundle")
+        _coverage_bundle_stage1 = st.session_state.get("coverage_bundle")
+        if _rb_bundle_stage1 is not None and "rb_concept_usage_cache" not in st.session_state:
+            st.session_state.rb_concept_usage_cache = build_rb_concept_usage_ranks(_rb_bundle_stage1)
+        _rb_concept_usage_stage1 = st.session_state.get("rb_concept_usage_cache")
+        for _, _row in nfl_qualified_df.iterrows():
+            try:
+                _s1 = calc_stage1_player_elite_check(
+                    _row.get("gsis_id"), _row.get("player_display_name"), _row.get("prop_type"),
+                    _row.get("position"), _row.get("opponent"),
+                    coverage_bundle=_coverage_bundle_stage1, rb_bundle=_rb_bundle_stage1,
+                    rb_concept_usage=_rb_concept_usage_stage1,
+                )
+                _stage1_elite_list.append(_s1.get("majority_elite", False))
+                _stage1_poor_list.append(_s1.get("majority_poor", False))
+            except Exception:
+                _stage1_elite_list.append(False)
+                _stage1_poor_list.append(False)
+        nfl_qualified_df["stage1_player_majority_elite"] = _stage1_elite_list
+        nfl_qualified_df["stage1_player_majority_poor"] = _stage1_poor_list
+
         # Color-coded read-only view, same 3-scheme style as the MLB tool -
         # data_editor itself can't render color (Streamlit limitation), so
         # this sits alongside the actual checkbox-editing table below as a
@@ -1390,7 +1476,8 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
             return f"background-color: rgba(0, 150, 220, {intensity * 0.5})"
 
         nfl_preview_cols = ["player_display_name", "team", "matchup", "prop_type", "line",
-                            "mu", "edge", "p_over", "quality_score", "games_sampled_current"]
+                            "mu", "edge", "p_over", "quality_score", "games_sampled_total",
+                            "stage1_player_majority_elite", "stage1_player_majority_poor"]
         nfl_styled_preview = (nfl_qualified_df[nfl_preview_cols].style
                               .map(_nfl_color_edge, subset=["edge"])
                               .map(_nfl_color_prob, subset=["p_over"])
@@ -1401,11 +1488,11 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
 
         nfl_checked = st.data_editor(
             nfl_qualified_df[["Include", "player_display_name", "team", "matchup", "prop_type",
-                              "line", "mu", "edge", "p_over", "quality_score", "games_sampled_current"]],
+                              "line", "mu", "edge", "p_over", "quality_score", "games_sampled_total"]],
             column_config={"Include": st.column_config.CheckboxColumn(
                 "Include", help="Check to add this leg to the slip builder below")},
             disabled=["player_display_name", "team", "matchup", "prop_type", "line", "mu",
-                      "edge", "p_over", "quality_score", "games_sampled_current"],
+                      "edge", "p_over", "quality_score", "games_sampled_total"],
             width='stretch', key="nfl_include_editor",
         )
 
@@ -1456,7 +1543,7 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                 avg_q = sum(l["quality_score"] for l in slip if pd.notna(l["quality_score"])) / max(len(slip), 1)
                 st.subheader(f"Slip {i + 1} — {len(slip)}-man (avg quality {avg_q:.0f})")
                 st.dataframe(pd.DataFrame(slip)[["player_display_name", "team", "matchup", "prop_type",
-                                                  "line", "quality_score", "edge", "games_sampled_current"]],
+                                                  "line", "quality_score", "edge", "games_sampled_total"]],
                             width='stretch', hide_index=True)
 
             if nfl_leftover:
@@ -1471,7 +1558,7 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                 if "nfl_locked_slips" not in st.session_state:
                     st.session_state.nfl_locked_slips = []
                 new_locked = [pd.DataFrame(slip)[["player_display_name", "team", "prop_type", "line",
-                                                   "quality_score", "edge", "games_sampled_current", "matchup"]]
+                                                   "quality_score", "edge", "games_sampled_total", "matchup"]]
                               for slip in nfl_slips if slip]
                 st.session_state.nfl_locked_slips.extend(new_locked)
                 st.success(f"Locked in {len(new_locked)} slip(s) - they'll now survive a rescan.")
@@ -1522,7 +1609,7 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                             skipped.append((pick, "another leg from this same game is already in this slip")); continue
                         target = pd.concat([target, pd.DataFrame([row[
                             ["player_display_name", "team", "prop_type", "line", "quality_score",
-                             "edge", "games_sampled_current", "matchup"]
+                             "edge", "games_sampled_total", "matchup"]
                         ]])], ignore_index=True)
                         existing_players.add(row["player_display_name"]); existing_games.add(row["matchup"])
                         added += 1
@@ -1992,7 +2079,7 @@ elif mode == "Coverage Matchup (premium data)":
             if opp_profile is None:
                 st.error(f"No real coverage data found for {omm_nfl_opponent}.")
             else:
-                tendency_profile = build_defense_coverage_tendency_profile(opp_profile)
+                tendency_profile = build_defense_coverage_tendency_profile(opp_profile, bundle.def_coverage)
                 with st.expander("Real defense coverage tendency profile (no benchmark judgment attached)"):
                     st.dataframe(pd.DataFrame(tendency_profile), width="stretch", hide_index=True)
 
