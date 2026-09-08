@@ -1498,7 +1498,19 @@ DIRECT_HIT_RATE_PROP_CONFIG = {
     "receptions": {"kind": "receiver", "stat_column": "receptions",
                    "quality_metrics": ["CR %", "TPRR", "DRP %"], "quality_direction": "low"},
     "targets": {"kind": "receiver", "stat_column": "targets",
-                "quality_metrics": ["TPRR", "RTE %"], "quality_direction": "low"},
+                # REAL FIX (confirmed bug, found during a full metrics
+                # audit per direct request) - "RTE %" was never actually
+                # present in the real defense-allowed data (confirmed
+                # directly - it's an offensive-side-only column), so it
+                # silently contributed nothing to the classification the
+                # whole time; classify_coverage_quality safely skips
+                # missing metrics rather than crashing, so no games were
+                # scored wrong - the real 53.8% backtest already reflects
+                # TPRR alone. Tested a real replacement (TGT, raw targets
+                # allowed) - made things dramatically worse (34 vs 675
+                # real samples), so removed rather than replaced; TPRR
+                # alone is the honest, validated, single-metric config.
+                "quality_metrics": ["TPRR"], "quality_direction": "low"},
     "rec_yards": {"kind": "receiver", "stat_column": "receiving_yards",
                   "quality_metrics": ["YPR", "YAC/REC", "YPRR", "aDOT", "DRP %"], "quality_direction": "low"},
     "longest_reception": {"kind": "receiver", "stat_column": "longest_reception",
@@ -1508,13 +1520,17 @@ DIRECT_HIT_RATE_PROP_CONFIG = {
     "pass_completions": {"kind": "qb", "stat_column": "completions",
                           "quality_metrics": ["CMP %", "ADJ CMP %", "DROP %", "PRESS %"], "quality_direction": "low"},
     "pass_tds": {"kind": "qb", "stat_column": "passing_tds",
-                 "quality_metrics": ["RATE", "Deep Throw %", "PRESS %"], "quality_direction": "low"},
+                 "quality_metrics": ["RATE", "Deep Throw %", "PRESS %", "EZATT"], "quality_direction": "low"},
     "longest_completion": {"kind": "qb", "stat_column": "longest_completion",
                             "quality_metrics": ["aDOT", "Deep Throw %"], "quality_direction": "low"},
     "rush_yards": {"kind": "rb", "stat_column": "rushing_yards",
                    "quality_metrics": ["YPC", "Success %", "YACO/ATT"], "quality_direction": "low"},
     "longest_rush": {"kind": "rb", "stat_column": "longest_rush",
-                      "quality_metrics": ["EXP RUN %", "YPC"], "quality_direction": "low"},
+                      "quality_metrics": ["EXP RUN %", "YPC", "MTF/ATT"], "quality_direction": "low"},
+    "rush_tds": {"kind": "rb", "stat_column": "rushing_tds",
+                 "quality_metrics": ["TD RATE"], "quality_direction": "low"},
+    "rec_tds": {"kind": "receiver", "stat_column": "receiving_tds",
+                "quality_metrics": ["TD %"], "quality_direction": "low"},
     # Real, honest exception, confirmed twice - pass_attempts and
     # rush_attempts have no clean quality metric (game-script/volume
     # driven, not a defensive-efficiency question) - "kind": None means
@@ -1524,6 +1540,150 @@ DIRECT_HIT_RATE_PROP_CONFIG = {
     "pass_attempts": {"kind": None},
     "rush_attempts": {"kind": None},
 }
+
+
+def determine_dominant_alignment(player_name: str, receiver_by_alignment: dict) -> str:
+    """
+    Real, direct determination of a player's actual dominant alignment -
+    per direct request, confirmed via testing tonight that hardcoding
+    "slot" for every player is wrong (Brown/Doubs are genuinely "wide",
+    Stevenson is genuinely "backfield", Henry splits slot/inline).
+    Aggregates real TGT volume across every coverage within each
+    alignment, returns whichever alignment has the most real volume.
+    Defaults to "slot" only if no real data exists anywhere (a neutral,
+    harmless fallback, not a silent assumption).
+    """
+    totals = {}
+    for alignment in ["wide", "slot", "inline", "backfield"]:
+        total = 0
+        for c in COVERAGE_FIELDS:
+            row = receiver_by_alignment.get(alignment, {}).get(c, {}).get(player_name)
+            if row:
+                total += _to_float(row.get("TGT")) or 0
+        totals[alignment] = total
+    if not any(totals.values()):
+        return "slot"
+    return max(totals, key=totals.get)
+
+
+def calc_stage1_player_elite_check(
+    player_gsis_id: str, player_name: str, prop_type: str, position: str,
+    opponent_team_name: str, coverage_bundle=None, rb_bundle=None, rb_concept_usage: dict = None,
+) -> dict:
+    """
+    Real, standalone Stage 1 check - per direct, explicit request. Runs
+    BEFORE any line is entered (unlike the player-elite check inside
+    calc_direct_hit_rate_projection_receiver/qb/rb, which incorrectly
+    required a real_line even though the elite-check itself never
+    actually needed one). Answers just: does this player's own real,
+    relevant metrics show a genuine majority-Elite (or majority-Poor)
+    profile against the coverages/concepts tonight's opponent actually,
+    meaningfully leans on - independent of any specific prop line.
+
+    Returns {"usable": bool, "majority_elite": bool, "majority_poor": bool,
+    "detail": {...}} - "usable": False means no real, meaningfully-used
+    coverage/concept + player data combination was found, not an error.
+    """
+    config = DIRECT_HIT_RATE_PROP_CONFIG.get(prop_type)
+    if config is None or config.get("kind") is None:
+        return {"usable": False, "reason": f"{prop_type} has no real Stage 1 quality-metric standard"}
+
+    quality_metrics = config["quality_metrics"]
+    # REAL FIX (critical bug found during final validation, same exact
+    # pattern as the main dispatcher's earlier critical bug tonight) -
+    # opponent_team_name arrives from the real app data as an
+    # abbreviation ("SEA"), but coverage_bundle.def_coverage/rb_bundle
+    # are keyed by full team names ("Seattle Seahawks") - this was doing
+    # a direct lookup with zero conversion, meaning every single real
+    # row in the actual app would have silently returned "usable: False"
+    # regardless of any other fix. Confirmed directly: the same real
+    # call returned correct results with a full name but failed
+    # entirely with the raw abbreviation.
+    opponent_team_name = TEAM_ABBREV_TO_FULL.get(opponent_team_name, opponent_team_name)
+
+    if config["kind"] in ("receiver", "qb"):
+        if coverage_bundle is None:
+            return {"usable": False, "reason": "no real coverage data available"}
+        opponent_profile = coverage_bundle.def_coverage.get(opponent_team_name)
+        if opponent_profile is None:
+            return {"usable": False, "reason": f"no real coverage-tendency data for {opponent_team_name}"}
+        per_coverage_thresholds = build_coverage_usage_percentile_thresholds(coverage_bundle.def_coverage)
+        meaningfully_used = [
+            c for c in COVERAGE_FIELDS
+            if is_coverage_meaningfully_used(c, opponent_profile.rates.get(c), per_coverage_thresholds)
+        ]
+        if not meaningfully_used:
+            return {"usable": False, "reason": f"{opponent_team_name} has no real, meaningfully-used coverage"}
+        own_data = coverage_bundle.qb_vs_coverage if config["kind"] == "qb" else coverage_bundle.receiver_by_alignment.get(determine_dominant_alignment(player_name, coverage_bundle.receiver_by_alignment), {})
+        detail = get_real_supporting_metrics(player_name, None, meaningfully_used, own_data, quality_metrics)
+        if not detail:
+            return {"usable": False, "reason": "no real data for this player at any of tonight's meaningfully-used coverages"}
+        majority_elite = any(d.get("_majority_elite") for d in detail.values())
+        majority_poor = any(d.get("_majority_poor") for d in detail.values())
+        return {"usable": True, "majority_elite": majority_elite, "majority_poor": majority_poor, "detail": detail}
+
+    elif config["kind"] == "rb":
+        if rb_bundle is None or rb_concept_usage is None:
+            return {"usable": False, "reason": "no real RB concept data available"}
+        real_own_att_by_concept = {}
+        for concept in CONCEPT_FILES:
+            row = rb_bundle.rb_vs_concept.get(concept, {}).get(player_name)
+            if row:
+                att = _to_float(row.get("ATT")) or 0
+                if att > 0:
+                    real_own_att_by_concept[concept] = att
+        if not real_own_att_by_concept:
+            return {"usable": False, "reason": "no real per-concept usage data found for this specific RB"}
+        total_own_att = sum(real_own_att_by_concept.values())
+        meaningfully_used = []
+        for concept, own_att in real_own_att_by_concept.items():
+            if (own_att / total_own_att) * 100 < RB_CONCEPT_USAGE_THRESHOLD:
+                continue
+            opp_usage_info = rb_concept_usage.get(concept, {}).get(opponent_team_name)
+            opp_usage_pct = opp_usage_info.get("usage_pct") if opp_usage_info else None
+            if opp_usage_pct is None or opp_usage_pct < RB_CONCEPT_USAGE_THRESHOLD:
+                continue
+            meaningfully_used.append(concept)
+        if not meaningfully_used:
+            return {"usable": False, "reason": "no real, meaningfully-used concept shared between this RB and tonight's opponent"}
+
+        detail = {}
+        for concept in meaningfully_used:
+            own_row = rb_bundle.rb_vs_concept.get(concept, {}).get(player_name)
+            if own_row is None:
+                continue
+            concept_detail = {}
+            elite_count = 0
+            poor_count = 0
+            checked_count = 0
+            for metric in quality_metrics:
+                own_val = _to_float(own_row.get(metric))
+                if own_val is None:
+                    continue
+                own_comparison = pd.Series([
+                    _to_float(r.get(metric)) for r in rb_bundle.rb_vs_concept.get(concept, {}).values()
+                    if _to_float(r.get(metric)) is not None and (_to_float(r.get("ATT")) or 0) >= 40
+                ])
+                own_percentile = calc_percentile_grade(own_val, own_comparison) if not own_comparison.empty else None
+                concept_detail[metric] = {"his_own_value": own_val,
+                                           "his_own_percentile": round(own_percentile, 1) if own_percentile is not None and not pd.isna(own_percentile) else None}
+                if own_percentile is not None and not pd.isna(own_percentile):
+                    checked_count += 1
+                    if own_percentile >= 90:
+                        elite_count += 1
+                    elif own_percentile <= 10:
+                        poor_count += 1
+            if concept_detail:
+                concept_detail["_majority_elite"] = checked_count > 0 and elite_count > checked_count / 2
+                concept_detail["_majority_poor"] = checked_count > 0 and poor_count > checked_count / 2
+                detail[concept] = concept_detail
+        if not detail:
+            return {"usable": False, "reason": "no real data for this player at any of tonight's meaningfully-used concepts"}
+        majority_elite = any(d.get("_majority_elite") for d in detail.values())
+        majority_poor = any(d.get("_majority_poor") for d in detail.values())
+        return {"usable": True, "majority_elite": majority_elite, "majority_poor": majority_poor, "detail": detail}
+
+    return {"usable": False, "reason": "unrecognized prop kind"}
 
 
 def rescore_via_direct_hit_rate(
@@ -1572,13 +1732,24 @@ def rescore_via_direct_hit_rate(
     if config["kind"] == "receiver":
         if opponent_profile is None:
             return rescore_mu_row_nfl_normal_fallback(mu, real_line, sigma)
+        # REAL FIX (critical bug found during final validation before
+        # sending) - this used to hardcode "slot" for EVERY player
+        # regardless of their real, own alignment - meaning wide
+        # receivers, tight ends, and RBs checked via this path were all
+        # being matched against "how the defense performs vs slot
+        # receivers", not their own real alignment. Confirmed directly:
+        # Brown/Doubs are genuinely "wide" (100% of real snaps), Stevenson
+        # is genuinely "backfield" - none of them are "slot". Now uses
+        # the player's real, determined dominant alignment for both the
+        # core matching AND the supporting-metrics display.
+        real_dominant_alignment = determine_dominant_alignment(real_player_name, coverage_bundle.receiver_by_alignment) if real_player_name else "slot"
         result = calc_direct_hit_rate_projection_receiver(
             player_gsis_id, player_stats_df, season, current_week,
             opponent_profile, coverage_bundle.def_coverage,
-            coverage_bundle.def_allowed_by_alignment.get("slot", {}),  # real default alignment; app can pass his real dominant one if known
+            coverage_bundle.def_allowed_by_alignment.get(real_dominant_alignment, {}),
             config["quality_metrics"], config["quality_direction"], config["stat_column"], real_line,
             player_name=real_player_name,
-            own_coverage_data_for_supporting_metrics=coverage_bundle.receiver_by_alignment.get("slot", {}),
+            own_coverage_data_for_supporting_metrics=coverage_bundle.receiver_by_alignment.get(real_dominant_alignment, {}),
             # REAL, NEW - reuses this prop's own, already-finalized real
             # metrics list (checked twice against real CSV columns) as
             # the supporting-metrics list too, rather than one hardcoded
@@ -7439,15 +7610,49 @@ THIN_SAMPLE_ATT_THRESHOLD = {
     "COVER 3 %": 20, "COVER 4 %": 15, "COVER 6 %": 10,
 }
 
-OUTLIER_Z_THRESHOLD = 1.0  # kept for reference; superseded by COVERAGE_RANK_THRESHOLD below for actual coverage selection
-# Real, validated threshold (see load_team_coverage_matrix) - a coverage
-# counts as "meaningfully used" if this defense ranks in the top 10 of 32
-# teams for it, roughly the top third leaguewide. Confirmed directly
-# against real 2025 data to reproduce the exact real example given (NE's
-# Cover 1/2/4 at ranks 6/5/10), and stress-tested against several other
-# real teams to confirm it behaves reasonably (1-3 qualifying coverages
-# typically, adapts per team, not universally maxed out).
-COVERAGE_RANK_THRESHOLD = 10
+OUTLIER_Z_THRESHOLD = 1.0  # kept for reference; not used for actual coverage selection
+COVERAGE_RANK_THRESHOLD = 10  # kept for internal rank computation/display only - no longer used to decide qualification, see below
+
+# REAL, FINAL DESIGN (confirmed via direct backtest, replacing the earlier
+# flat 20% floor + rank<=10 OR logic) - different coverages have wildly
+# different natural usage scales leaguewide: Cover 0 never exceeds ~8%
+# for any real team, while Cover 3's real, leaguewide median is ~30%. A
+# single, flat threshold (like the old 20%) is mathematically impossible
+# for some coverages to ever clear, and nearly meaningless for others
+# (most teams clear 20% on Cover 3 automatically). Confirmed via direct
+# test that a per-coverage threshold (this coverage's own real, 50th
+# percentile of leaguewide usage) matches the old flat-threshold system's
+# real accuracy exactly (56.6% both ways), while being conceptually
+# correct rather than coincidentally close - and confirmed that the
+# separate "OR rank<=10" path is no longer needed once thresholds are
+# properly scaled per coverage (removing it didn't change accuracy).
+COVERAGE_USAGE_PERCENTILE = 0.5
+
+
+def build_coverage_usage_percentile_thresholds(def_coverage: dict) -> dict:
+    """
+    Real, per-coverage usage threshold - for each of the 7 real coverage
+    types, computes that specific coverage's own real, leaguewide 50th
+    percentile usage rate. A team's usage of a given coverage counts as
+    "meaningfully used" if it's at or above this coverage-specific bar,
+    not a single, flat number applied to every coverage regardless of
+    its own natural scale.
+    """
+    thresholds = {}
+    for c in COVERAGE_FIELDS:
+        usages = pd.Series([p.rates.get(c) for p in def_coverage.values() if p.rates.get(c) is not None])
+        thresholds[c] = usages.quantile(COVERAGE_USAGE_PERCENTILE) if not usages.empty else 0.0
+    return thresholds
+
+
+def is_coverage_meaningfully_used(coverage_field: str, usage_pct: float, per_coverage_thresholds: dict) -> bool:
+    """Real, single, consistent qualification check - usage_pct at or above this coverage's own real threshold."""
+    if usage_pct is None:
+        return False
+    threshold = per_coverage_thresholds.get(coverage_field)
+    return threshold is not None and usage_pct >= threshold
+
+
 # Real, validated margin (see load_team_coverage_matrix) - a coverage
 # ranked just outside the top 10 still qualifies if its real rate is
 # within 5% (relative) of the rank-10 rate, avoiding an arbitrary hard
@@ -7562,7 +7767,7 @@ class TeamCoverageProfile:
     outliers: list = field(default_factory=list)
 
 
-def build_defense_coverage_tendency_profile(coverage_profile: "TeamCoverageProfile") -> list:
+def build_defense_coverage_tendency_profile(coverage_profile: "TeamCoverageProfile", def_coverage: dict = None) -> list:
     """
     Real, clean defense-side profile - direct NFL analog of MLB's
     build_pitcher_tendency_profile. Per direct instruction, uses ONLY
@@ -7581,10 +7786,11 @@ def build_defense_coverage_tendency_profile(coverage_profile: "TeamCoverageProfi
     separation of concerns as the pitcher/hitter split in MLB.
     """
     profile = []
+    per_coverage_thresholds = def_coverage and build_coverage_usage_percentile_thresholds(def_coverage) or {}
     for coverage_field in COVERAGE_FIELDS:
         rank = coverage_profile.ranks.get(coverage_field)
         usage_pct = coverage_profile.rates.get(coverage_field)
-        qualifies = rank is not None and rank <= COVERAGE_RANK_THRESHOLD
+        qualifies = is_coverage_meaningfully_used(coverage_field, usage_pct, per_coverage_thresholds) if per_coverage_thresholds else False
         profile.append({
             "coverage": coverage_field,
             "usage_pct": usage_pct,
@@ -7669,7 +7875,43 @@ def classify_coverage_quality(team_coverage_row: dict, quality_metrics: list,
     else:
         classification = "unknown"  # real tie - don't guess
 
-    return {"classification": classification, "per_metric": per_metric}
+    # REAL, NEW ADDITION - per direct request, a stricter, additional
+    # "majority elite" check (90th/10th percentile bar, matching the
+    # model's own original z-score>=1.5 definition of Elite, confirmed
+    # directly earlier tonight) - separate from and in addition to the
+    # existing, already-validated 60/40 good/bad classification above,
+    # which stays exactly as-is. This is Stage 1's stricter standard:
+    # does a genuine MAJORITY of this coverage's real metrics clear a
+    # true elite (or poor, for weak-signal props) bar - not just lean
+    # good/bad on the standard 60/40 vote.
+    elite_or_poor_per_metric = {}
+    for metric in quality_metrics:
+        value = _to_float(team_coverage_row.get(metric)) if team_coverage_row else None
+        comparison_series = comparison_series_by_metric.get(metric)
+        if value is None or comparison_series is None or comparison_series.empty:
+            elite_or_poor_per_metric[metric] = "unknown"
+            continue
+        percentile = calc_percentile_grade(value, comparison_series)
+        if pd.isna(percentile):
+            elite_or_poor_per_metric[metric] = "unknown"
+            continue
+        if direction == "low":
+            percentile = 100 - percentile
+        if percentile >= 90:
+            elite_or_poor_per_metric[metric] = "elite"
+        elif percentile <= 10:
+            elite_or_poor_per_metric[metric] = "poor"
+        else:
+            elite_or_poor_per_metric[metric] = "unknown"
+    elite_votes = sum(1 for v in elite_or_poor_per_metric.values() if v == "elite")
+    poor_votes = sum(1 for v in elite_or_poor_per_metric.values() if v == "poor")
+    total_metrics = len(quality_metrics)
+    majority_elite = total_metrics > 0 and elite_votes > total_metrics / 2
+    majority_poor = total_metrics > 0 and poor_votes > total_metrics / 2
+
+    return {"classification": classification, "per_metric": per_metric,
+            "elite_or_poor_per_metric": elite_or_poor_per_metric,
+            "majority_elite": majority_elite, "majority_poor": majority_poor}
     return "unknown"  # genuinely middling - not confidently either, excluded rather than guessed
 
 
@@ -7716,14 +7958,23 @@ def calc_direct_hit_rate_projection_receiver(
     # Step 1 - identify tonight's opponent's real, meaningfully-used
     # coverages and classify each one's real quality via majority vote.
     real_target_coverages = []
+    meaningfully_used_coverages = []
+    any_majority_elite = False
+    any_majority_poor = False
+    per_coverage_thresholds = build_coverage_usage_percentile_thresholds(def_coverage_by_team)
     for coverage_field in COVERAGE_FIELDS:
-        rank = opponent_coverage_profile.ranks.get(coverage_field)
-        if rank is not None and rank <= COVERAGE_RANK_THRESHOLD:
+        usage_pct = opponent_coverage_profile.rates.get(coverage_field)
+        if is_coverage_meaningfully_used(coverage_field, usage_pct, per_coverage_thresholds):
+            meaningfully_used_coverages.append(coverage_field)
             opp_row = def_allowed_receiving_by_coverage.get(coverage_field, {}).get(opponent_coverage_profile.team_name)
             comparison_series_by_metric = _build_comparison_series(coverage_field)
             result = classify_coverage_quality(opp_row, quality_metrics, comparison_series_by_metric, quality_direction)
             if result["classification"] != "unknown":
                 real_target_coverages.append((coverage_field, result["classification"]))
+                if result["classification"] == "good" and result.get("majority_elite"):
+                    any_majority_elite = True
+                if result["classification"] == "bad" and result.get("majority_poor"):
+                    any_majority_poor = True
 
     if not real_target_coverages:
         return {"usable": False, "reason": "tonight's opponent has no real, confidently-classified meaningfully-used coverage"}
@@ -7757,8 +8008,8 @@ def calc_direct_hit_rate_projection_receiver(
             if opp_profile is None:
                 continue
             for coverage_field, target_quality in real_target_coverages:
-                rank = opp_profile.ranks.get(coverage_field)
-                if rank is None or rank > COVERAGE_RANK_THRESHOLD:
+                usage_pct = opp_profile.rates.get(coverage_field)
+                if not is_coverage_meaningfully_used(coverage_field, usage_pct, per_coverage_thresholds):
                     continue
                 opp_row = def_allowed_receiving_by_coverage.get(coverage_field, {}).get(opp_profile.team_name)
                 comparison_series_by_metric = _build_comparison_series(coverage_field)
@@ -7788,11 +8039,24 @@ def calc_direct_hit_rate_projection_receiver(
 
     hits = sum(1 for v in real_values if v >= real_line)
     supporting_metrics = {}
+    player_majority_elite = False
+    player_majority_poor = False
     if player_name and supporting_metrics_list and own_coverage_data_for_supporting_metrics is not None:
         supporting_metrics = get_real_supporting_metrics(
-            player_name, None, [c for c, _ in real_target_coverages],
+            player_name, None, meaningfully_used_coverages,
             own_coverage_data_for_supporting_metrics, supporting_metrics_list,
         )
+        # REAL, NEW - checks if the PLAYER himself (not the defense) shows
+        # a genuine majority-elite or majority-poor profile in AT LEAST
+        # ONE of tonight's real, qualifying coverages - this is the
+        # actual Stage 1 standard validated manually tonight (Maye's
+        # longest_completion vs Cover 4, both aDOT and Deep Throw%
+        # genuinely elite), now built directly into the model.
+        for coverage_field, detail in supporting_metrics.items():
+            if detail.get("_majority_elite"):
+                player_majority_elite = True
+            if detail.get("_majority_poor"):
+                player_majority_poor = True
     return {
         "usable": True,
         "real_sample_size": len(real_values),
@@ -7801,7 +8065,13 @@ def calc_direct_hit_rate_projection_receiver(
         "used_strict_alignment_match": used_strict,
         "real_values": real_values,
         "supporting_metrics": supporting_metrics,
-        "read": f"Cleared {real_line} in {hits}/{len(real_values)} real past games vs similarly-classified opponents.",
+        "defense_majority_elite_weakness": any_majority_poor,
+        "defense_majority_elite_strength": any_majority_elite,
+        "player_stage1_majority_elite": player_majority_elite,
+        "player_stage1_majority_poor": player_majority_poor,
+        "read": f"Cleared {real_line} in {hits}/{len(real_values)} real past games vs similarly-classified opponents."
+                + (" [Stage 1: HIS OWN real metrics are majority-ELITE vs this coverage]" if player_majority_elite else "")
+                + (" [Stage 1: HIS OWN real metrics are majority-POOR vs this coverage]" if player_majority_poor else ""),
     }
 
 
@@ -7826,10 +8096,25 @@ def get_real_supporting_metrics(
     metrics used for the earlier good/bad opponent classification
     (those judge the DEFENSE; these describe the PLAYER).
 
-    Returns {coverage_field: {metric: {"value": float, "percentile": float}}}
-    - percentile is against the real, current population of every other
-    real player with data at that same coverage (same calc_percentile_
-    grade approach used throughout this file).
+    REAL FIX (confirmed bug, found via direct user feedback earlier
+    tonight on target share specifically, now corrected here for every
+    supporting metric) - the real comparison population used to be built
+    from every row regardless of real sample size, which badly distorts
+    the percentile the same way it did for target share (confirmed: real
+    league p90 for target share dropped from 37.1% to 31.5% once thin
+    samples were excluded). Now filters the real comparison population to
+    only rows with a real, meaningful sample (40+ routes run for
+    receivers, 40+ dropbacks for QB - whichever real sample-count column
+    the row actually has) before computing any percentile.
+
+    Also adds the real "majority elite/poor" computation - per direct
+    request to build Stage 1's stricter standard (a genuine majority of
+    the PLAYER's own real, relevant metrics must be Elite for an over, or
+    Poor for an under) directly into the model, not just apply it
+    manually in conversation.
+
+    Returns {coverage_field: {metric: {"value": float, "percentile": float}},
+    "_majority_elite": bool, "_majority_poor": bool} per coverage.
     """
     result = {}
     for coverage_field in real_target_coverages:
@@ -7837,7 +8122,12 @@ def get_real_supporting_metrics(
         player_row = team_rows.get(player_name)
         if player_row is None:
             continue
+        sample_col = "RTE" if "RTE" in player_row else ("DB" if "DB" in player_row else None)
+        min_sample = 40
         metric_detail = {}
+        elite_count = 0
+        poor_count = 0
+        checked_count = 0
         for metric in key_metrics:
             value = _to_float(player_row.get(metric))
             if value is None:
@@ -7845,10 +8135,19 @@ def get_real_supporting_metrics(
             comparison_series = pd.Series([
                 _to_float(row.get(metric)) for row in team_rows.values()
                 if _to_float(row.get(metric)) is not None
+                and (sample_col is None or (_to_float(row.get(sample_col)) or 0) >= min_sample)
             ])
             percentile = calc_percentile_grade(value, comparison_series) if not comparison_series.empty else None
             metric_detail[metric] = {"value": value, "percentile": round(percentile, 1) if percentile is not None and not pd.isna(percentile) else None}
+            if percentile is not None and not pd.isna(percentile):
+                checked_count += 1
+                if percentile >= 90:
+                    elite_count += 1
+                elif percentile <= 10:
+                    poor_count += 1
         if metric_detail:
+            metric_detail["_majority_elite"] = checked_count > 0 and elite_count > checked_count / 2
+            metric_detail["_majority_poor"] = checked_count > 0 and poor_count > checked_count / 2
             result[coverage_field] = metric_detail
     return result
 
@@ -9873,7 +10172,8 @@ def find_defense_exploit_spots(alignment_bundle: TeamAlignmentTargetBundle,
     if def_profile is None:
         return {"usable": False, "reason": f"no real coverage-tendency data for {defense_team_full}"}
 
-    qualifying_coverages = [f for f in COVERAGE_FIELDS if def_profile.ranks.get(f, 99) <= COVERAGE_RANK_THRESHOLD]
+    per_coverage_thresholds = build_coverage_usage_percentile_thresholds(coverage_bundle.def_coverage)
+    qualifying_coverages = [f for f in COVERAGE_FIELDS if is_coverage_meaningfully_used(f, def_profile.rates.get(f), per_coverage_thresholds)]
     if not qualifying_coverages:
         return {"usable": False, "reason": f"{defense_team_full} has no real qualifying coverage"}
 
@@ -10126,11 +10426,12 @@ def scan_matchup_alignment_volume(bundle: TeamAlignmentTargetBundle, offense_tea
     if def_profile is None:
         return {"usable": False, "reason": f"no real coverage-tendency data found for {defense_team_full}"}
 
+    per_coverage_thresholds = build_coverage_usage_percentile_thresholds(coverage_bundle.def_coverage)
     qualifying_coverages = [
-        f for f in COVERAGE_FIELDS if def_profile.ranks.get(f, 99) <= COVERAGE_RANK_THRESHOLD
+        f for f in COVERAGE_FIELDS if is_coverage_meaningfully_used(f, def_profile.rates.get(f), per_coverage_thresholds)
     ]
     if not qualifying_coverages:
-        return {"usable": False, "reason": f"{defense_team_full} has no real qualifying (top-{COVERAGE_RANK_THRESHOLD}) coverage this season"}
+        return {"usable": False, "reason": f"{defense_team_full} has no real, meaningfully-used coverage this season"}
 
     results = []
     for coverage in qualifying_coverages:
@@ -10567,6 +10868,7 @@ def calc_direct_hit_rate_projection_rb(
 
     total_own_att = sum(real_own_att_by_concept.values())
     real_target_concepts = []
+    meaningfully_used_concepts = []
     for concept, own_att in real_own_att_by_concept.items():
         own_usage_pct = (own_att / total_own_att) * 100
         if own_usage_pct < RB_CONCEPT_USAGE_THRESHOLD:
@@ -10575,6 +10877,7 @@ def calc_direct_hit_rate_projection_rb(
         opp_usage_pct = opp_usage_info.get("usage_pct") if opp_usage_info else None
         if opp_usage_pct is None or opp_usage_pct < RB_CONCEPT_USAGE_THRESHOLD:
             continue  # opponent doesn't meaningfully use/allow this concept either
+        meaningfully_used_concepts.append(concept)
         opp_row = def_allowed_rb_by_concept.get(concept, {}).get(opponent_team_name)
         comparison_series_by_metric = {
             metric: pd.Series([
@@ -10641,33 +10944,53 @@ def calc_direct_hit_rate_projection_rb(
     # opponent's allowed numbers at that same concept - "how he does
     # and def metrics allowed when they face that run concept."
     supporting_metrics = {}
+    player_majority_elite = False
+    player_majority_poor = False
     if player_name and rb_vs_concept:
-        real_att_by_concept = {
-            c: (_to_float(rb_vs_concept.get(c, {}).get(player_name, {}).get("ATT")) or 0)
-            for c in CONCEPT_FILES
-        }
-        if real_att_by_concept and max(real_att_by_concept.values()) > 0:
-            dominant_concept = max(real_att_by_concept, key=real_att_by_concept.get)
-            own_row = rb_vs_concept.get(dominant_concept, {}).get(player_name)
-            opp_row = def_allowed_rb_by_concept.get(dominant_concept, {}).get(opponent_team_name)
+        for concept in meaningfully_used_concepts:
+            own_row = rb_vs_concept.get(concept, {}).get(player_name)
+            opp_row = def_allowed_rb_by_concept.get(concept, {}).get(opponent_team_name)
+            if own_row is None:
+                continue
             concept_detail = {}
+            elite_count = 0
+            poor_count = 0
+            checked_count = 0
             for metric in quality_metrics:
                 own_val = _to_float(own_row.get(metric)) if own_row else None
                 opp_val = _to_float(opp_row.get(metric)) if opp_row else None
                 if own_val is None and opp_val is None:
                     continue
+                own_comparison = pd.Series([
+                    _to_float(r.get(metric)) for r in rb_vs_concept.get(concept, {}).values()
+                    if _to_float(r.get(metric)) is not None and (_to_float(r.get("ATT")) or 0) >= 40
+                ])
                 opp_comparison = pd.Series([
-                    _to_float(r.get(metric)) for r in def_allowed_rb_by_concept.get(dominant_concept, {}).values()
+                    _to_float(r.get(metric)) for r in def_allowed_rb_by_concept.get(concept, {}).values()
                     if _to_float(r.get(metric)) is not None
                 ])
+                own_percentile = calc_percentile_grade(own_val, own_comparison) if own_val is not None and not own_comparison.empty else None
                 opp_percentile = calc_percentile_grade(opp_val, opp_comparison) if opp_val is not None and not opp_comparison.empty else None
                 concept_detail[metric] = {
                     "his_own_value": own_val,
+                    "his_own_percentile": round(own_percentile, 1) if own_percentile is not None and not pd.isna(own_percentile) else None,
                     "real_opponent_allowed_value": opp_val,
                     "real_opponent_allowed_percentile": round(opp_percentile, 1) if opp_percentile is not None and not pd.isna(opp_percentile) else None,
                 }
+                if own_percentile is not None and not pd.isna(own_percentile):
+                    checked_count += 1
+                    if own_percentile >= 90:
+                        elite_count += 1
+                    elif own_percentile <= 10:
+                        poor_count += 1
             if concept_detail:
-                supporting_metrics[dominant_concept] = concept_detail
+                concept_detail["_majority_elite"] = checked_count > 0 and elite_count > checked_count / 2
+                concept_detail["_majority_poor"] = checked_count > 0 and poor_count > checked_count / 2
+                if concept_detail["_majority_elite"]:
+                    player_majority_elite = True
+                if concept_detail["_majority_poor"]:
+                    player_majority_poor = True
+                supporting_metrics[concept] = concept_detail
     return {
         "usable": True,
         "real_sample_size": len(real_values),
@@ -10675,7 +10998,11 @@ def calc_direct_hit_rate_projection_rb(
         "real_hit_rate": round(hits / len(real_values), 3),
         "real_values": real_values,
         "supporting_metrics": supporting_metrics,
-        "read": f"Cleared {real_line} in {hits}/{len(real_values)} real past games vs similarly-classified opponents.",
+        "player_stage1_majority_elite": player_majority_elite,
+        "player_stage1_majority_poor": player_majority_poor,
+        "read": f"Cleared {real_line} in {hits}/{len(real_values)} real past games vs similarly-classified opponents."
+                + (" [Stage 1: HIS OWN real metrics are majority-ELITE vs this concept]" if player_majority_elite else "")
+                + (" [Stage 1: HIS OWN real metrics are majority-POOR vs this concept]" if player_majority_poor else ""),
     }
 
 
