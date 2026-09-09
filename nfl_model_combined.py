@@ -4593,6 +4593,16 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
                 "team": pr.get("team"), "position": pr.get("position"), "prop_type": "fantasy_points",
                 "matchup": team_to_matchup.get(pr.get("team")),
                 "mu": mu_fantasy, "sigma": sigma, "quality_score": fantasy_quality_score,
+                # REAL FIX (confirmed bug, found via direct user report) -
+                # games_sampled_total was missing entirely from this row,
+                # even though games_n (the exact same real, combined
+                # current+fallback count used to weight mu/sigma above)
+                # was already computed and available. This wasn't a
+                # team-change carryover failure - AJ Brown's real
+                # underlying rec_yards/receptions/etc. props correctly
+                # showed 16 real games; only this specific prop's row was
+                # missing the field, showing 0 by default instead.
+                "games_sampled_total": games_n,
             })
 
         except Exception:
@@ -4712,9 +4722,22 @@ def build_weekly_slate(season: int, week: int, coverage_bundle=None, rb_bundle=N
         # safe and gives the real, total sample size actually behind
         # that specific mu.
         if "games_sampled_current" in result_df.columns and "games_sampled_fallback" in result_df.columns:
-            result_df["games_sampled_total"] = (
-                result_df["games_sampled_current"].fillna(0) + result_df["games_sampled_fallback"].fillna(0)
-            )
+            # REAL FIX (confirmed bug, found via direct user report) -
+            # this used to unconditionally overwrite games_sampled_total
+            # for EVERY row, including fantasy_points/fantasy_points_
+            # underdog rows, which never had games_sampled_current/
+            # games_sampled_fallback set at all (fillna(0)+fillna(0)=0),
+            # clobbering the real, correct games_n value those rows had
+            # just been given. Now only recalculates for rows that
+            # actually HAVE a real current/fallback split, leaving any
+            # row that already has its own valid games_sampled_total
+            # (like fantasy_points) untouched instead of stomping it.
+            has_split = result_df["games_sampled_current"].notna() | result_df["games_sampled_fallback"].notna()
+            recalculated = result_df["games_sampled_current"].fillna(0) + result_df["games_sampled_fallback"].fillna(0)
+            if "games_sampled_total" not in result_df.columns:
+                result_df["games_sampled_total"] = np.nan
+            result_df["games_sampled_total"] = np.where(
+                has_split, recalculated, result_df["games_sampled_total"])
 
     return result_df
 
@@ -8241,7 +8264,12 @@ def calc_original_method_match_nfl(coverage_profile: "TeamCoverageProfile", play
         clears_all = True
         real_percentiles = {}
         for stat_key in stat_keys:
-            value = stats.get(stat_key)
+            # REAL FIX (found via direct live testing against the actual
+            # Week 1 slate) - value was a raw CSV string, never converted
+            # to a real float before numeric comparison - crashed the
+            # first time this ran across a real, live slate instead of
+            # a single hand-typed manual check.
+            value = _to_float(stats.get(stat_key))
             comparison_series = comparison_series_by_stat.get(stat_key)
             if value is None or comparison_series is None:
                 clears_all = False
@@ -11283,4 +11311,352 @@ def get_rb_matchup(bundle: RBDataBundle, rb_name, opponent_team_full, rb_team_na
         return [{"note": f"No data found for {rb_name} or {opponent_team_full} "
                           f"in any of the 6 run concepts."}]
     return report
-  
+
+
+# =============================================================================
+# REAL, NEW - Stage 1 / Stage 2 coverage & concept cross-reference system,
+# per direct request and read-back confirmation this session. Two separate
+# tracks, same real, two-stage philosophy as MLB's Stage 1/Stage 2:
+#
+# PASS/PASS-CATCHING TRACK (coverage-based):
+#   Stage 1 - reuses the already-tested calc_original_method_match_nfl_for_prop
+#   in a loop across the whole real slate - does this player individually
+#   clear the real percentile bar on a real MAJORITY of tonight's specific
+#   opponent's meaningfully-used coverages, for the right metrics that drive
+#   THIS specific prop (NFL_PROP_ORIGINAL_METHOD_STATS, already established).
+#   Survivors move to Stage 2 with no line needed yet.
+#
+#   Stage 2 - once a real line is entered, finds this SAME player's own real
+#   past games specifically against OTHER real teams that ALSO meaningfully
+#   use that same coverage type (not just games vs tonight's exact opponent -
+#   games vs any defense sharing that real tendency), and checks how many of
+#   those specific real games actually cleared the entered line - a real
+#   "8/12" style read, not an abstract probability.
+#
+# RUN CONCEPT TRACK (concept-based, mirrors the same two-stage idea for RBs):
+#   Stage 1 - is this RB's own real efficiency in his DOMINANT run concept
+#   genuinely strong (top-third percentile, using the same established
+#   RB_CONCEPT_STATS_BY_PROP metric set for the specific prop), AND is
+#   tonight's specific opponent genuinely weak defending that same concept
+#   (bottom-third percentile allowed). Both sides must match to survive.
+#
+#   Stage 2 - same real cross-reference idea: this RB's own past games
+#   against OTHER real defenses that were ALSO genuinely weak against that
+#   same concept, checked against the entered real line.
+# =============================================================================
+
+def get_dominant_alignment_for_player(bundle: CoverageDataBundle, player_name: str):
+    """
+    Real, direct lookup of which alignment (wide/slot/inline/backfield)
+    this player is actually used at most, by real target volume - same
+    established approach already used inline in the Original Method
+    Matcher UI, pulled out here as a real, reusable function instead of
+    being duplicated for the new Stage 1 scan.
+    """
+    tgt_by_alignment = {}
+    for alignment in ALIGNMENTS:
+        total_tgt = 0
+        for coverage_field, rows in bundle.receiver_by_alignment.get(alignment, {}).items():
+            row = rows.get(player_name)
+            if row is not None:
+                total_tgt += int(_to_float(row.get("TGT")) or 0)
+        if total_tgt > 0:
+            tgt_by_alignment[alignment] = total_tgt
+    if not tgt_by_alignment:
+        return None
+    return max(tgt_by_alignment, key=tgt_by_alignment.get)
+
+
+def scan_stage1_pass_catch_survivors(bundle: CoverageDataBundle, week_rosters: pd.DataFrame,
+                                       opponent_by_team: dict, prop_types: list = None,
+                                       min_percentile: float = 75.0) -> pd.DataFrame:
+    """
+    Real, automated Stage 1 scan across the WHOLE real slate for pass-
+    catching props (receptions/targets/rec_yards/rec_tds/longest_reception)
+    - no line needed. For every real WR/TE on tonight's slate, checks
+    calc_original_method_match_nfl_for_prop against their own real, specific
+    opponent, for every prop in prop_types. Returns one real row per
+    (player, prop) that reaches a real majority match - the actual
+    "survivor" list, same role as MLB's Stage 1 output.
+
+    week_rosters: real roster rows for this week's slate (position, team,
+    player name columns expected, same shape as build_weekly_slate's input).
+    opponent_by_team: {team_full_name: opponent_full_name} for this week -
+    real, direct matchup lookup, not re-derived here.
+    """
+    prop_types = prop_types or list(NFL_PROP_ORIGINAL_METHOD_STATS.keys())
+    survivors = []
+
+    # Real, precomputed once per stat_key - the current-season population
+    # pooled across every alignment/coverage, reused for every player
+    # instead of rebuilding per player (which would be far too slow across
+    # a whole real slate).
+    all_stat_keys = sorted({sk for stat_keys in NFL_PROP_ORIGINAL_METHOD_STATS.values() for sk in stat_keys})
+    comparison_series_by_stat = {}
+    for stat_key in all_stat_keys:
+        all_values = []
+        for alignment in ALIGNMENTS:
+            for coverage_field, rows in bundle.receiver_by_alignment.get(alignment, {}).items():
+                for row in rows.values():
+                    v = _to_float(row.get(stat_key))
+                    if v is not None:
+                        all_values.append(v)
+        comparison_series_by_stat[stat_key] = pd.Series(all_values)
+
+    wr_te_rows = week_rosters[week_rosters["position"].isin(["WR", "TE"])]
+    for _, pr in wr_te_rows.iterrows():
+        player_name = pr.get("full_name") or pr.get("player_display_name")
+        team_full = TEAM_ABBREV_TO_FULL.get(pr.get("team"), pr.get("team"))
+        opponent_full = opponent_by_team.get(team_full)
+        if not player_name or not opponent_full:
+            continue
+        opp_profile = bundle.def_coverage.get(opponent_full)
+        if opp_profile is None:
+            continue
+
+        dominant_alignment = get_dominant_alignment_for_player(bundle, player_name)
+        if dominant_alignment is None:
+            continue
+        player_stats_by_coverage = {}
+        for coverage_field, rows in bundle.receiver_by_alignment.get(dominant_alignment, {}).items():
+            row = rows.get(player_name)
+            if row is not None:
+                player_stats_by_coverage[coverage_field] = row
+
+        for prop_type in prop_types:
+            result = calc_original_method_match_nfl_for_prop(
+                opp_profile, player_stats_by_coverage, prop_type,
+                comparison_series_by_stat, min_percentile=min_percentile,
+            )
+            if result.get("usable") and result.get("real_majority_match"):
+                # REAL FIX (found while building Stage 2) - Stage 2 needs
+                # a specific coverage_field to search similar-tendency
+                # defenses against; this was computed inside the result
+                # but never carried through to the survivor row.
+                qualifying_coverage_fields = [
+                    r["coverage"] for r in result.get("per_coverage", []) if r.get("qualifies")
+                ]
+                survivors.append({
+                    "gsis_id": pr.get("gsis_id"), "player": player_name,
+                    "team": pr.get("team"), "opponent": opponent_full,
+                    "position": pr.get("position"), "prop_type": prop_type,
+                    "coverages_qualifying": result["coverages_qualifying"],
+                    "coverages_scored": result["coverages_scored"],
+                    "qualifying_coverage_fields": qualifying_coverage_fields,
+                    "read": result["read"],
+                })
+
+    return pd.DataFrame(survivors)
+
+
+# Real, direct mapping from prop_type to the actual real player_stats
+# column name - needed for Stage 2's cross-reference lookup, since
+# NFL_PROP_ORIGINAL_METHOD_STATS's stat_keys are advanced-metric column
+# names (FantasyPoints CSVs), not player_stats' own real column names.
+NFL_PROP_STAT_COLUMN = {
+    "receptions": "receptions", "targets": "targets",
+    "rec_yards": "receiving_yards", "rec_tds": "receiving_tds",
+    "longest_reception": "receiving_yards",  # real, honest approximation - no per-game longest-reception column exists in player_stats
+}
+
+
+def stage2_pass_catch_cross_reference(gsis_id: str, prop_type: str, coverage_field: str,
+                                        bundle: CoverageDataBundle, line: float,
+                                        player_stats_df: pd.DataFrame, exclude_team_full: str = None) -> dict:
+    """
+    Real Stage 2 - for a confirmed Stage 1 survivor, finds this SAME
+    player's own real past games (any season available in player_stats_df)
+    specifically against OTHER real teams that ALSO meaningfully use this
+    same real coverage type - not just games vs tonight's exact opponent.
+    Checks how many of those specific real games actually cleared the
+    entered real line. Reuses the same rank-based qualification already
+    established and tested in calc_original_method_match_nfl, for
+    consistency with Stage 1's own definition of "meaningfully used."
+    """
+    similar_teams_full = [
+        team_full for team_full, profile in bundle.def_coverage.items()
+        if profile.ranks.get(coverage_field, 999) <= COVERAGE_RANK_THRESHOLD
+        and team_full != exclude_team_full
+    ]
+    similar_abbrevs = {abbr for abbr, full in TEAM_ABBREV_TO_FULL.items() if full in similar_teams_full}
+    if not similar_abbrevs:
+        return {"usable": False, "reason": "no other real teams meaningfully use this same coverage"}
+
+    stat_col = NFL_PROP_STAT_COLUMN.get(prop_type, prop_type)
+    games = player_stats_df[
+        (player_stats_df["gsis_id"] == gsis_id)
+        & (player_stats_df["opponent_team"].isin(similar_abbrevs))
+    ]
+    if games.empty or stat_col not in games.columns:
+        return {"usable": False, "reason": "no real past games found vs similar-tendency defenses"}
+
+    values = games[stat_col].dropna()
+    if values.empty:
+        return {"usable": False, "reason": "no real stat values found in those specific games"}
+
+    hits = int((values >= line).sum())
+    total = len(values)
+    return {
+        "usable": True, "hits": hits, "total": total,
+        "hit_rate": round(hits / total, 3) if total else None,
+        "read": f"{hits}/{total} real past games vs similar-tendency defenses cleared {line}",
+    }
+
+
+def get_rb_dominant_concept(rb_bundle: RBDataBundle, rb_name: str):
+    """Real, direct lookup of this RB's dominant real run concept, by
+    real attempt volume (ATT) across the 6 tracked concepts."""
+    att_by_concept = {}
+    for concept in CONCEPT_FILES:
+        row = rb_bundle.rb_vs_concept.get(concept, {}).get(rb_name)
+        if row is not None:
+            att = _to_float(row.get("ATT")) or 0
+            if att > 0:
+                att_by_concept[concept] = att
+    if not att_by_concept:
+        return None
+    return max(att_by_concept, key=att_by_concept.get)
+
+
+NFL_PROP_STAT_COLUMN_RUSH = {
+    "rush_yards": "rushing_yards", "longest_rush": "rushing_yards",  # honest approximation, same as longest_reception
+}
+
+
+def scan_stage1_rush_survivors(rb_bundle: RBDataBundle, week_rosters: pd.DataFrame,
+                                 opponent_by_team: dict, prop_types: list = None,
+                                 min_percentile: float = 66.7) -> pd.DataFrame:
+    """
+    Real, automated Stage 1 scan for rush-concept props - for every real
+    RB on tonight's slate, finds his dominant real run concept, checks
+    whether his own real efficiency in that concept is genuinely strong
+    (top-third percentile of the real, current RB population, using the
+    same RB_CONCEPT_STATS_BY_PROP metric set already established for the
+    specific prop) AND whether tonight's specific real opponent is
+    genuinely weak defending that same concept (bottom-third percentile
+    allowed - same pool direction, since both "own strength" and "defense
+    allowed" use higher-is-more real efficiency metrics here). Both sides
+    must match - survives only if his own strength AND the real matchup
+    weakness both hold, same real two-sided logic already read back and
+    confirmed this session.
+    """
+    prop_types = prop_types or ["rush_yards", "longest_rush"]
+    survivors = []
+
+    rb_rows = week_rosters[week_rosters["position"] == "RB"]
+    for _, pr in rb_rows.iterrows():
+        rb_name = pr.get("full_name") or pr.get("player_display_name")
+        team_full = TEAM_ABBREV_TO_FULL_RB.get(pr.get("team"), pr.get("team"))
+        opponent_full = opponent_by_team.get(team_full)
+        if not rb_name or not opponent_full:
+            continue
+
+        dominant_concept = get_rb_dominant_concept(rb_bundle, rb_name)
+        if dominant_concept is None:
+            continue
+        own_row = rb_bundle.rb_vs_concept.get(dominant_concept, {}).get(rb_name)
+        def_row = rb_bundle.def_allowed.get(dominant_concept, {}).get(opponent_full)
+        if own_row is None or def_row is None:
+            continue
+
+        for prop_type in prop_types:
+            stats_config = RB_CONCEPT_STATS_BY_PROP.get(prop_type, RB_CONCEPT_DEFAULT_STATS)
+            if isinstance(stats_config, dict):
+                metric_names = [mn for bucket in stats_config.values() for mn in bucket]
+            else:
+                metric_names = list(stats_config) if isinstance(stats_config, (list, tuple)) else [stats_config]
+
+            own_pop = pd.Series([
+                _to_float(rb_bundle.rb_vs_concept.get(dominant_concept, {}).get(other, {}).get(mn))
+                for other in rb_bundle.rb_vs_concept.get(dominant_concept, {})
+                for mn in metric_names
+            ]).dropna()
+            def_pop = pd.Series([
+                _to_float(rb_bundle.def_allowed.get(dominant_concept, {}).get(other, {}).get(mn))
+                for other in rb_bundle.def_allowed.get(dominant_concept, {})
+                for mn in metric_names
+            ]).dropna()
+
+            own_values = [_to_float(own_row.get(mn)) for mn in metric_names if _to_float(own_row.get(mn)) is not None]
+            def_values = [_to_float(def_row.get(mn)) for mn in metric_names if _to_float(def_row.get(mn)) is not None]
+            if not own_values or not def_values or own_pop.empty or def_pop.empty:
+                continue
+
+            own_pct = calc_percentile_grade(sum(own_values) / len(own_values), own_pop)
+            def_pct = calc_percentile_grade(sum(def_values) / len(def_values), def_pop)
+            if pd.isna(own_pct) or pd.isna(def_pct):
+                continue
+
+            own_strong = own_pct >= min_percentile
+            def_weak = def_pct >= min_percentile  # higher allowed value = worse defense, same pool direction as own strength
+            if own_strong and def_weak:
+                survivors.append({
+                    "gsis_id": pr.get("gsis_id"), "player": rb_name,
+                    "team": pr.get("team"), "opponent": opponent_full,
+                    "position": "RB", "prop_type": prop_type,
+                    "dominant_concept": dominant_concept,
+                    "own_percentile": own_pct, "defense_allowed_percentile": def_pct,
+                    "read": f"Elite in {dominant_concept} ({own_pct:.0f}th pct) vs a defense that's genuinely "
+                            f"weak defending it ({def_pct:.0f}th pct allowed).",
+                })
+
+    return pd.DataFrame(survivors)
+
+
+def stage2_rush_cross_reference(gsis_id: str, prop_type: str, concept: str,
+                                  rb_bundle: RBDataBundle, line: float,
+                                  player_stats_df: pd.DataFrame, exclude_team_full: str = None) -> dict:
+    """
+    Real Stage 2 for a rush-concept survivor - finds this SAME RB's own
+    real past games against OTHER real defenses that were ALSO genuinely
+    weak against this same real concept (top-third percentile allowed,
+    same bar Stage 1 used), and checks his real hit rate against the
+    entered line in those specific games.
+    """
+    stats_config = RB_CONCEPT_STATS_BY_PROP.get(prop_type, RB_CONCEPT_DEFAULT_STATS)
+    if isinstance(stats_config, dict):
+        metric_names = stats_config.get("raw_efficiency", ["YPC"])
+    else:
+        metric_names = list(stats_config) if isinstance(stats_config, (list, tuple)) else [stats_config]
+    def_pop = pd.Series([
+        _to_float(row.get(mn))
+        for row in rb_bundle.def_allowed.get(concept, {}).values()
+        for mn in metric_names
+    ]).dropna()
+    if def_pop.empty:
+        return {"usable": False, "reason": "no real comparison population for this concept"}
+
+    weak_teams_full = []
+    for team_full, row in rb_bundle.def_allowed.get(concept, {}).items():
+        if team_full == exclude_team_full:
+            continue
+        vals = [_to_float(row.get(mn)) for mn in metric_names if _to_float(row.get(mn)) is not None]
+        if not vals:
+            continue
+        pct = calc_percentile_grade(sum(vals) / len(vals), def_pop)
+        if pd.notna(pct) and pct >= 66.7:
+            weak_teams_full.append(team_full)
+
+    weak_abbrevs = {abbr for abbr, full in TEAM_ABBREV_TO_FULL_RB.items() if full in weak_teams_full}
+    if not weak_abbrevs:
+        return {"usable": False, "reason": "no other real teams found weak against this concept"}
+
+    stat_col = NFL_PROP_STAT_COLUMN_RUSH.get(prop_type, prop_type)
+    games = player_stats_df[
+        (player_stats_df["gsis_id"] == gsis_id)
+        & (player_stats_df["opponent_team"].isin(weak_abbrevs))
+    ]
+    if games.empty or stat_col not in games.columns:
+        return {"usable": False, "reason": "no real past games found vs similar-tendency defenses"}
+
+    values = games[stat_col].dropna()
+    if values.empty:
+        return {"usable": False, "reason": "no real stat values found in those specific games"}
+
+    hits = int((values >= line).sum())
+    total = len(values)
+    return {
+        "usable": True, "hits": hits, "total": total,
+        "hit_rate": round(hits / total, 3) if total else None,
+        "read": f"{hits}/{total} real past games vs similar-tendency defenses cleared {line}",
+    }
