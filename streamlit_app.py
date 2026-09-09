@@ -65,6 +65,8 @@ from nfl_model_combined import (
     build_defense_coverage_tendency_profile, calc_original_method_match_nfl,
     rescore_via_direct_hit_rate, build_rb_concept_usage_ranks,
     calc_original_method_match_nfl_for_prop, NFL_PROP_ORIGINAL_METHOD_STATS, _to_float,
+    TEAM_ABBREV_TO_FULL_RB, scan_stage1_pass_catch_survivors, scan_stage1_rush_survivors,
+    stage2_pass_catch_cross_reference, stage2_rush_cross_reference,
 )
 from draft_rankings import (
     build_yahoo_style_rankings, detect_risers, build_league_settings,
@@ -425,7 +427,7 @@ with st.expander("🔍 Debug: Check for real receiver alignment data (wide/slot/
 
 mode = st.radio(
     "Mode",
-    ["Season Backtest", "Weekly Scan / Draft Rankings", "Coverage Matchup (premium data)"],
+    ["Weekly Scan / Draft Rankings", "Season Backtest", "Coverage Matchup (premium data)"],
     horizontal=True,
     help="Renamed for real, honest clarity (previously 'Scan (adjustable lines)' and "
          "'Draft Rankings', which didn't reflect what's actually inside either one). "
@@ -580,6 +582,22 @@ else:
 
     st.divider()
 
+    # REAL FIX (confirmed bug, found via direct user report) - the main
+    # scan silently ran with ZERO coverage data whenever the separate
+    # "Load coverage dataset" button (in a different section of the app)
+    # hadn't been clicked first - no error, no warning, just a
+    # degraded result that looked complete but wasn't (every coverage
+    # column blank, mu never actually coverage-adjusted). This is a
+    # loud, impossible-to-miss warning right where the scan button
+    # lives, instead of a silent gap discovered only after the fact.
+    if st.session_state.get("coverage_bundle") is None:
+        st.warning(
+            "⚠️ Coverage dataset not loaded yet - scanning now will run WITHOUT any coverage "
+            "data (every coverage-related column will be blank, and mu won't get the real, "
+            "direct coverage adjustment). Scroll to the 'Coverage data folder' section further "
+            "down, click 'Load coverage dataset' there first, then come back and scan."
+        )
+
     button_label = "Scan full slate"
 
     if st.button(button_label, type="primary"):
@@ -605,6 +623,133 @@ else:
             except Exception as e:
                 st.error(f"{'Backtest' if mode.startswith('Backtest') else 'Scan'} failed: {e}")
                 st.session_state.slate_df = None
+
+    st.divider()
+    st.header("🎯 Stage 1 / Stage 2 - Coverage & Concept Survivors")
+    st.caption(
+        "Stage 1: scans the WHOLE real slate at once - does this player's own real "
+        "performance clear the bar on a real MAJORITY of tonight's specific opponent's "
+        "meaningfully-used coverages (pass/pass-catching props), or is this RB elite in "
+        "his own dominant run concept AND facing a real defense that's genuinely weak "
+        "defending that same concept (rush props)? No line needed yet - this just finds "
+        "who has a genuinely high-quality real mu. Stage 2: once you enter a real line for "
+        "a survivor, finds that SAME player's own real past games against OTHER teams that "
+        "also share that same real tendency, and shows how many of those specific games "
+        "actually cleared your line - a real '8/12' style read."
+    )
+
+    if st.session_state.get("coverage_bundle") is None or st.session_state.get("rb_bundle") is None:
+        st.warning(
+            "⚠️ Needs BOTH the coverage dataset AND the RB concept dataset loaded first "
+            "(scroll down to their sections) - Stage 1 can't run without either one."
+        )
+    elif st.button("Scan Stage 1 Survivors", key="stage1_scan_btn"):
+        with st.spinner("Scanning the whole real slate for coverage & concept survivors..."):
+            try:
+                schedules_df = pull_schedules([season])
+                games_df = build_week_games_list(season, week, schedules_df)
+                opponent_by_team_pc = {}
+                opponent_by_team_rush = {}
+                for _, g in games_df.iterrows():
+                    away_pc = TEAM_ABBREV_TO_FULL.get(g["away_team"], g["away_team"])
+                    home_pc = TEAM_ABBREV_TO_FULL.get(g["home_team"], g["home_team"])
+                    opponent_by_team_pc[away_pc] = home_pc
+                    opponent_by_team_pc[home_pc] = away_pc
+                    away_rb = TEAM_ABBREV_TO_FULL_RB.get(g["away_team"], g["away_team"])
+                    home_rb = TEAM_ABBREV_TO_FULL_RB.get(g["home_team"], g["home_team"])
+                    opponent_by_team_rush[away_rb] = home_rb
+                    opponent_by_team_rush[home_rb] = away_rb
+
+                rosters_df = pull_rosters([season])
+                week_rosters_df = rosters_df[rosters_df["position"].isin(["QB", "RB", "WR", "TE"])].drop_duplicates("gsis_id")
+
+                pc_survivors = scan_stage1_pass_catch_survivors(
+                    st.session_state.coverage_bundle, week_rosters_df, opponent_by_team_pc,
+                )
+                rush_survivors = scan_stage1_rush_survivors(
+                    st.session_state.rb_bundle, week_rosters_df, opponent_by_team_rush,
+                )
+                st.session_state.stage1_pc_survivors = pc_survivors
+                st.session_state.stage1_rush_survivors = rush_survivors
+                st.success(
+                    f"Stage 1 complete - {len(pc_survivors)} pass/pass-catching survivors, "
+                    f"{len(rush_survivors)} rush-concept survivors."
+                )
+            except Exception as e:
+                st.error(f"Stage 1 scan failed: {e}")
+
+    pc_survivors = st.session_state.get("stage1_pc_survivors")
+    rush_survivors = st.session_state.get("stage1_rush_survivors")
+
+    if (pc_survivors is not None and not pc_survivors.empty) or (rush_survivors is not None and not rush_survivors.empty):
+        st.subheader("Stage 1 survivors")
+        if pc_survivors is not None and not pc_survivors.empty:
+            st.write("Pass / pass-catching")
+            st.dataframe(
+                pc_survivors[["player", "team", "opponent", "prop_type", "coverages_qualifying", "coverages_scored", "read"]],
+                width="stretch", hide_index=True,
+            )
+        if rush_survivors is not None and not rush_survivors.empty:
+            st.write("Rush concept")
+            st.dataframe(
+                rush_survivors[["player", "team", "opponent", "prop_type", "dominant_concept",
+                                 "own_percentile", "defense_allowed_percentile", "read"]],
+                width="stretch", hide_index=True,
+            )
+
+        st.subheader("Stage 2 - enter a real line for any survivor above")
+        stage2_col1, stage2_col2, stage2_col3 = st.columns(3)
+        with stage2_col1:
+            all_survivor_names = []
+            if pc_survivors is not None and not pc_survivors.empty:
+                all_survivor_names += (pc_survivors["player"] + " - " + pc_survivors["prop_type"]).tolist()
+            if rush_survivors is not None and not rush_survivors.empty:
+                all_survivor_names += (rush_survivors["player"] + " - " + rush_survivors["prop_type"]).tolist()
+            stage2_pick = st.selectbox("Survivor", all_survivor_names, key="stage2_pick") if all_survivor_names else None
+        with stage2_col2:
+            stage2_line = st.number_input("Real line", min_value=0.0, value=50.0, step=0.5, key="stage2_line")
+        with stage2_col3:
+            stage2_years_back = st.number_input("Seasons of history to check", min_value=1, max_value=5, value=2, key="stage2_years")
+
+        if stage2_pick and st.button("Run Stage 2 cross-reference", key="stage2_run_btn"):
+            with st.spinner("Cross-referencing real past games..."):
+                try:
+                    player_name_picked, prop_picked = stage2_pick.rsplit(" - ", 1)
+                    player_stats_hist = pull_player_stats(list(range(season - stage2_years_back, season)))
+
+                    pc_match = pc_survivors[
+                        (pc_survivors["player"] == player_name_picked) & (pc_survivors["prop_type"] == prop_picked)
+                    ] if pc_survivors is not None and not pc_survivors.empty else pd.DataFrame()
+                    rush_match = rush_survivors[
+                        (rush_survivors["player"] == player_name_picked) & (rush_survivors["prop_type"] == prop_picked)
+                    ] if rush_survivors is not None and not rush_survivors.empty else pd.DataFrame()
+
+                    if not pc_match.empty:
+                        row = pc_match.iloc[0]
+                        team_full = TEAM_ABBREV_TO_FULL.get(row["team"], row["team"])
+                        result = stage2_pass_catch_cross_reference(
+                            row["gsis_id"], row["prop_type"], row["qualifying_coverage_fields"][0],
+                            st.session_state.coverage_bundle, stage2_line, player_stats_hist,
+                            exclude_team_full=team_full,
+                        )
+                    elif not rush_match.empty:
+                        row = rush_match.iloc[0]
+                        team_full = TEAM_ABBREV_TO_FULL_RB.get(row["team"], row["team"])
+                        result = stage2_rush_cross_reference(
+                            row["gsis_id"], row["prop_type"], row["dominant_concept"],
+                            st.session_state.rb_bundle, stage2_line, player_stats_hist,
+                            exclude_team_full=team_full,
+                        )
+                    else:
+                        result = {"usable": False, "reason": "survivor not found - try re-running Stage 1"}
+
+                    if result.get("usable"):
+                        st.success(result["read"])
+                        st.metric("Real hit rate", f"{result['hits']}/{result['total']}", f"{result['hit_rate']*100:.0f}%")
+                    else:
+                        st.warning(result.get("reason", "Not usable."))
+                except Exception as e:
+                    st.error(f"Stage 2 cross-reference failed: {e}")
 
 
 # -----------------------------------------------------------------------
