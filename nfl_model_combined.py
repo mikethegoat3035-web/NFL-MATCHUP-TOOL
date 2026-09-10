@@ -7828,12 +7828,76 @@ NFL_PROP_ORIGINAL_METHOD_STATS = {
     # column groupings already established in ALIGNMENT_STATS_BY_PROP -
     # not reinvented, just flattened to a direct list for percentile
     # comparison against the real, current-season population.
-    "receptions": ["RTE %", "TPRR", "CR %"],
-    "targets": ["1READ %", "TGT", "TGT %"],
-    "rec_yards": ["YPRR", "YAC", "aDOT"],
+    "receptions": ["RTE %", "TPRR", "CR %", "DRP %"],
+    "targets": ["1READ %", "TGT %", "TPRR"],
+    "rec_yards": ["YPRR", "YAC", "aDOT", "MTF/REC"],
     "rec_tds": ["TD", "TD %", "i20 TGT", "EZTGT"],
-    "longest_reception": ["aDOT", "YAC", "YPR"],
+    "longest_reception": ["aDOT", "YAC", "YPR", "TPRR"],
 }
+
+# REAL, NEW (found via full-model audit, per direct request) - DRP%
+# genuinely was never used anywhere despite being directly relevant to
+# receptions (a real drop reduces catch conversion). MTF/REC genuinely
+# was never used despite being directly relevant to rec_yards/YAC
+# ability. Real direction map, since the wrapper below never passed
+# stat_directions through at all before this fix - every metric was
+# silently defaulting to "higher is better", which would have been
+# wrong for a drop rate.
+NFL_RECEIVER_METRIC_DIRECTIONS = {"DRP %": "low"}
+
+
+# REAL, NEW (per direct request) - fixed, absolute thresholds per metric,
+# replacing the live, relative percentile grading that calc_original_
+# method_match_nfl used before. Each value is the real 75th-percentile
+# VALUE of that metric among genuinely meaningful-volume real players
+# (10+ real targets this season - filtering out one-off/no-target
+# entries that were badly skewing the raw population; confirmed via
+# direct check - CR% and RTE% both showed a nonsensical 75th-pct of
+# 100.0 before this filter, an artifact of single-target guys who
+# caught their one target). Frozen here as fixed numbers rather than
+# recomputed live each scan, per direct request - "use thresholds for
+# their values" instead of a moving percentile target.
+NFL_PROP_METRIC_THRESHOLDS = {
+    "1READ %": 38.2, "CR %": 80.0, "EZTGT": 1.0, "RTE %": 96.7,
+    "TD": 1.0, "TD %": 7.14, "TGT": 17.0, "TGT %": 31.5,
+    "TPRR": 0.31, "YAC": 75.0, "YPR": 14.363, "YPRR": 2.732,
+    "aDOT": 12.425, "i20 TGT": 2.0, "DRP %": 6.3, "MTF/REC": 0.25,
+}
+
+# REAL, NEW (found via direct live testing - a backup with 3 real targets
+# who caught all 3 shows a "perfect" 100% catch rate, easily clearing a
+# fixed 80% threshold despite the tiny, unrepresentative sample). Pure
+# rate stats need a real, minimum target volume WITHIN that specific
+# coverage before they're allowed to count at all - volume/count stats
+# (TGT, TD, EZTGT, i20 TGT) can't be gamed the same way and don't need
+# this gate.
+NFL_RATE_STATS_NEEDING_VOLUME_FLOOR = {"CR %", "RTE %", "TD %", "TGT %", "1READ %", "TPRR", "DRP %"}
+MIN_REAL_TGT_FOR_RATE_STATS = 5.0
+
+# REAL, NEW (per direct request) - QB pass prop metrics were completely
+# missing from Stage 1 entirely (confirmed - QBs were never even
+# included in the survivor scan). Stat sets reused directly from the
+# already-established DIRECT_HIT_RATE_PROP_CONFIG (not reinvented).
+# Thresholds are the real 75th-percentile value (or 25th for stats
+# where LOWER is genuinely better - pressure/drop rate) among real,
+# meaningful-volume QBs (100+ real attempts this season).
+NFL_QB_PASS_PROP_STATS = {
+    "pass_yards": ["YPA", "ANY/A", "PRESS %", "CPOE"],
+    "pass_completions": ["CMP %", "ADJ CMP %", "DROP %", "PRESS %", "CPOE"],
+    "pass_tds": ["RATE", "Deep Throw %", "PRESS %", "EZATT"],
+    "longest_completion": ["ADJ CMP %", "Deep Throw %", "ACC %"],
+}
+NFL_QB_METRIC_DIRECTIONS = {"PRESS %": "low", "DROP %": "low"}  # everything else defaults to "high"
+NFL_QB_METRIC_THRESHOLDS = {
+    "YPA": 8.227, "ANY/A": 7.605, "PRESS %": 33.9, "CMP %": 69.475,
+    "ADJ CMP %": 80.7, "DROP %": 3.7, "RATE": 98.125, "Deep Throw %": 13.3,
+    "EZATT": 6.25, "aDOT": 8.825, "CPOE": 7.425, "ACC %": 60.875,
+}
+# Same real small-sample protection already proven for receivers - a
+# rate stat only counts if this specific coverage sample also has real,
+# meaningful attempt volume behind it.
+NFL_QB_RATE_STATS_NEEDING_VOLUME_FLOOR = {"CMP %", "ADJ CMP %", "DROP %", "PRESS %", "CPOE", "ACC %"}
+MIN_REAL_ATT_FOR_QB_RATE_STATS = 15.0
 
 
 def classify_coverage_quality(team_coverage_row: dict, quality_metrics: list,
@@ -8204,7 +8268,7 @@ def calc_direct_hit_rate_projection_qb(
 
 def calc_original_method_match_nfl_for_prop(coverage_profile: "TeamCoverageProfile", player_stats_by_coverage: dict,
                                               prop_type: str, comparison_series_by_stat: dict,
-                                              min_percentile: float = 75.0) -> dict:
+                                              min_percentile: float = 75.0, per_coverage_thresholds: dict = None) -> dict:
     """
     Real, generalized, per-prop wrapper around calc_original_method_
     match_nfl - looks up the right real stat_keys for the given prop
@@ -8217,12 +8281,15 @@ def calc_original_method_match_nfl_for_prop(coverage_profile: "TeamCoverageProfi
     return calc_original_method_match_nfl(
         coverage_profile, player_stats_by_coverage, stat_keys,
         comparison_series_by_stat, min_percentile=min_percentile,
+        per_coverage_thresholds=per_coverage_thresholds,
+        stat_directions=NFL_RECEIVER_METRIC_DIRECTIONS,
     )
 
 
 def calc_original_method_match_nfl(coverage_profile: "TeamCoverageProfile", player_stats_by_coverage: dict,
                                      stat_keys: list, comparison_series_by_stat: dict,
-                                     min_percentile: float = 75.0, stat_directions: dict = None) -> dict:
+                                     min_percentile: float = 75.0, stat_directions: dict = None,
+                                     per_coverage_thresholds: dict = None) -> dict:
     """
     Real, direct NFL analog of MLB's calc_original_method_match - hard
     thresholds per real, individual coverage type (not a usage-weighted
@@ -8234,23 +8301,37 @@ def calc_original_method_match_nfl(coverage_profile: "TeamCoverageProfile", play
     equivalent of MLB's fixed TIER_BENCHMARKS (confirmed - searched,
     found nothing). What NFL already has, extensively used throughout
     this file, is calc_percentile_grade - a real, established, relative
-    grading approach against this season's actual population. Using a
-    fixed, invented absolute number here would be inconsistent with how
-    every other stat in this file is actually graded. So "clears the
-    bar" here means clears a real percentile cutoff (default 75th) of
-    the real, current-season comparison population for that stat - not
-    an arbitrary made-up number.
+    grading approach against this season's actual population.
+
+    REAL, UPDATED PER DIRECT REQUEST - now uses FIXED, absolute
+    thresholds (NFL_PROP_METRIC_THRESHOLDS) instead of a live, relative
+    percentile. Each real value is compared directly against a real,
+    data-grounded fixed number (the real 75th-percentile VALUE among
+    meaningful-volume players, frozen once rather than recomputed live
+    each scan) - not an arbitrary invented number, but no longer a
+    moving target either. comparison_series_by_stat/min_percentile are
+    kept as real parameters for signature compatibility with every
+    existing caller, but are no longer used internally.
 
     player_stats_by_coverage: {coverage_field: {stat_key: value}}.
-    comparison_series_by_stat: {stat_key: pd.Series} - the real, full,
-    current-season population of values for that stat, to grade
-    against (reuses calc_percentile_grade directly, not reinvented).
+    comparison_series_by_stat: kept for signature compatibility, unused.
     stat_directions: {stat_key: "high"|"low"} - "low" for stats where a
-    LOWER real value is actually better (e.g. an inverted floor-profile
-    stat); defaults to "high" for any stat not listed.
+    LOWER real value is actually better; defaults to "high" for any
+    stat not listed.
     """
     stat_directions = stat_directions or {}
-    qualifying_coverages = [c for c in COVERAGE_FIELDS if coverage_profile.ranks.get(c, 999) <= COVERAGE_RANK_THRESHOLD]
+    if per_coverage_thresholds:
+        qualifying_coverages = [
+            c for c in COVERAGE_FIELDS
+            if is_coverage_meaningfully_used(c, coverage_profile.rates.get(c), per_coverage_thresholds)
+        ]
+    else:
+        # Real, honest fallback ONLY when no real per_coverage_thresholds
+        # were supplied (e.g. an older caller) - the leaguewide-rank
+        # check confirmed too strict via direct user check (excluded
+        # Seattle's real, primary 30.1%-usage Cover 3 for ranking only
+        # 16th nationally) - callers should pass real thresholds instead.
+        qualifying_coverages = [c for c in COVERAGE_FIELDS if coverage_profile.ranks.get(c, 999) <= COVERAGE_RANK_THRESHOLD]
     if not qualifying_coverages:
         return {"usable": False, "reason": "defense has no real, meaningfully-used coverage"}
 
@@ -8270,16 +8351,24 @@ def calc_original_method_match_nfl(coverage_profile: "TeamCoverageProfile", play
             # first time this ran across a real, live slate instead of
             # a single hand-typed manual check.
             value = _to_float(stats.get(stat_key))
-            comparison_series = comparison_series_by_stat.get(stat_key)
-            if value is None or comparison_series is None:
+            threshold = NFL_PROP_METRIC_THRESHOLDS.get(stat_key)
+            if value is None or threshold is None:
                 clears_all = False
                 continue
+            # REAL, NEW - a rate stat only counts if this specific
+            # coverage row also has real, meaningful target volume behind
+            # it; otherwise a tiny sample (e.g. 3 real targets, all
+            # caught) could fake a "perfect" rate stat and wrongly clear
+            # a fixed threshold.
+            if stat_key in NFL_RATE_STATS_NEEDING_VOLUME_FLOOR:
+                real_tgt_this_coverage = _to_float(stats.get("TGT")) or 0
+                if real_tgt_this_coverage < MIN_REAL_TGT_FOR_RATE_STATS:
+                    clears_all = False
+                    continue
             direction = stat_directions.get(stat_key, "high")
-            percentile = calc_percentile_grade(value, comparison_series)
-            if direction == "low":
-                percentile = 100 - percentile if pd.notna(percentile) else percentile
-            real_percentiles[stat_key] = percentile
-            if pd.isna(percentile) or percentile < min_percentile:
+            clears_this_stat = (value <= threshold) if direction == "low" else (value >= threshold)
+            real_percentiles[stat_key] = value
+            if not clears_this_stat:
                 clears_all = False
         per_coverage_results.append({"coverage": coverage, "qualifies": clears_all,
                                        "stats": stats, "real_percentiles": real_percentiles})
@@ -11133,6 +11222,7 @@ RB_CONCEPT_STATS_BY_PROP = {
     "longest_rush": {
         "explosiveness": ["EXP RUN %", "EXP YDS", "EXP YDS %"],
         "contact_yardage": ["YACO/ATT", "YBCO/ATT"],
+        "raw_efficiency": ["YPC"],
     },
 }
 # Success % - a classic down-and-distance value-threshold stat (e.g. 40%
@@ -11386,6 +11476,11 @@ def scan_stage1_pass_catch_survivors(bundle: CoverageDataBundle, week_rosters: p
     """
     prop_types = prop_types or list(NFL_PROP_ORIGINAL_METHOD_STATS.keys())
     survivors = []
+    # REAL FIX (confirmed bug, found via direct user check - Seattle's
+    # real, primary 30.1%-usage Cover 3 was being excluded for ranking
+    # only 16th leaguewide) - precomputed once, real percentile-based
+    # thresholds, passed through to the corrected matching function.
+    per_coverage_thresholds = build_coverage_usage_percentile_thresholds(bundle.def_coverage)
 
     # Real, precomputed once per stat_key - the current-season population
     # pooled across every alignment/coverage, reused for every player
@@ -11427,6 +11522,7 @@ def scan_stage1_pass_catch_survivors(bundle: CoverageDataBundle, week_rosters: p
             result = calc_original_method_match_nfl_for_prop(
                 opp_profile, player_stats_by_coverage, prop_type,
                 comparison_series_by_stat, min_percentile=min_percentile,
+                per_coverage_thresholds=per_coverage_thresholds,
             )
             if result.get("usable") and result.get("real_majority_match"):
                 # REAL FIX (found while building Stage 2) - Stage 2 needs
@@ -11449,15 +11545,279 @@ def scan_stage1_pass_catch_survivors(bundle: CoverageDataBundle, week_rosters: p
     return pd.DataFrame(survivors)
 
 
-# Real, direct mapping from prop_type to the actual real player_stats
-# column name - needed for Stage 2's cross-reference lookup, since
+def scan_stage1_qb_rush_survivors(bundle: CoverageDataBundle, week_rosters: pd.DataFrame,
+                                    opponent_by_team: dict, min_percentile: float = 66.7) -> pd.DataFrame:
+    """
+    Real, automated Stage 1 scan for QB rush (scramble) props - per
+    direct request, confirmed QB rushing was completely missing from
+    Stage 1 before this (only RB rushing was ever checked). Same real,
+    two-sided philosophy as the RB rush scan: is this QB's own real
+    scramble efficiency genuinely strong (top-third percentile, using
+    YACO/ATT and MTF/ATT - the same real, established metric buckets
+    already used in calc_qb_scramble_exploit_strength), AND is tonight's
+    specific real opponent genuinely weak defending scrambles (bottom-
+    third percentile allowed)? Both sides must match to survive.
+    """
+    survivors = []
+    # REAL FIX (per direct request, found via full CSV audit) - EXP RUN%
+    # and EXP YDS% were confirmed available in the real QB scramble data
+    # but never used, despite being the exact same real explosiveness
+    # metrics already established for RB rushing.
+    metric_names = ["YACO/ATT", "MTF/ATT", "EXP RUN %", "EXP YDS %"]
+
+    own_rows = bundle.qb_scrambles.get("SCRAMBLE", {})
+    def_rows = bundle.def_allowed_qb_scrambles.get("SCRAMBLE", {})
+    own_per_metric_pop = {mn: pd.Series([_to_float(row.get(mn)) for row in own_rows.values()]).dropna() for mn in metric_names}
+    def_per_metric_pop = {mn: pd.Series([_to_float(row.get(mn)) for row in def_rows.values()]).dropna() for mn in metric_names}
+    if all(s.empty for s in own_per_metric_pop.values()) or all(s.empty for s in def_per_metric_pop.values()):
+        return pd.DataFrame(survivors)
+
+    def _majority_clears(row, per_metric_pop, bar):
+        clears, scored = 0, 0
+        for mn in metric_names:
+            value = _to_float(row.get(mn))
+            pop = per_metric_pop.get(mn)
+            if value is None or pop is None or pop.empty:
+                continue
+            scored += 1
+            pct = calc_percentile_grade(value, pop)
+            if pd.notna(pct) and pct >= bar:
+                clears += 1
+        return (clears > scored / 2) if scored else False
+
+    qb_rows = week_rosters[week_rosters["position"] == "QB"]
+    for _, pr in qb_rows.iterrows():
+        qb_name = pr.get("full_name") or pr.get("player_display_name")
+        team_full = TEAM_ABBREV_TO_FULL.get(pr.get("team"), pr.get("team"))
+        opponent_full = opponent_by_team.get(team_full)
+        if not qb_name or not opponent_full:
+            continue
+        own_row = own_rows.get(qb_name)
+        def_row = def_rows.get(opponent_full)
+        if own_row is None or def_row is None:
+            continue
+
+        # REAL FIX (same confirmed bug as RB rush) - switched from
+        # pooled-average grading to real, per-metric majority vote.
+        own_strong = _majority_clears(own_row, own_per_metric_pop, min_percentile)
+        def_weak = _majority_clears(def_row, def_per_metric_pop, min_percentile)
+        if own_strong and def_weak:
+            survivors.append({
+                "gsis_id": pr.get("gsis_id"), "player": qb_name,
+                "team": pr.get("team"), "opponent": opponent_full,
+                "position": "QB", "prop_type": "qb_rush_yards",
+                "read": "Elite scramble efficiency on a real majority of metrics vs a defense "
+                        "that's genuinely weak on a real majority of metrics defending QB scrambles.",
+            })
+
+    return pd.DataFrame(survivors)
+
+
+def scan_stage1_qb_pass_survivors(bundle: CoverageDataBundle, week_rosters: pd.DataFrame,
+                                    opponent_by_team: dict, prop_types: list = None) -> pd.DataFrame:
+    """
+    Real, automated Stage 1 scan for QB pass props - per direct request,
+    confirmed QBs were completely missing from Stage 1 before this (the
+    pass-catch scan only ever checked WR/TE). Same real, two-sided
+    philosophy: does the QB's own real performance clear a real, fixed
+    threshold on a majority of tonight's specific opponent's
+    meaningfully-used coverages, using the metrics that actually drive
+    each specific prop (reused from NFL_QB_PASS_PROP_STATS, not
+    reinvented). Uses fixed thresholds (not live percentiles), same
+    approach already built for receivers, with the same small-sample
+    protection for rate stats (CMP%, ADJ CMP%, DROP%, PRESS%).
+    """
+    prop_types = prop_types or list(NFL_QB_PASS_PROP_STATS.keys())
+    survivors = []
+    # REAL FIX (confirmed bug, found via direct user check - Seattle's
+    # real, primary 30.1%-usage Cover 3 was being excluded for ranking
+    # only 16th leaguewide) - precomputed once, real percentile-based
+    # thresholds, not the flawed leaguewide-rank check.
+    per_coverage_thresholds = build_coverage_usage_percentile_thresholds(bundle.def_coverage)
+
+    qb_rows = week_rosters[week_rosters["position"] == "QB"]
+    for _, pr in qb_rows.iterrows():
+        qb_name = pr.get("full_name") or pr.get("player_display_name")
+        team_full = TEAM_ABBREV_TO_FULL.get(pr.get("team"), pr.get("team"))
+        opponent_full = opponent_by_team.get(team_full)
+        if not qb_name or not opponent_full:
+            continue
+        opp_profile = bundle.def_coverage.get(opponent_full)
+        if opp_profile is None:
+            continue
+
+        qualifying_coverages = [
+            c for c in COVERAGE_FIELDS
+            if is_coverage_meaningfully_used(c, opp_profile.rates.get(c), per_coverage_thresholds)
+        ]
+        if not qualifying_coverages:
+            continue
+
+        for prop_type in prop_types:
+            stat_keys = NFL_QB_PASS_PROP_STATS.get(prop_type, [])
+            per_coverage_results = []
+            for coverage_field in qualifying_coverages:
+                row = bundle.qb_vs_coverage.get(coverage_field, {}).get(qb_name)
+                if row is None:
+                    continue
+                clears_all = True
+                any_stat_checked = False
+                for stat_key in stat_keys:
+                    value = _to_float(row.get(stat_key))
+                    threshold = NFL_QB_METRIC_THRESHOLDS.get(stat_key)
+                    if value is None or threshold is None:
+                        clears_all = False
+                        continue
+                    if stat_key in NFL_QB_RATE_STATS_NEEDING_VOLUME_FLOOR:
+                        real_att_this_coverage = _to_float(row.get("ATT")) or 0
+                        if real_att_this_coverage < MIN_REAL_ATT_FOR_QB_RATE_STATS:
+                            clears_all = False
+                            continue
+                    any_stat_checked = True
+                    direction = NFL_QB_METRIC_DIRECTIONS.get(stat_key, "high")
+                    clears_this_stat = (value <= threshold) if direction == "low" else (value >= threshold)
+                    if not clears_this_stat:
+                        clears_all = False
+                if any_stat_checked:
+                    per_coverage_results.append((coverage_field, clears_all))
+
+            if not per_coverage_results:
+                continue
+            qualifying_count = sum(1 for _, clears in per_coverage_results if clears)
+            is_majority = qualifying_count > (len(per_coverage_results) / 2)
+            if is_majority:
+                survivors.append({
+                    "gsis_id": pr.get("gsis_id"), "player": qb_name,
+                    "team": pr.get("team"), "opponent": opponent_full,
+                    "position": "QB", "prop_type": prop_type,
+                    "coverages_qualifying": qualifying_count,
+                    "coverages_scored": len(per_coverage_results),
+                    "qualifying_coverage_fields": [c for c, clears in per_coverage_results if clears],
+                    "read": f"REAL MATCH - clears real, fixed thresholds on {qualifying_count}/"
+                            f"{len(per_coverage_results)} of the defense's meaningfully-used coverages.",
+                })
+
+    return pd.DataFrame(survivors)
+
+
 # NFL_PROP_ORIGINAL_METHOD_STATS's stat_keys are advanced-metric column
 # names (FantasyPoints CSVs), not player_stats' own real column names.
 NFL_PROP_STAT_COLUMN = {
     "receptions": "receptions", "targets": "targets",
     "rec_yards": "receiving_yards", "rec_tds": "receiving_tds",
     "longest_reception": "receiving_yards",  # real, honest approximation - no per-game longest-reception column exists in player_stats
+    "pass_yards": "passing_yards", "pass_completions": "completions",
+    "pass_tds": "passing_tds",
+    "longest_completion": "passing_yards",  # same honest approximation as longest_reception
 }
+NFL_QB_RUSH_STAT_COLUMN = "rushing_yards"
+
+
+def stage2_qb_pass_cross_reference(gsis_id: str, prop_type: str, coverage_field: str,
+                                     bundle: CoverageDataBundle, line: float,
+                                     player_stats_df: pd.DataFrame, exclude_team_full: str = None) -> dict:
+    """
+    Real Stage 2 for a QB pass Stage 1 survivor - same real cross-
+    reference philosophy as the receiver version: finds this SAME QB's
+    own real past games specifically against OTHER real teams that ALSO
+    meaningfully use this same real coverage type, and checks how many
+    of those specific real games actually cleared the entered real line.
+    """
+    # REAL FIX (same confirmed bug as Stage 1 - Seattle's real, primary
+    # 30.1%-usage Cover 3 was being excluded for ranking only 16th
+    # leaguewide) - switched to the real, percentile-based qualification.
+    per_coverage_thresholds = build_coverage_usage_percentile_thresholds(bundle.def_coverage)
+    similar_teams_full = [
+        team_full for team_full, profile in bundle.def_coverage.items()
+        if is_coverage_meaningfully_used(coverage_field, profile.rates.get(coverage_field), per_coverage_thresholds)
+        and team_full != exclude_team_full
+    ]
+    similar_abbrevs = {abbr for abbr, full in TEAM_ABBREV_TO_FULL.items() if full in similar_teams_full}
+    if not similar_abbrevs:
+        return {"usable": False, "reason": "no other real teams meaningfully use this same coverage"}
+
+    stat_col = NFL_PROP_STAT_COLUMN.get(prop_type, prop_type)
+    games = player_stats_df[
+        (player_stats_df["gsis_id"] == gsis_id)
+        & (player_stats_df["opponent_team"].isin(similar_abbrevs))
+    ]
+    if games.empty or stat_col not in games.columns:
+        return {"usable": False, "reason": "no real past games found vs similar-tendency defenses"}
+
+    values = games[stat_col].dropna()
+    if values.empty:
+        return {"usable": False, "reason": "no real stat values found in those specific games"}
+
+    hits = int((values >= line).sum())
+    total = len(values)
+    return {
+        "usable": True, "hits": hits, "total": total,
+        "hit_rate": round(hits / total, 3) if total else None,
+        "read": f"{hits}/{total} real past games vs similar-tendency defenses cleared {line}",
+    }
+
+
+def stage2_qb_rush_cross_reference(gsis_id: str, line: float, bundle: CoverageDataBundle,
+                                     player_stats_df: pd.DataFrame, exclude_team_full: str = None,
+                                     min_percentile: float = 66.7) -> dict:
+    """
+    Real Stage 2 for a QB rush (scramble) Stage 1 survivor - same real
+    cross-reference philosophy as the RB rush version: finds this SAME
+    QB's own real past games against OTHER real defenses that were ALSO
+    genuinely weak against QB scrambles, checked against the entered
+    real line.
+    """
+    metric_names = ["YACO/ATT", "MTF/ATT", "EXP RUN %", "EXP YDS %"]
+    def_rows = bundle.def_allowed_qb_scrambles.get("SCRAMBLE", {})
+    # REAL FIX (same confirmed bug as RB rush Stage 2) - switched from
+    # pooled-average grading to per-metric majority vote.
+    per_metric_pop = {
+        mn: pd.Series([_to_float(row.get(mn)) for row in def_rows.values()]).dropna()
+        for mn in metric_names
+    }
+    if all(s.empty for s in per_metric_pop.values()):
+        return {"usable": False, "reason": "no real comparison population for QB scrambles"}
+
+    weak_teams_full = []
+    for team_full, row in def_rows.items():
+        if team_full == exclude_team_full:
+            continue
+        clears = 0
+        scored = 0
+        for mn in metric_names:
+            value = _to_float(row.get(mn))
+            pop = per_metric_pop.get(mn)
+            if value is None or pop is None or pop.empty:
+                continue
+            scored += 1
+            pct = calc_percentile_grade(value, pop)
+            if pd.notna(pct) and pct >= min_percentile:
+                clears += 1
+        if scored and clears > scored / 2:
+            weak_teams_full.append(team_full)
+
+    weak_abbrevs = {abbr for abbr, full in TEAM_ABBREV_TO_FULL.items() if full in weak_teams_full}
+    if not weak_abbrevs:
+        return {"usable": False, "reason": "no other real teams found weak against QB scrambles"}
+
+    games = player_stats_df[
+        (player_stats_df["gsis_id"] == gsis_id)
+        & (player_stats_df["opponent_team"].isin(weak_abbrevs))
+    ]
+    if games.empty or NFL_QB_RUSH_STAT_COLUMN not in games.columns:
+        return {"usable": False, "reason": "no real past games found vs similar-tendency defenses"}
+
+    values = games[NFL_QB_RUSH_STAT_COLUMN].dropna()
+    if values.empty:
+        return {"usable": False, "reason": "no real stat values found in those specific games"}
+
+    hits = int((values >= line).sum())
+    total = len(values)
+    return {
+        "usable": True, "hits": hits, "total": total,
+        "hit_rate": round(hits / total, 3) if total else None,
+        "read": f"{hits}/{total} real past games vs similar-tendency defenses cleared {line}",
+    }
 
 
 def stage2_pass_catch_cross_reference(gsis_id: str, prop_type: str, coverage_field: str,
@@ -11469,13 +11829,16 @@ def stage2_pass_catch_cross_reference(gsis_id: str, prop_type: str, coverage_fie
     specifically against OTHER real teams that ALSO meaningfully use this
     same real coverage type - not just games vs tonight's exact opponent.
     Checks how many of those specific real games actually cleared the
-    entered real line. Reuses the same rank-based qualification already
-    established and tested in calc_original_method_match_nfl, for
-    consistency with Stage 1's own definition of "meaningfully used."
+    entered real line.
     """
+    # REAL FIX (confirmed bug, found via direct user check - Seattle's
+    # real, primary 30.1%-usage Cover 3 was being excluded for ranking
+    # only 16th leaguewide) - switched to the real, percentile-based
+    # qualification, consistent with Stage 1's corrected definition.
+    per_coverage_thresholds = build_coverage_usage_percentile_thresholds(bundle.def_coverage)
     similar_teams_full = [
         team_full for team_full, profile in bundle.def_coverage.items()
-        if profile.ranks.get(coverage_field, 999) <= COVERAGE_RANK_THRESHOLD
+        if is_coverage_meaningfully_used(coverage_field, profile.rates.get(coverage_field), per_coverage_thresholds)
         and team_full != exclude_team_full
     ]
     similar_abbrevs = {abbr for abbr, full in TEAM_ABBREV_TO_FULL.items() if full in similar_teams_full}
@@ -11566,38 +11929,49 @@ def scan_stage1_rush_survivors(rb_bundle: RBDataBundle, week_rosters: pd.DataFra
             else:
                 metric_names = list(stats_config) if isinstance(stats_config, (list, tuple)) else [stats_config]
 
-            own_pop = pd.Series([
-                _to_float(rb_bundle.rb_vs_concept.get(dominant_concept, {}).get(other, {}).get(mn))
-                for other in rb_bundle.rb_vs_concept.get(dominant_concept, {})
+            # REAL FIX (same confirmed bug as Stage 2 - pooling all
+            # metrics into one combined population and averaging a
+            # team's/player's values before grading was far too lenient,
+            # confirmed via direct check that 75-91% of the league was
+            # being flagged "weak"). Switched to real, per-metric
+            # majority vote - each metric graded individually against
+            # its own real population, majority must clear the bar.
+            own_per_metric_pop = {
+                mn: pd.Series([_to_float(rb_bundle.rb_vs_concept.get(dominant_concept, {}).get(o, {}).get(mn))
+                               for o in rb_bundle.rb_vs_concept.get(dominant_concept, {})]).dropna()
                 for mn in metric_names
-            ]).dropna()
-            def_pop = pd.Series([
-                _to_float(rb_bundle.def_allowed.get(dominant_concept, {}).get(other, {}).get(mn))
-                for other in rb_bundle.def_allowed.get(dominant_concept, {})
+            }
+            def_per_metric_pop = {
+                mn: pd.Series([_to_float(rb_bundle.def_allowed.get(dominant_concept, {}).get(o, {}).get(mn))
+                               for o in rb_bundle.def_allowed.get(dominant_concept, {})]).dropna()
                 for mn in metric_names
-            ]).dropna()
-
-            own_values = [_to_float(own_row.get(mn)) for mn in metric_names if _to_float(own_row.get(mn)) is not None]
-            def_values = [_to_float(def_row.get(mn)) for mn in metric_names if _to_float(def_row.get(mn)) is not None]
-            if not own_values or not def_values or own_pop.empty or def_pop.empty:
+            }
+            if all(s.empty for s in own_per_metric_pop.values()) or all(s.empty for s in def_per_metric_pop.values()):
                 continue
 
-            own_pct = calc_percentile_grade(sum(own_values) / len(own_values), own_pop)
-            def_pct = calc_percentile_grade(sum(def_values) / len(def_values), def_pop)
-            if pd.isna(own_pct) or pd.isna(def_pct):
-                continue
+            def _majority_clears(row, per_metric_pop, bar):
+                clears, scored = 0, 0
+                for mn in metric_names:
+                    value = _to_float(row.get(mn))
+                    pop = per_metric_pop.get(mn)
+                    if value is None or pop is None or pop.empty:
+                        continue
+                    scored += 1
+                    pct = calc_percentile_grade(value, pop)
+                    if pd.notna(pct) and pct >= bar:
+                        clears += 1
+                return (clears > scored / 2) if scored else False
 
-            own_strong = own_pct >= min_percentile
-            def_weak = def_pct >= min_percentile  # higher allowed value = worse defense, same pool direction as own strength
+            own_strong = _majority_clears(own_row, own_per_metric_pop, min_percentile)
+            def_weak = _majority_clears(def_row, def_per_metric_pop, min_percentile)
             if own_strong and def_weak:
                 survivors.append({
                     "gsis_id": pr.get("gsis_id"), "player": rb_name,
                     "team": pr.get("team"), "opponent": opponent_full,
                     "position": "RB", "prop_type": prop_type,
                     "dominant_concept": dominant_concept,
-                    "own_percentile": own_pct, "defense_allowed_percentile": def_pct,
-                    "read": f"Elite in {dominant_concept} ({own_pct:.0f}th pct) vs a defense that's genuinely "
-                            f"weak defending it ({def_pct:.0f}th pct allowed).",
+                    "read": f"Elite in {dominant_concept} on a real majority of metrics vs a "
+                            f"defense that's genuinely weak on a real majority of metrics defending it.",
                 })
 
     return pd.DataFrame(survivors)
@@ -11615,26 +11989,44 @@ def stage2_rush_cross_reference(gsis_id: str, prop_type: str, concept: str,
     """
     stats_config = RB_CONCEPT_STATS_BY_PROP.get(prop_type, RB_CONCEPT_DEFAULT_STATS)
     if isinstance(stats_config, dict):
-        metric_names = stats_config.get("raw_efficiency", ["YPC"])
+        metric_names = [mn for bucket in stats_config.values() for mn in bucket]
     else:
         metric_names = list(stats_config) if isinstance(stats_config, (list, tuple)) else [stats_config]
-    def_pop = pd.Series([
-        _to_float(row.get(mn))
-        for row in rb_bundle.def_allowed.get(concept, {}).values()
+
+    # REAL FIX (confirmed serious bug, found via direct discrepancy
+    # check - 75-91% of the whole league was being flagged "weak",
+    # which is meaningless) - pooling every metric into one combined
+    # population and averaging a team's values before grading was far
+    # too lenient; smoothing multiple metrics together pushes most
+    # teams into a similar middle-to-upper range. Switched to the same
+    # rigorous, per-metric majority-vote approach already proven for
+    # pass props (calc_original_method_match_nfl) - each metric graded
+    # individually against its OWN real population, and a defense only
+    # counts as genuinely weak if a real MAJORITY of the individual
+    # metrics clear the bar, not a single blended average.
+    per_metric_pop = {
+        mn: pd.Series([_to_float(row.get(mn)) for row in rb_bundle.def_allowed.get(concept, {}).values()]).dropna()
         for mn in metric_names
-    ]).dropna()
-    if def_pop.empty:
+    }
+    if all(s.empty for s in per_metric_pop.values()):
         return {"usable": False, "reason": "no real comparison population for this concept"}
 
     weak_teams_full = []
     for team_full, row in rb_bundle.def_allowed.get(concept, {}).items():
         if team_full == exclude_team_full:
             continue
-        vals = [_to_float(row.get(mn)) for mn in metric_names if _to_float(row.get(mn)) is not None]
-        if not vals:
-            continue
-        pct = calc_percentile_grade(sum(vals) / len(vals), def_pop)
-        if pd.notna(pct) and pct >= 66.7:
+        clears = 0
+        scored = 0
+        for mn in metric_names:
+            value = _to_float(row.get(mn))
+            pop = per_metric_pop.get(mn)
+            if value is None or pop is None or pop.empty:
+                continue
+            scored += 1
+            pct = calc_percentile_grade(value, pop)
+            if pd.notna(pct) and pct >= 66.7:
+                clears += 1
+        if scored and clears > scored / 2:
             weak_teams_full.append(team_full)
 
     weak_abbrevs = {abbr for abbr, full in TEAM_ABBREV_TO_FULL_RB.items() if full in weak_teams_full}
