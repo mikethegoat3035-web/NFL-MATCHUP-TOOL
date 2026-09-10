@@ -12052,3 +12052,4 @@ def stage2_rush_cross_reference(gsis_id: str, prop_type: str, concept: str,
         "hit_rate": round(hits / total, 3) if total else None,
         "read": f"{hits}/{total} real past games vs similar-tendency defenses cleared {line}",
     }
+                                    
