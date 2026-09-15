@@ -7935,14 +7935,14 @@ MIN_REAL_TGT_FOR_RATE_STATS = 5.0
 NFL_QB_PASS_PROP_STATS = {
     "pass_yards": ["YPA", "ANY/A", "PRESS %", "CPOE"],
     "pass_completions": ["CMP %", "ADJ CMP %", "DROP %", "PRESS %", "CPOE"],
-    "pass_tds": ["RATE", "Deep Throw %", "PRESS %", "EZATT"],
+    "pass_tds": ["TD", "Deep Throw %", "PRESS %", "EZATT"],
     "longest_completion": ["ADJ CMP %", "Deep Throw %", "ACC %"],
 }
 NFL_QB_METRIC_DIRECTIONS = {"PRESS %": "low", "DROP %": "low"}  # everything else defaults to "high"
 NFL_QB_METRIC_THRESHOLDS = {
     "YPA": 8.227, "ANY/A": 7.605, "PRESS %": 33.9, "CMP %": 69.475,
     "ADJ CMP %": 80.7, "DROP %": 3.7, "RATE": 98.125, "Deep Throw %": 13.3,
-    "EZATT": 6.25, "aDOT": 8.825, "CPOE": 7.425, "ACC %": 60.875,
+    "EZATT": 6.25, "aDOT": 8.825, "CPOE": 7.425, "ACC %": 60.875, "TD": 7.0,
 }
 # Same real small-sample protection already proven for receivers - a
 # rate stat only counts if this specific coverage sample also has real,
@@ -11270,13 +11270,21 @@ RB_CONCEPT_STATS_BY_PROP = {
         "explosiveness": ["EXP RUN %", "EXP YDS", "EXP YDS %"],
     },
     "rush_attempts": {
-        "elusiveness": ["MTF", "MTF/ATT"],
+        # REAL FIX (found via full-model audit, flagged earlier but not
+        # yet corrected until now) - removed "elusiveness" (MTF, MTF/ATT).
+        # Attempt volume is about role and game script, not tackle-
+        # breaking ability - a genuinely elusive back can still get very
+        # few carries if his team doesn't feed him the ball. Pure volume
+        # metrics are the real, correct driver for this specific prop.
         "volume": ["ATT", "ATT %"],
     },
     "rush_tds": {
         "red_zone_opportunity": ["i5 %"],
+        # REAL FIX (found via full-model audit, flagged earlier but not
+        # yet corrected until now) - removed "first_downs" (1D). Picking
+        # up first downs isn't directly about scoring touchdowns - a
+        # back can move the chains all day without ever punching one in.
         "scoring_rate": ["TD RATE", "TD"],
-        "first_downs": ["1D"],
     },
     # REAL FIX - no literal "longest rush" column exists in any real file
     # (confirmed earlier this session - genuine data absence, not
