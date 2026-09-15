@@ -491,6 +491,50 @@ if "rb_player_dir" not in st.session_state:
 if "rb_def_dir" not in st.session_state:
     st.session_state.rb_def_dir = None
 
+# REAL FIX (confirmed regression, found via direct user report) - the
+# coverage/RB data loading UI was accidentally removed along with the
+# Coverage Matchup premium tab earlier this session, since it lived
+# inside that same code block as shared, reused functionality. Now
+# replaced with genuine AUTOMATIC loading - no button, no manual
+# folder entry - matching how the MLB tool's data just works without
+# a manual load step every session. Loads once per session (checked
+# via session_state, so it doesn't reload on every single rerun) from
+# a fixed path bundled directly in the repo, exactly the same real
+# folder structure (WIDE/SLOT/INLINE/BACKFIELD/QBS/RUSH METRICS/etc.)
+# already used and proven all session - this now needs that same
+# "metrics" folder committed into the GitHub repo itself (alongside
+# streamlit_app.py and nfl_model_combined.py) so the deployed app can
+# find it automatically, the same way it's been used locally all
+# along.
+NFL_METRICS_DATA_DIR = "metrics"
+NFL_RB_PLAYER_DIR = "metrics/RUSH METRICS"
+NFL_RB_DEF_DIR = "metrics/RUSH METRICS ALLOWED"
+
+if st.session_state.coverage_bundle is None:
+    try:
+        st.session_state.coverage_bundle = load_full_dataset(data_dir=NFL_METRICS_DATA_DIR)
+        st.session_state.coverage_data_dir = NFL_METRICS_DATA_DIR
+    except Exception as e:
+        st.error(
+            f"Real, automatic coverage data load failed: {e}. Confirm the 'metrics' folder "
+            "(with WIDE/SLOT/INLINE/BACKFIELD/QBS/COVG% subfolders) is committed directly "
+            "into the GitHub repo, in the same folder as streamlit_app.py."
+        )
+
+if st.session_state.rb_bundle is None:
+    try:
+        st.session_state.rb_bundle = load_full_rb_dataset(
+            player_dir=NFL_RB_PLAYER_DIR, def_dir=NFL_RB_DEF_DIR,
+        )
+        st.session_state.rb_player_dir = NFL_RB_PLAYER_DIR
+        st.session_state.rb_def_dir = NFL_RB_DEF_DIR
+    except Exception as e:
+        st.error(
+            f"Real, automatic RB concept data load failed: {e}. Confirm the 'metrics/RUSH "
+            "METRICS' and 'metrics/RUSH METRICS ALLOWED' folders are committed directly "
+            "into the GitHub repo."
+        )
+
 if mode == "Weekly Scan / Draft Rankings":
     pass  # REAL, SAFE REMOVAL (per direct request) - Draft Rankings removed
     # entirely. The "League Settings" UI and "Build Draft Rankings" button
@@ -562,10 +606,11 @@ else:
     # lives, instead of a silent gap discovered only after the fact.
     if st.session_state.get("coverage_bundle") is None:
         st.warning(
-            "⚠️ Coverage dataset not loaded yet - scanning now will run WITHOUT any coverage "
-            "data (every coverage-related column will be blank, and mu won't get the real, "
-            "direct coverage adjustment). Scroll to the 'Coverage data folder' section further "
-            "down, click 'Load coverage dataset' there first, then come back and scan."
+            "⚠️ Coverage dataset failed to auto-load - scanning now will run WITHOUT any "
+            "coverage data (every coverage-related column will be blank, and mu won't get "
+            "the real, direct coverage adjustment). Check the real error message shown "
+            "above for why the automatic load failed - most likely the 'metrics' folder "
+            "isn't committed into the GitHub repo yet."
         )
 
     button_label = "Scan full slate"
@@ -669,8 +714,8 @@ else:
 
     if st.session_state.get("coverage_bundle") is None or st.session_state.get("rb_bundle") is None:
         st.warning(
-            "⚠️ Needs BOTH the coverage dataset AND the RB concept dataset loaded first "
-            "(scroll down to their sections) - Stage 1 can't run without either one."
+            "⚠️ Coverage and/or RB concept data failed to auto-load - check the real error "
+            "message(s) shown near the top of the page for why. Stage 1 can't run without both."
         )
     elif st.button("Scan Stage 1 Survivors", key="stage1_scan_btn"):
         with st.spinner("Scanning the whole real slate for coverage & concept survivors..."):
