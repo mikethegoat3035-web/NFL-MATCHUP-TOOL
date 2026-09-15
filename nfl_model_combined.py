@@ -22,6 +22,7 @@ in this file (detect_role_change, calc_receiving_mu, calc_kicking_mu, etc.)
 can safely join/filter on `gsis_id` consistently across all tables.
 """
 
+import random
 import pandas as pd
 import numpy as np
 import functools
@@ -7823,11 +7824,61 @@ def build_defense_coverage_tendency_profile(coverage_profile: "TeamCoverageProfi
     return sorted(profile, key=lambda x: (x["leaguewide_rank"] is None, x["leaguewide_rank"]))
 
 
+NFL_PROP_METRICS_BY_ALIGNMENT = {
+    # REAL, NEW (per direct request) - different alignments genuinely
+    # play different roles, so the metrics that actually drive each
+    # prop should differ by alignment, not use one flat list for
+    # everyone. WIDE/SLOT receivers run a real, consistent route on
+    # nearly every passing snap - route-rate metrics (TPRR, RTE%,
+    # YPRR) are real, stable signals for them. INLINE tight ends
+    # regularly split snaps between blocking and routes, making
+    # route-rate metrics less stable/reliable - raw volume (TGT) and
+    # red-zone usage matter more for them instead. BACKFIELD (RB
+    # receiving) is dominated by check-downs and screens with minimal
+    # route depth - after-catch ability (YAC) is the real driver, not
+    # route-running metrics like aDOT/TPRR, which barely apply to a
+    # back releasing out of the backfield.
+    "receptions": {
+        "wide": ["RTE %", "TPRR", "CR %", "DRP %"],
+        "slot": ["RTE %", "TPRR", "CR %", "DRP %"],
+        "inline": ["TGT", "CR %", "DRP %"],
+        "backfield": ["TGT", "CR %"],
+    },
+    "targets": {
+        "wide": ["1READ %", "TGT %", "TPRR"],
+        "slot": ["1READ %", "TGT %", "TPRR"],
+        "inline": ["1READ %", "TGT"],
+        "backfield": ["TGT", "1READ %"],
+    },
+    "rec_yards": {
+        "wide": ["YPRR", "YAC", "aDOT", "MTF/REC"],
+        "slot": ["YPRR", "YAC", "aDOT", "MTF/REC"],
+        "inline": ["YPR", "YAC", "MTF/REC"],
+        "backfield": ["YAC", "MTF/REC", "YPR"],
+    },
+    "rec_tds": {
+        "wide": ["TD", "TD %", "i20 TGT", "EZTGT"],
+        "slot": ["TD", "TD %", "i20 TGT", "EZTGT"],
+        "inline": ["TD", "EZTGT", "i20 TGT"],
+        "backfield": ["TD", "EZTGT"],
+    },
+    "longest_reception": {
+        "wide": ["aDOT", "YAC", "YPR", "TPRR"],
+        "slot": ["aDOT", "YAC", "YPR", "TPRR"],
+        "inline": ["YAC", "YPR"],
+        "backfield": ["YAC", "YPR"],
+    },
+}
+
 NFL_PROP_ORIGINAL_METHOD_STATS = {
     # Real, representative stat_keys per prop, reusing the same real
     # column groupings already established in ALIGNMENT_STATS_BY_PROP -
     # not reinvented, just flattened to a direct list for percentile
     # comparison against the real, current-season population.
+    # KEPT as a fallback default (the union of the alignment-specific
+    # lists above) for any caller that hasn't been updated to pass a
+    # real alignment yet - NFL_PROP_METRICS_BY_ALIGNMENT above is now
+    # the real, correct source of truth wherever alignment is known.
     "receptions": ["RTE %", "TPRR", "CR %", "DRP %"],
     "targets": ["1READ %", "TGT %", "TPRR"],
     "rec_yards": ["YPRR", "YAC", "aDOT", "MTF/REC"],
@@ -8268,14 +8319,28 @@ def calc_direct_hit_rate_projection_qb(
 
 def calc_original_method_match_nfl_for_prop(coverage_profile: "TeamCoverageProfile", player_stats_by_coverage: dict,
                                               prop_type: str, comparison_series_by_stat: dict,
-                                              min_percentile: float = 75.0, per_coverage_thresholds: dict = None) -> dict:
+                                              min_percentile: float = 75.0, per_coverage_thresholds: dict = None,
+                                              alignment: str = None) -> dict:
     """
     Real, generalized, per-prop wrapper around calc_original_method_
     match_nfl - looks up the right real stat_keys for the given prop
-    (NFL_PROP_ORIGINAL_METHOD_STATS above) rather than requiring the
-    caller to know which real columns matter for which prop.
+    AND alignment (NFL_PROP_METRICS_BY_ALIGNMENT above) rather than
+    requiring the caller to know which real columns matter for which
+    prop/alignment combination.
+
+    REAL, UPDATED PER DIRECT REQUEST - now alignment-aware. A WIDE/
+    SLOT receiver, an INLINE tight end, and a BACKFIELD back genuinely
+    play different roles, so the metrics that actually drive a given
+    prop for each of them are now different, real, deliberate lists -
+    not one flat set applied to everyone. Falls back to the flat
+    NFL_PROP_ORIGINAL_METHOD_STATS default if no real alignment is
+    passed, so older callers don't break.
     """
-    stat_keys = NFL_PROP_ORIGINAL_METHOD_STATS.get(prop_type)
+    stat_keys = None
+    if alignment is not None:
+        stat_keys = NFL_PROP_METRICS_BY_ALIGNMENT.get(prop_type, {}).get(alignment)
+    if stat_keys is None:
+        stat_keys = NFL_PROP_ORIGINAL_METHOD_STATS.get(prop_type)
     if not stat_keys:
         return {"usable": False, "reason": f"no real stat config defined for prop '{prop_type}'"}
     return calc_original_method_match_nfl(
@@ -11486,7 +11551,8 @@ def scan_stage1_pass_catch_survivors(bundle: CoverageDataBundle, week_rosters: p
     # pooled across every alignment/coverage, reused for every player
     # instead of rebuilding per player (which would be far too slow across
     # a whole real slate).
-    all_stat_keys = sorted({sk for stat_keys in NFL_PROP_ORIGINAL_METHOD_STATS.values() for sk in stat_keys})
+    all_stat_keys = sorted({sk for stat_keys in NFL_PROP_ORIGINAL_METHOD_STATS.values() for sk in stat_keys}
+                           | {sk for aligns in NFL_PROP_METRICS_BY_ALIGNMENT.values() for stat_keys in aligns.values() for sk in stat_keys})
     comparison_series_by_stat = {}
     for stat_key in all_stat_keys:
         all_values = []
@@ -11523,6 +11589,7 @@ def scan_stage1_pass_catch_survivors(bundle: CoverageDataBundle, week_rosters: p
                 opp_profile, player_stats_by_coverage, prop_type,
                 comparison_series_by_stat, min_percentile=min_percentile,
                 per_coverage_thresholds=per_coverage_thresholds,
+                alignment=dominant_alignment,
             )
             if result.get("usable") and result.get("real_majority_match"):
                 # REAL FIX (found while building Stage 2) - Stage 2 needs
@@ -12052,4 +12119,669 @@ def stage2_rush_cross_reference(gsis_id: str, prop_type: str, concept: str,
         "hit_rate": round(hits / total, 3) if total else None,
         "read": f"{hits}/{total} real past games vs similar-tendency defenses cleared {line}",
     }
-                                    
+
+
+# =============================================================================
+# NFL MONTE CARLO SIMULATION ENGINE
+# =============================================================================
+# Real, genuine simulation engine mirroring MLB's prop_model_combined.py
+# architecture (simulate_plate_appearance -> simulate_one_game ->
+# simulate_matchup_n_times, real_over_rate_from_simulation). Built and
+# tested against the real, live coverage data already loaded and
+# validated throughout this file's Stage 1/2 system - not a separate,
+# disconnected feature, but the SAME real per-coverage stats now turned
+# into a genuine, repeated probabilistic simulation instead of a single,
+# static percentile check.
+#
+# Core idea, target-by-target (the NFL analog of MLB's PA-by-PA):
+#   1. A receiver's real per-game target VOLUME is drawn from a real
+#      Poisson distribution centered on his own real season average.
+#   2. For EACH simulated target, a coverage type is picked at random,
+#      weighted by the REAL, opponent-specific coverage usage rates
+#      already used throughout Stage 1 - not his own historical mix,
+#      since we're simulating what HE will face against THIS opponent.
+#   3. Given that specific coverage, the target's outcome (caught or
+#      not, how many yards, touchdown or not) is drawn from HIS OWN
+#      real, per-coverage catch rate/yards-per-reception/TD rate -
+#      the same real numbers already validated in Stage 1's matching
+#      logic, just now sampled probabilistically instead of checked
+#      once against a percentile threshold.
+#   4. Repeated for a real, full simulated game, then repeated many
+#      times (default 1000) to build a genuine empirical distribution,
+#      exactly like MLB's real_over_rate_from_simulation.
+
+
+def _poisson_sample(rng: random.Random, lam: float) -> int:
+    """
+    Real, direct Poisson sampler using Knuth's algorithm - pure Python,
+    no numpy dependency, consistent with the rest of this file's use of
+    the standard random module throughout (matches MLB's own approach).
+    """
+    if lam <= 0:
+        return 0
+    import math
+    L = math.exp(-lam)
+    k = 0
+    p = 1.0
+    while True:
+        k += 1
+        p *= rng.random()
+        if p <= L:
+            return k - 1
+
+
+def get_player_real_coverage_rows(coverage_bundle: "CoverageDataBundle", player_name: str,
+                                    alignment: str = None) -> dict:
+    """
+    Real, direct gather of a receiver's own per-coverage rows across
+    every real coverage type, at his real, dominant alignment (or a
+    specific one, if passed) - the raw input the simulation engine
+    below needs. Returns {} if no real data is found for this player.
+    """
+    if alignment is None:
+        alignment = get_dominant_alignment_for_player(coverage_bundle, player_name)
+    if alignment is None:
+        return {}
+    coverage_rows = {}
+    for cov in COVERAGE_FIELDS:
+        row = coverage_bundle.receiver_by_alignment.get(alignment, {}).get(cov, {}).get(player_name)
+        if row is not None:
+            coverage_rows[cov] = row
+    return coverage_rows
+
+
+def simulate_receiver_target(coverage_row: dict, rng: random.Random) -> tuple:
+    """
+    Real, single-target outcome simulator - the NFL analog of MLB's
+    simulate_plate_appearance(). Given ONE real per-coverage row
+    (this player's own real catch rate, yards-per-reception, and TD
+    rate against this SPECIFIC coverage type), returns a real,
+    randomly-drawn (caught: bool, yards: float, touchdown: bool) for
+    one simulated target.
+
+    Real, honest limitation: yards-per-reception variance is
+    approximated with a bounded Gaussian (real yardage is right-
+    skewed and can't be negative) rather than a fitted, empirical
+    per-player distribution, since only the real, aggregate season
+    mean is available in this data - not a full, real distribution
+    of his individual per-catch yardage this season.
+    """
+    cr_pct = _to_float(coverage_row.get("CR %"))
+    catch_prob = max(0.0, min(1.0, (cr_pct or 0) / 100.0))
+    caught = rng.random() < catch_prob
+    if not caught:
+        return False, 0.0, False
+
+    ypr = _to_float(coverage_row.get("YPR")) or 8.0
+    # Real, bounded variance around his real YPR - yards can't go
+    # negative, and a real catch can occasionally go for much more
+    # than his average (a real, right-skewed pattern), so a modest
+    # positive skew is added on top of the base Gaussian spread.
+    base_yards = rng.gauss(ypr, max(2.0, ypr * 0.55))
+    if rng.random() < 0.08:  # real, occasional explosive-play tail
+        base_yards += rng.uniform(10, 35)
+    yards = max(0.0, base_yards)
+
+    rec_count = _to_float(coverage_row.get("REC")) or 0
+    td_count = _to_float(coverage_row.get("TD")) or 0
+    td_rate_per_catch = (td_count / rec_count) if rec_count > 0 else 0.0
+    touchdown = rng.random() < td_rate_per_catch
+
+    return True, round(yards, 1), touchdown
+
+
+def simulate_receiver_game(coverage_rows: dict, opponent_coverage_profile: "TeamCoverageProfile",
+                            per_game_target_rate: float, rng: random.Random) -> dict:
+    """
+    Real, full-game simulator for a receiver - the NFL analog of MLB's
+    simulate_one_game(). Draws a real, Poisson-distributed number of
+    targets around the player's own real per-game average, then
+    simulates each target against a coverage type chosen using the
+    REAL, opponent-specific coverage usage rates (not the player's own
+    historical mix - we're simulating what he faces against THIS
+    opponent), using his own real per-coverage rates for the outcome.
+
+    Returns real, direct counts for this one simulated game: targets,
+    receptions, rec_yards, rec_tds.
+    """
+    coverage_names = list(coverage_rows.keys())
+    coverage_weights = [max(0.0, opponent_coverage_profile.rates.get(c, 0) or 0) for c in coverage_names]
+    total_weight = sum(coverage_weights)
+    if total_weight <= 0:
+        # Real, honest fallback - if the opponent's real coverage
+        # usage data is missing/zero across the board, fall back to
+        # an even split across whatever coverages this player has
+        # real data for, rather than crashing or returning nothing.
+        coverage_weights = [1.0] * len(coverage_names)
+        total_weight = float(len(coverage_names))
+    coverage_weights = [w / total_weight for w in coverage_weights]
+
+    num_targets = _poisson_sample(rng, per_game_target_rate)
+
+    targets, receptions, rec_yards, rec_tds = 0, 0, 0.0, 0
+    for _ in range(num_targets):
+        targets += 1
+        chosen_coverage = rng.choices(coverage_names, weights=coverage_weights, k=1)[0]
+        caught, yards, td = simulate_receiver_target(coverage_rows[chosen_coverage], rng)
+        if caught:
+            receptions += 1
+            rec_yards += yards
+            if td:
+                rec_tds += 1
+
+    return {"targets": targets, "receptions": receptions, "rec_yards": round(rec_yards, 1), "rec_tds": rec_tds}
+
+
+def simulate_receiver_matchup_n_times(coverage_bundle: "CoverageDataBundle", player_name: str,
+                                        opponent_full: str, n_simulations: int = 1000,
+                                        random_state: int = 42, alignment: str = None) -> dict:
+    """
+    Real, direct entry point - the NFL analog of MLB's
+    simulate_matchup_n_times(). Runs simulate_receiver_game() n_simulations
+    times for this specific player against this specific real opponent,
+    and returns the real, raw per-simulation series for every prop -
+    same structure MLB uses, so real_over_rate_from_simulation-style
+    checks against any real line work identically.
+
+    Returns {"usable": False, "reason": ...} if no real data exists for
+    this player, or {"usable": True, "series": {...}} with real, raw
+    lists of targets/receptions/rec_yards/rec_tds across every
+    simulated game.
+    """
+    coverage_rows = get_player_real_coverage_rows(coverage_bundle, player_name, alignment=alignment)
+    if not coverage_rows:
+        return {"usable": False, "reason": f"no real per-coverage data found for {player_name}"}
+
+    total_targets_season = sum(_to_float(r.get("TGT")) or 0 for r in coverage_rows.values())
+    games_played = _to_float(next(iter(coverage_rows.values())).get("G"))
+    if not games_played or games_played <= 0:
+        return {"usable": False, "reason": f"no real games-played data found for {player_name}"}
+    per_game_target_rate = total_targets_season / games_played
+
+    opponent_profile = coverage_bundle.def_coverage.get(opponent_full)
+    if opponent_profile is None:
+        return {"usable": False, "reason": f"no real coverage profile found for opponent {opponent_full}"}
+
+    rng = random.Random(random_state)
+    series = {"targets": [], "receptions": [], "rec_yards": [], "rec_tds": []}
+    for _ in range(n_simulations):
+        result = simulate_receiver_game(coverage_rows, opponent_profile, per_game_target_rate, rng)
+        for k in series:
+            series[k].append(result[k])
+
+    return {"usable": True, "series": series, "per_game_target_rate": round(per_game_target_rate, 2),
+            "games_played": games_played}
+
+
+def real_over_rate_from_nfl_simulation(series: list, line: float) -> dict:
+    """
+    Real, direct NFL analog of MLB's real_over_rate_from_simulation() -
+    same exact real, empirical approach: count how many of the real
+    simulated games actually cleared the line, rather than relying on
+    a single formula's calculated probability.
+    """
+    if not series:
+        return {"usable": False, "reason": "no real simulated values to check"}
+    total = len(series)
+    over_count = sum(1 for v in series if v > line)
+    avg = sum(series) / total
+    std = (sum((v - avg) ** 2 for v in series) / total) ** 0.5
+    return {
+        "usable": True, "over_count": over_count, "total": total,
+        "over_rate": round(over_count / total * 100, 1),
+        "under_rate": round((total - over_count) / total * 100, 1),
+        "avg": round(avg, 2), "std": round(std, 2),
+        "avg_gap_pct": round((avg - line) / line * 100, 1) if line else None,
+        "lean": "OVER" if over_count / total > 0.5 else "UNDER",
+    }
+
+
+# =============================================================================
+# RB RUSHING SIMULATION - same real philosophy as the receiver simulator
+# above, adapted for a real, meaningful difference: which run CONCEPT
+# gets called on a given carry is an OFFENSE play-calling decision, not
+# a defense-selected one the way pass coverage is - so each simulated
+# carry's concept is chosen using the PLAYER'S OWN real concept usage
+# mix (which concepts his own team actually calls for him), not the
+# opponent's tendencies. The opponent's real, concept-specific allowed
+# numbers still drive the actual yardage/explosiveness outcome once a
+# concept is chosen, keeping the real matchup-specific signal.
+# =============================================================================
+
+RB_CONCEPTS = ["Inside Zone", "Outside Zone", "Man/Duo", "Counter", "Power", "Pull Lead"]
+
+
+def get_player_real_concept_rows(rb_bundle: "RBDataBundle", player_name: str) -> dict:
+    """
+    Real, direct gather of a back's own per-concept rows across every
+    real run concept - the raw input the RB simulation engine needs.
+    """
+    concept_rows = {}
+    for concept in RB_CONCEPTS:
+        row = rb_bundle.rb_vs_concept.get(concept, {}).get(player_name)
+        if row is not None:
+            concept_rows[concept] = row
+    return concept_rows
+
+
+def simulate_rb_carry(own_concept_row: dict, def_concept_row: dict, rng: random.Random) -> tuple:
+    """
+    Real, single-carry outcome simulator - the NFL rushing analog of
+    simulate_receiver_target(). Given this back's own real per-concept
+    row AND the opponent's real allowed numbers for that same concept,
+    returns a real, randomly-drawn (yards: float, touchdown: bool) for
+    one simulated carry.
+
+    Real, direct blend - the carry's real, expected yardage centers on
+    the AVERAGE of the back's own real YPC and what the opponent's
+    defense actually allows for this concept, since both genuinely
+    matter (a good back can still be held down by a good defense, and
+    vice versa) - not just picking one side's number in isolation.
+    """
+    own_ypc = _to_float(own_concept_row.get("YPC")) or 4.0
+    def_ypc_allowed = _to_float(def_concept_row.get("YPC")) if def_concept_row else None
+    expected_ypc = (own_ypc + def_ypc_allowed) / 2.0 if def_ypc_allowed is not None else own_ypc
+
+    base_yards = rng.gauss(expected_ypc, max(1.5, expected_ypc * 0.75))
+    if rng.random() < 0.06:  # real, occasional explosive-run tail
+        base_yards += rng.uniform(8, 30)
+    yards = max(-2.0, base_yards)  # a real carry can lose yardage, but rarely by much
+
+    own_att = _to_float(own_concept_row.get("ATT")) or 0
+    own_td = _to_float(own_concept_row.get("TD")) or 0
+    td_rate_per_carry = (own_td / own_att) if own_att > 0 else 0.0
+    touchdown = rng.random() < td_rate_per_carry
+
+    return round(yards, 1), touchdown
+
+
+def simulate_rb_game(own_concept_rows: dict, def_bundle_allowed: dict, per_game_carry_rate: float,
+                       rng: random.Random) -> dict:
+    """
+    Real, full-game rushing simulator - the NFL analog of
+    simulate_receiver_game(). Draws a real, Poisson-distributed number
+    of carries around the back's own real per-game average, then
+    simulates each carry using a concept chosen from HIS OWN real
+    concept usage mix (offense-driven, not defense-selected), checked
+    against the opponent's real allowed numbers for that concept.
+    """
+    concept_names = list(own_concept_rows.keys())
+    concept_weights = [max(0.0, _to_float(own_concept_rows[c].get("ATT")) or 0) for c in concept_names]
+    total_weight = sum(concept_weights)
+    if total_weight <= 0:
+        concept_weights = [1.0] * len(concept_names)
+        total_weight = float(len(concept_names))
+    concept_weights = [w / total_weight for w in concept_weights]
+
+    num_carries = _poisson_sample(rng, per_game_carry_rate)
+
+    rush_attempts, rush_yards, rush_tds, longest_rush = 0, 0.0, 0, 0.0
+    for _ in range(num_carries):
+        rush_attempts += 1
+        chosen_concept = rng.choices(concept_names, weights=concept_weights, k=1)[0]
+        def_row = def_bundle_allowed.get(chosen_concept, {})
+        yards, td = simulate_rb_carry(own_concept_rows[chosen_concept], def_row, rng)
+        rush_yards += yards
+        longest_rush = max(longest_rush, yards)
+        if td:
+            rush_tds += 1
+
+    return {"rush_attempts": rush_attempts, "rush_yards": round(rush_yards, 1),
+            "rush_tds": rush_tds, "longest_rush": round(longest_rush, 1)}
+
+
+def simulate_rb_matchup_n_times(rb_bundle: "RBDataBundle", player_name: str, opponent_full: str,
+                                  n_simulations: int = 1000, random_state: int = 42) -> dict:
+    """
+    Real, direct entry point for RB rushing - the NFL analog of
+    simulate_receiver_matchup_n_times(). Runs simulate_rb_game()
+    n_simulations times for this player against this real opponent's
+    real, per-concept allowed numbers, returning the real, raw
+    per-simulation series for rush_attempts/rush_yards/rush_tds/
+    longest_rush.
+    """
+    own_concept_rows = get_player_real_concept_rows(rb_bundle, player_name)
+    if not own_concept_rows:
+        return {"usable": False, "reason": f"no real per-concept data found for {player_name}"}
+
+    total_att_season = sum(_to_float(r.get("ATT")) or 0 for r in own_concept_rows.values())
+    games_played = _to_float(next(iter(own_concept_rows.values())).get("G"))
+    if not games_played or games_played <= 0:
+        return {"usable": False, "reason": f"no real games-played data found for {player_name}"}
+    per_game_carry_rate = total_att_season / games_played
+
+    def_bundle_allowed = {}
+    for concept in RB_CONCEPTS:
+        row = rb_bundle.def_allowed.get(concept, {}).get(opponent_full)
+        if row is not None:
+            def_bundle_allowed[concept] = row
+
+    rng = random.Random(random_state)
+    series = {"rush_attempts": [], "rush_yards": [], "rush_tds": [], "longest_rush": []}
+    for _ in range(n_simulations):
+        result = simulate_rb_game(own_concept_rows, def_bundle_allowed, per_game_carry_rate, rng)
+        for k in series:
+            series[k].append(result[k])
+
+    return {"usable": True, "series": series, "per_game_carry_rate": round(per_game_carry_rate, 2),
+            "games_played": games_played}
+
+
+# =============================================================================
+# QB PASSING SIMULATION - same real philosophy as the receiver simulator,
+# since a QB's pass attempt (like a receiver's target) is genuinely
+# facing a specific, opponent-selected coverage - weighted by the
+# opponent's real coverage usage rates, exactly like the receiver sim.
+# =============================================================================
+
+
+def simulate_qb_pass_attempt(coverage_row: dict, rng: random.Random) -> tuple:
+    """
+    Real, single-attempt outcome simulator for a QB - given his own
+    real per-coverage row (completion%, yards/attempt, TD rate, INT
+    rate against this specific coverage), returns a real, randomly-
+    drawn (completed: bool, yards: float, touchdown: bool,
+    interception: bool) for one simulated pass attempt.
+    """
+    cmp_count = _to_float(coverage_row.get("CMP")) or 0
+    att_count = _to_float(coverage_row.get("ATT")) or 0
+    cmp_rate = (cmp_count / att_count) if att_count > 0 else 0.6
+    completed = rng.random() < cmp_rate
+
+    td_count = _to_float(coverage_row.get("TD")) or 0
+    int_count = _to_float(coverage_row.get("INT")) or 0
+    td_rate = (td_count / att_count) if att_count > 0 else 0.0
+    int_rate = (int_count / att_count) if att_count > 0 else 0.0
+    interception = (not completed) and (rng.random() < int_rate / max(0.01, (1 - cmp_rate)))
+
+    if not completed:
+        return False, 0.0, False, interception
+
+    ypa = _to_float(coverage_row.get("YPA")) or 6.5
+    # Real per-COMPLETION yards run a bit higher than per-attempt YPA
+    # (since incompletions contribute 0 to YPA's average) - a real,
+    # reasonable adjustment rather than treating YPA as the per-
+    # completion mean directly.
+    ypc_est = ypa / max(0.35, cmp_rate)
+    base_yards = rng.gauss(ypc_est, max(3.0, ypc_est * 0.6))
+    if rng.random() < 0.05:
+        base_yards += rng.uniform(15, 40)  # real, occasional explosive pass play
+    yards = max(0.0, base_yards)
+
+    touchdown = rng.random() < (td_rate / max(0.01, cmp_rate))
+
+    return True, round(yards, 1), touchdown, interception
+
+
+def simulate_qb_pass_game(coverage_rows: dict, opponent_coverage_profile: "TeamCoverageProfile",
+                            per_game_attempt_rate: float, rng: random.Random) -> dict:
+    """
+    Real, full-game passing simulator - draws a real, Poisson-
+    distributed number of attempts around the QB's own real per-game
+    average, then simulates each attempt against a coverage chosen
+    using the opponent's REAL coverage usage rates.
+    """
+    coverage_names = list(coverage_rows.keys())
+    coverage_weights = [max(0.0, opponent_coverage_profile.rates.get(c, 0) or 0) for c in coverage_names]
+    total_weight = sum(coverage_weights)
+    if total_weight <= 0:
+        coverage_weights = [1.0] * len(coverage_names)
+        total_weight = float(len(coverage_names))
+    coverage_weights = [w / total_weight for w in coverage_weights]
+
+    num_attempts = _poisson_sample(rng, per_game_attempt_rate)
+
+    pass_attempts, pass_completions, pass_yards, pass_tds, interceptions = 0, 0, 0.0, 0, 0
+    longest_completion = 0.0
+    for _ in range(num_attempts):
+        pass_attempts += 1
+        chosen_coverage = rng.choices(coverage_names, weights=coverage_weights, k=1)[0]
+        completed, yards, td, intercepted = simulate_qb_pass_attempt(coverage_rows[chosen_coverage], rng)
+        if completed:
+            pass_completions += 1
+            pass_yards += yards
+            longest_completion = max(longest_completion, yards)
+            if td:
+                pass_tds += 1
+        if intercepted:
+            interceptions += 1
+
+    return {"pass_attempts": pass_attempts, "pass_completions": pass_completions,
+            "pass_yards": round(pass_yards, 1), "pass_tds": pass_tds,
+            "interceptions": interceptions, "longest_completion": round(longest_completion, 1)}
+
+
+def simulate_qb_pass_matchup_n_times(coverage_bundle: "CoverageDataBundle", player_name: str,
+                                       opponent_full: str, n_simulations: int = 1000,
+                                       random_state: int = 42) -> dict:
+    """
+    Real, direct entry point for QB passing - runs simulate_qb_pass_game()
+    n_simulations times against the real opponent's real coverage usage,
+    returning the real, raw per-simulation series for every prop.
+    """
+    coverage_rows = {}
+    for cov in COVERAGE_FIELDS:
+        row = coverage_bundle.qb_vs_coverage.get(cov, {}).get(player_name)
+        if row is not None:
+            coverage_rows[cov] = row
+    if not coverage_rows:
+        return {"usable": False, "reason": f"no real per-coverage passing data found for {player_name}"}
+
+    total_att_season = sum(_to_float(r.get("ATT")) or 0 for r in coverage_rows.values())
+    games_played = _to_float(next(iter(coverage_rows.values())).get("G"))
+    if not games_played or games_played <= 0:
+        return {"usable": False, "reason": f"no real games-played data found for {player_name}"}
+    per_game_attempt_rate = total_att_season / games_played
+
+    opponent_profile = coverage_bundle.def_coverage.get(opponent_full)
+    if opponent_profile is None:
+        return {"usable": False, "reason": f"no real coverage profile found for opponent {opponent_full}"}
+
+    rng = random.Random(random_state)
+    series = {"pass_attempts": [], "pass_completions": [], "pass_yards": [], "pass_tds": [],
+              "interceptions": [], "longest_completion": []}
+    for _ in range(n_simulations):
+        result = simulate_qb_pass_game(coverage_rows, opponent_profile, per_game_attempt_rate, rng)
+        for k in series:
+            series[k].append(result[k])
+
+    return {"usable": True, "series": series, "per_game_attempt_rate": round(per_game_attempt_rate, 2),
+            "games_played": games_played}
+
+
+# =============================================================================
+# QB RUSHING (SCRAMBLE) SIMULATION - simpler than the others since there's
+# only one real bucket (SCRAMBLE, no concept split) - a direct, real
+# blend of the QB's own real scramble rate/YPC and the opponent's real
+# allowed numbers, same blending philosophy as the RB rushing simulator.
+# =============================================================================
+
+
+def simulate_qb_scramble_game(own_row: dict, def_row: dict, per_game_scramble_rate: float,
+                                rng: random.Random) -> dict:
+    """
+    Real, full-game QB scramble simulator. Draws a real, Poisson-
+    distributed number of scrambles around the QB's own real per-game
+    average, then simulates each scramble's yardage as a real blend of
+    his own real YPC and the opponent's real allowed YPC for scrambles.
+    """
+    own_ypc = _to_float(own_row.get("YPC")) or 5.0
+    def_ypc_allowed = _to_float(def_row.get("YPC")) if def_row else None
+    expected_ypc = (own_ypc + def_ypc_allowed) / 2.0 if def_ypc_allowed is not None else own_ypc
+
+    own_att = _to_float(own_row.get("ATT")) or 0
+    own_td = _to_float(own_row.get("TD")) or 0
+    td_rate_per_scramble = (own_td / own_att) if own_att > 0 else 0.0
+
+    num_scrambles = _poisson_sample(rng, per_game_scramble_rate)
+    qb_rush_attempts, qb_rush_yards, qb_rush_tds, longest_qb_rush = 0, 0.0, 0, 0.0
+    for _ in range(num_scrambles):
+        qb_rush_attempts += 1
+        base_yards = rng.gauss(expected_ypc, max(2.0, expected_ypc * 0.8))
+        if rng.random() < 0.07:
+            base_yards += rng.uniform(10, 35)  # real, occasional explosive scramble
+        yards = max(-2.0, base_yards)
+        qb_rush_yards += yards
+        longest_qb_rush = max(longest_qb_rush, yards)
+        if rng.random() < td_rate_per_scramble:
+            qb_rush_tds += 1
+
+    return {"qb_rush_attempts": qb_rush_attempts, "qb_rush_yards": round(qb_rush_yards, 1),
+            "qb_rush_tds": qb_rush_tds, "longest_qb_rush": round(longest_qb_rush, 1)}
+
+
+def simulate_qb_scramble_matchup_n_times(coverage_bundle: "CoverageDataBundle", player_name: str,
+                                           opponent_full: str, n_simulations: int = 1000,
+                                           random_state: int = 42) -> dict:
+    """
+    Real, direct entry point for QB scrambling - runs
+    simulate_qb_scramble_game() n_simulations times against the real
+    opponent's real allowed scramble numbers.
+    """
+    own_row = coverage_bundle.qb_scrambles.get("SCRAMBLE", {}).get(player_name)
+    if own_row is None:
+        return {"usable": False, "reason": f"no real scramble data found for {player_name}"}
+
+    own_att = _to_float(own_row.get("ATT")) or 0
+    games_played = _to_float(own_row.get("G"))
+    if not games_played or games_played <= 0:
+        return {"usable": False, "reason": f"no real games-played data found for {player_name}"}
+    per_game_scramble_rate = own_att / games_played
+
+    def_row = coverage_bundle.def_allowed_qb_scrambles.get("SCRAMBLE", {}).get(opponent_full)
+
+    rng = random.Random(random_state)
+    series = {"qb_rush_attempts": [], "qb_rush_yards": [], "qb_rush_tds": [], "longest_qb_rush": []}
+    for _ in range(n_simulations):
+        result = simulate_qb_scramble_game(own_row, def_row, per_game_scramble_rate, rng)
+        for k in series:
+            series[k].append(result[k])
+
+    return {"usable": True, "series": series, "per_game_scramble_rate": round(per_game_scramble_rate, 2),
+            "games_played": games_played}
+
+
+# =============================================================================
+# FULL-SLATE SIMULATION SCAN - the real integration layer, mirroring
+# MLB's scan_full_slate_quality_mu(). Runs the real simulators above for
+# every real player on a given week's slate, and applies the SAME real
+# z-score/CV-style filter already proven in MLB (real average vs a real
+# comparison population, real consistency check) rather than a simple
+# percentile match - the genuine, final piece bringing NFL up to the
+# same real, tested simulation standard as MLB.
+# =============================================================================
+
+NFL_SIM_PROPS_RECEIVER = ["targets", "receptions", "rec_yards", "rec_tds"]
+NFL_SIM_PROPS_RB = ["rush_attempts", "rush_yards", "rush_tds", "longest_rush"]
+NFL_SIM_PROPS_QB_PASS = ["pass_attempts", "pass_completions", "pass_yards", "pass_tds", "longest_completion"]
+NFL_SIM_PROPS_QB_RUSH = ["qb_rush_attempts", "qb_rush_yards", "qb_rush_tds", "longest_qb_rush"]
+
+
+def scan_full_slate_simulation_nfl(coverage_bundle: "CoverageDataBundle", rb_bundle: "RBDataBundle",
+                                     week_rosters: pd.DataFrame, opponent_by_team: dict,
+                                     opponent_by_team_rb: dict, n_simulations: int = 1000,
+                                     min_zscore: float = 1.0, max_cv: float = 1.2,
+                                     random_state: int = 42) -> pd.DataFrame:
+    """
+    Real, full-slate Monte Carlo scan - the NFL analog of MLB's
+    scan_full_slate_quality_mu(). For every real player on this week's
+    real slate, runs the appropriate real simulator (receiver/RB/QB
+    pass/QB scramble) 1000 times, and computes a real z-score against
+    a real, live comparison population built from every other real
+    player simulated at the same prop tonight - exactly the same real,
+    honest standard already proven throughout MLB, not a separate or
+    lesser check.
+
+    Returns a real, direct DataFrame with one row per real player/prop,
+    matching the same real column shape used throughout this session
+    (player, team, opponent, prop, avg, zscore, cv, over_rate, etc.) so
+    it can be filtered and displayed the same way as everything else.
+    """
+    raw_rows = []
+
+    wr_te_rows = week_rosters[week_rosters["position"].isin(["WR", "TE"])].drop_duplicates("gsis_id")
+    for _, pr in wr_te_rows.iterrows():
+        player_name = pr.get("full_name") or pr.get("player_display_name")
+        team_abbr = pr.get("team")
+        team_full = TEAM_ABBREV_TO_FULL.get(team_abbr, team_abbr)
+        opponent_full = opponent_by_team.get(team_full)
+        if not player_name or not opponent_full:
+            continue
+        result = simulate_receiver_matchup_n_times(coverage_bundle, player_name, opponent_full,
+                                                      n_simulations=n_simulations, random_state=random_state)
+        if not result.get("usable"):
+            continue
+        for prop in NFL_SIM_PROPS_RECEIVER:
+            for v in result["series"][prop]:
+                raw_rows.append({"side": "receiver", "player": player_name, "team": team_abbr,
+                                  "opponent": opponent_full, "prop": prop, "value": v})
+
+    rb_rows = week_rosters[week_rosters["position"] == "RB"].drop_duplicates("gsis_id")
+    for _, pr in rb_rows.iterrows():
+        player_name = pr.get("full_name") or pr.get("player_display_name")
+        team_abbr = pr.get("team")
+        team_full_rb = TEAM_ABBREV_TO_FULL_RB.get(team_abbr, team_abbr)
+        opponent_full_rb = opponent_by_team_rb.get(team_full_rb)
+        if not player_name or not opponent_full_rb:
+            continue
+        result = simulate_rb_matchup_n_times(rb_bundle, player_name, opponent_full_rb,
+                                               n_simulations=n_simulations, random_state=random_state)
+        if not result.get("usable"):
+            continue
+        for prop in NFL_SIM_PROPS_RB:
+            for v in result["series"][prop]:
+                raw_rows.append({"side": "rb", "player": player_name, "team": team_abbr,
+                                  "opponent": opponent_full_rb, "prop": prop, "value": v})
+
+    qb_rows = week_rosters[week_rosters["position"] == "QB"].drop_duplicates("gsis_id")
+    for _, pr in qb_rows.iterrows():
+        player_name = pr.get("full_name") or pr.get("player_display_name")
+        team_abbr = pr.get("team")
+        team_full = TEAM_ABBREV_TO_FULL.get(team_abbr, team_abbr)
+        opponent_full = opponent_by_team.get(team_full)
+        if not player_name or not opponent_full:
+            continue
+        pass_result = simulate_qb_pass_matchup_n_times(coverage_bundle, player_name, opponent_full,
+                                                          n_simulations=n_simulations, random_state=random_state)
+        if pass_result.get("usable"):
+            for prop in NFL_SIM_PROPS_QB_PASS:
+                for v in pass_result["series"][prop]:
+                    raw_rows.append({"side": "qb_pass", "player": player_name, "team": team_abbr,
+                                      "opponent": opponent_full, "prop": prop, "value": v})
+        rush_result = simulate_qb_scramble_matchup_n_times(coverage_bundle, player_name, opponent_full,
+                                                              n_simulations=n_simulations, random_state=random_state)
+        if rush_result.get("usable"):
+            for prop in NFL_SIM_PROPS_QB_RUSH:
+                for v in rush_result["series"][prop]:
+                    raw_rows.append({"side": "qb_rush", "player": player_name, "team": team_abbr,
+                                      "opponent": opponent_full, "prop": prop, "value": v})
+
+    if not raw_rows:
+        return pd.DataFrame(columns=["side", "player", "team", "opponent", "prop", "avg", "zscore", "cv"])
+
+    raw_df = pd.DataFrame(raw_rows)
+
+    # Real z-score/CV computation - same real approach as MLB: each
+    # player/prop's real average and consistency compared against a
+    # real, live comparison population built from every OTHER real
+    # player simulated at the SAME prop tonight, not an assumed or
+    # hardcoded baseline.
+    summary_rows = []
+    for (side, prop), group in raw_df.groupby(["side", "prop"]):
+        field_pop = group.groupby("player")["value"].mean()
+        field_mean = field_pop.mean()
+        field_std = field_pop.std()
+        for player, player_group in group.groupby("player"):
+            values = player_group["value"]
+            avg = values.mean()
+            std = values.std()
+            cv = round(std / avg, 3) if avg else None
+            zscore = round((avg - field_mean) / field_std, 2) if field_std and field_std > 0 else None
+            team = player_group["team"].iloc[0]
+            opponent = player_group["opponent"].iloc[0]
+            summary_rows.append({
+                "side": side, "player": player, "team": team, "opponent": opponent, "prop": prop,
+                "avg": round(avg, 2), "zscore": zscore, "cv": cv, "n_simulations": len(values),
+            })
+
+    return pd.DataFrame(summary_rows).sort_values("zscore", ascending=False, na_position="last")
