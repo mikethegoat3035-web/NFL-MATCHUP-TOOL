@@ -313,7 +313,7 @@ st.markdown(
 # took effect, instead of waiting through a full readiness-report run to
 # find out indirectly. If this doesn't match what was just sent, the
 # deploy didn't land - no need to test anything further until it does.
-DEPLOY_VERSION = "v51-play-by-play-sim-merged-scrambles-rushconcepts-2026-08-29"
+DEPLOY_VERSION = "v52-unified-sim-pipeline-fantasy-fixes-2026-09-18"
 st.caption(f"🔧 Deploy check: `{DEPLOY_VERSION}` — if this doesn't match what was just sent to you, the deploy hasn't taken effect yet.")
 
 # -----------------------------------------------------------------------
@@ -519,18 +519,21 @@ if "rb_def_dir" not in st.session_state:
 # shift to 2026 once real, current-season games pass Week 5 - see
 # load_free_nfl_data() for the real, tested season-blending logic.
 if st.session_state.coverage_bundle is None or st.session_state.rb_bundle is None:
-    try:
-        free_data = load_free_nfl_data(current_season=2026, prior_season=2025, blend_after_week=5)
-        coverage_bundle, rb_bundle = build_bundles_from_free_data(
-            free_data, CoverageDataBundle, TeamCoverageProfile, RBDataBundle,
-            team_abbrev_to_full=TEAM_ABBREV_TO_FULL,
-        )
-        st.session_state.coverage_bundle = coverage_bundle
-        st.session_state.rb_bundle = rb_bundle
-        st.session_state.free_data_season_used = free_data["season_used"]
-        st.session_state.free_data_current_week = free_data["real_current_week_completed"]
-    except Exception as e:
-        st.error(f"Real, automatic live data load failed: {e}")
+    with st.spinner("Loading live NFL data (play-by-play, participation, NGS, FTN charting) - "
+                     "this pulls several real, live data sources and can take 20-40 seconds "
+                     "on first load..."):
+        try:
+            free_data = load_free_nfl_data(current_season=2026, prior_season=2025, blend_after_week=5)
+            coverage_bundle, rb_bundle = build_bundles_from_free_data(
+                free_data, CoverageDataBundle, TeamCoverageProfile, RBDataBundle,
+                team_abbrev_to_full=TEAM_ABBREV_TO_FULL,
+            )
+            st.session_state.coverage_bundle = coverage_bundle
+            st.session_state.rb_bundle = rb_bundle
+            st.session_state.free_data_season_used = free_data["season_used"]
+            st.session_state.free_data_current_week = free_data["real_current_week_completed"]
+        except Exception as e:
+            st.error(f"Real, automatic live data load failed: {e}")
 
 if st.session_state.get("free_data_season_used"):
     st.caption(
