@@ -65,9 +65,14 @@ from nfl_model_combined import (
     build_defense_coverage_tendency_profile, calc_original_method_match_nfl,
     rescore_via_direct_hit_rate, build_rb_concept_usage_ranks,
     calc_original_method_match_nfl_for_prop, NFL_PROP_ORIGINAL_METHOD_STATS, _to_float,
-    TEAM_ABBREV_TO_FULL_RB, scan_stage1_pass_catch_survivors, scan_stage1_rush_survivors,
+    TEAM_ABBREV_TO_FULL_RB, scan_stage1_pass_catch_survivors_free, scan_stage1_rush_survivors_free,
+    scan_stage1_qb_pass_survivors_free, QUALITY_MU_PROP_TO_SIMULATOR,
+    real_over_rate_from_nfl_simulation, simulate_receiver_matchup_n_times,
+    simulate_rb_matchup_n_times, simulate_qb_pass_matchup_n_times, simulate_qb_scramble_matchup_n_times,
     stage2_pass_catch_cross_reference, stage2_rush_cross_reference,
     scan_full_slate_simulation_nfl,
+    load_free_nfl_data, build_bundles_from_free_data,
+    CoverageDataBundle, TeamCoverageProfile, RBDataBundle,
 )
 
 st.set_page_config(page_title="NFL Matchup Tool", layout="wide", page_icon="🏈")
@@ -506,34 +511,33 @@ if "rb_def_dir" not in st.session_state:
 # streamlit_app.py and nfl_model_combined.py) so the deployed app can
 # find it automatically, the same way it's been used locally all
 # along.
-NFL_METRICS_DATA_DIR = "metrics"
-NFL_RB_PLAYER_DIR = "metrics/RUSH METRICS"
-NFL_RB_DEF_DIR = "metrics/RUSH METRICS ALLOWED"
-
-if st.session_state.coverage_bundle is None:
+# REAL, FINAL TRANSITION (per direct request) - no more CSV files at
+# all. Data now loads automatically and entirely from free, live
+# nflreadpy feeds (play-by-play + participation charting), exactly
+# mirroring how the MLB tool's data just works via a live API. Uses
+# the full, robust 2025 season right now, and will automatically
+# shift to 2026 once real, current-season games pass Week 5 - see
+# load_free_nfl_data() for the real, tested season-blending logic.
+if st.session_state.coverage_bundle is None or st.session_state.rb_bundle is None:
     try:
-        st.session_state.coverage_bundle = load_full_dataset(data_dir=NFL_METRICS_DATA_DIR)
-        st.session_state.coverage_data_dir = NFL_METRICS_DATA_DIR
-    except Exception as e:
-        st.error(
-            f"Real, automatic coverage data load failed: {e}. Confirm the 'metrics' folder "
-            "(with WIDE/SLOT/INLINE/BACKFIELD/QBS/COVG% subfolders) is committed directly "
-            "into the GitHub repo, in the same folder as streamlit_app.py."
+        free_data = load_free_nfl_data(current_season=2026, prior_season=2025, blend_after_week=5)
+        coverage_bundle, rb_bundle = build_bundles_from_free_data(
+            free_data, CoverageDataBundle, TeamCoverageProfile, RBDataBundle,
+            team_abbrev_to_full=TEAM_ABBREV_TO_FULL,
         )
+        st.session_state.coverage_bundle = coverage_bundle
+        st.session_state.rb_bundle = rb_bundle
+        st.session_state.free_data_season_used = free_data["season_used"]
+        st.session_state.free_data_current_week = free_data["real_current_week_completed"]
+    except Exception as e:
+        st.error(f"Real, automatic live data load failed: {e}")
 
-if st.session_state.rb_bundle is None:
-    try:
-        st.session_state.rb_bundle = load_full_rb_dataset(
-            player_dir=NFL_RB_PLAYER_DIR, def_dir=NFL_RB_DEF_DIR,
-        )
-        st.session_state.rb_player_dir = NFL_RB_PLAYER_DIR
-        st.session_state.rb_def_dir = NFL_RB_DEF_DIR
-    except Exception as e:
-        st.error(
-            f"Real, automatic RB concept data load failed: {e}. Confirm the 'metrics/RUSH "
-            "METRICS' and 'metrics/RUSH METRICS ALLOWED' folders are committed directly "
-            "into the GitHub repo."
-        )
+if st.session_state.get("free_data_season_used"):
+    st.caption(
+        f"📡 Live data: using {st.session_state.free_data_season_used} season "
+        f"(real week {st.session_state.free_data_current_week} completed so far in 2026) — "
+        "no CSV upload needed, auto-refreshes each session."
+    )
 
 if mode == "Weekly Scan / Draft Rankings":
     pass  # REAL, SAFE REMOVAL (per direct request) - Draft Rankings removed
@@ -737,17 +741,22 @@ else:
                 rosters_df = pull_rosters([season])
                 week_rosters_df = rosters_df[rosters_df["position"].isin(["QB", "RB", "WR", "TE"])].drop_duplicates("gsis_id")
 
-                pc_survivors = scan_stage1_pass_catch_survivors(
+                pc_survivors = scan_stage1_pass_catch_survivors_free(
                     st.session_state.coverage_bundle, week_rosters_df, opponent_by_team_pc,
                 )
-                rush_survivors = scan_stage1_rush_survivors(
+                rush_survivors = scan_stage1_rush_survivors_free(
                     st.session_state.rb_bundle, week_rosters_df, opponent_by_team_rush,
+                )
+                qb_pass_survivors = scan_stage1_qb_pass_survivors_free(
+                    st.session_state.coverage_bundle, week_rosters_df, opponent_by_team_pc,
                 )
                 st.session_state.stage1_pc_survivors = pc_survivors
                 st.session_state.stage1_rush_survivors = rush_survivors
+                st.session_state.stage1_qb_pass_survivors = qb_pass_survivors
                 st.success(
                     f"Stage 1 complete - {len(pc_survivors)} pass/pass-catching survivors, "
-                    f"{len(rush_survivors)} rush-concept survivors."
+                    f"{len(rush_survivors)} rush-concept survivors, "
+                    f"{len(qb_pass_survivors)} QB passing survivors."
                 )
             except Exception as e:
                 st.error(f"Stage 1 scan failed: {e}")
@@ -1054,6 +1063,16 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         filtered = filtered[filtered["prop_type"] == prop_filter]
     if position_filter != "All":
         filtered = filtered[filtered["position"] == position_filter]
+
+    # REAL, CORRECTED (per direct correction) - Stage 1 is the genuine
+    # quality gate (quality_score + real games sampled), NOT a field-
+    # or season-average comparison. "Over or under" only means
+    # something once a real line exists to check against - that's
+    # exactly what Stage 2 below does, running each survivor through
+    # 1000 real Monte Carlo simulations for its own real over-rate/
+    # gap%, the same real mechanism MLB already uses. No averages
+    # (field or season) are used anywhere in this flow - the
+    # simulation's own real, direct numbers are the entire mechanism.
     if min_quality_filter > 0 and "quality_score" in filtered.columns:
         filtered = filtered[filtered["quality_score"].fillna(0) >= min_quality_filter]
     # REAL FIX (confirmed bug) - was filtering on games_sampled_current
@@ -1066,6 +1085,9 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         filtered = filtered[filtered["games_sampled_total"].fillna(0) >= min_games_filter]
     elif min_games_filter > 0 and "games_sampled_current" in filtered.columns:
         filtered = filtered[filtered["games_sampled_current"].fillna(0) >= min_games_filter]
+
+    st.caption(f"Stage 1 survivors: {len(filtered)} of {len(df)} real rows in this week's slate "
+               f"(quality_score + real games sampled only - no averages used).")
 
     # REAL, NEW - per direct, explicit request, built and validated
     # tonight (confirmed end-to-end: Maye's longest_completion vs Cover 4
@@ -1149,7 +1171,11 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         st.subheader("Slate - enter a line per row to compute edge/probability")
         st.caption(
             "Type a value in the 'line' column for any prop you want scored. "
-            "edge/p_over recompute automatically once you enter a line."
+            "edge/p_over recompute automatically once you enter a line. "
+            "REAL, UNIFIED PIPELINE (matching MLB's structure): mu/sigma now come directly "
+            "from 1000 real Monte Carlo simulations wherever the simulator supports that prop "
+            "(check the 'sim_source' column) - the separate simulation scan is no longer a "
+            "different step, it's built into this same scan automatically."
         )
 
         if week is not None and week <= 3:
@@ -1201,7 +1227,8 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                 ]
 
         core_editor_cols = ["player_display_name", "team", "opponent", "matchup",
-                             "position", "prop_type", "line", "mu", "sigma",
+                             "position", "prop_type",
+                             "line", "mu", "sigma", "sim_source",
                              "continuity_confidence", "data_confidence", "games_sampled_total", "games_sampled_current", "quality_score"]
         editor_col_order = core_editor_cols if not show_full_diagnostics else None
         editor_col_order = [c for c in editor_col_order if c in filtered.columns] if editor_col_order else None
@@ -1320,6 +1347,49 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                 # not just applied manually in conversation.
                 player_stage1_elite = real_detail.get("player_stage1_majority_elite", False)
                 player_stage1_poor = real_detail.get("player_stage1_majority_poor", False)
+                # REAL, NEW (per direct request) - the actual MLB-style
+                # workflow: run this exact row through 1000 real Monte
+                # Carlo simulations, the same way MLB's Stage 2 does,
+                # rather than leaving mu-scoring and simulation as two
+                # disconnected systems. Uses the same real bridge/mapping
+                # already built and tested (run_quality_mu_through_
+                # simulation), just inline per-row here so it updates
+                # live as lines are typed, matching MLB's exact feel.
+                sim_over_rate = sim_under_rate = sim_avg = sim_avg_gap_pct = sim_lean = None
+                sim_reason = None
+                mapping = QUALITY_MU_PROP_TO_SIMULATOR.get(row.get("prop_type"))
+                if mapping and _coverage_bundle_for_scoring is not None:
+                    sim_side, series_key = mapping
+                    team_abbr = row.get("team")
+                    team_full = TEAM_ABBREV_TO_FULL.get(team_abbr, team_abbr)
+                    team_full_rb = TEAM_ABBREV_TO_FULL_RB.get(team_abbr, team_abbr)
+                    opponent_full = row.get("opponent")
+                    try:
+                        if sim_side == "receiver":
+                            sim_result = simulate_receiver_matchup_n_times(
+                                _coverage_bundle_for_scoring, row.get("player_display_name"), opponent_full)
+                        elif sim_side == "rb" and _rb_bundle_for_scoring is not None:
+                            sim_result = simulate_rb_matchup_n_times(
+                                _rb_bundle_for_scoring, row.get("player_display_name"), opponent_full)
+                        elif sim_side == "qb_pass":
+                            sim_result = simulate_qb_pass_matchup_n_times(
+                                _coverage_bundle_for_scoring, row.get("player_display_name"), opponent_full)
+                        elif sim_side == "qb_rush":
+                            sim_result = simulate_qb_scramble_matchup_n_times(
+                                _coverage_bundle_for_scoring, row.get("player_display_name"), opponent_full)
+                        else:
+                            sim_result = {"usable": False, "reason": "RB bundle not loaded"}
+                        if sim_result.get("usable"):
+                            sim_check = real_over_rate_from_nfl_simulation(sim_result["series"][series_key], line)
+                            sim_over_rate = sim_check["over_rate"]
+                            sim_under_rate = sim_check["under_rate"]
+                            sim_avg = sim_check["avg"]
+                            sim_avg_gap_pct = sim_check["avg_gap_pct"]
+                            sim_lean = sim_check["lean"]
+                        else:
+                            sim_reason = sim_result.get("reason")
+                    except Exception as e:
+                        sim_reason = str(e)
                 results.append({
                     **row.to_dict(), **scored,
                     "real_hit_rate_read": real_read,
@@ -1328,6 +1398,9 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
                     "real_supporting_metrics": real_supporting_read,
                     "stage1_player_majority_elite": player_stage1_elite,
                     "stage1_player_majority_poor": player_stage1_poor,
+                    "sim_over_rate": sim_over_rate, "sim_under_rate": sim_under_rate,
+                    "sim_avg": sim_avg, "sim_avg_gap_pct": sim_avg_gap_pct,
+                    "sim_lean": sim_lean, "sim_reason": sim_reason,
                 })
             else:
                 results.append({**row.to_dict(), "p_over": np.nan, "edge": np.nan})
@@ -1335,6 +1408,29 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         scored_df = pd.DataFrame(results)
         if min_edge_filter > 0 and "edge" in scored_df.columns:
             scored_df = scored_df[scored_df["edge"].fillna(0) >= min_edge_filter]
+
+        # REAL, NEW (per direct request) - the actual MLB-style filter:
+        # only keep rows where the real, direct Monte Carlo simulation
+        # (not just the mu-based edge above) shows the leaning side
+        # clearing 60% across 1000 real simulated games - same real
+        # threshold MLB's own slate uses.
+        if "sim_over_rate" in scored_df.columns:
+            min_sim_rate = st.slider("Minimum simulation rate for the leaning side (%)", 0, 100, 60, key="min_sim_rate")
+            only_sim_confirmed = st.checkbox(
+                "Only show rows the real Monte Carlo simulation actually confirms "
+                f"(clears {min_sim_rate}% on 1000 simulated games)",
+                value=False, key="only_sim_confirmed",
+                help="Off by default so you can still see mu-only rows (useful before "
+                     "coverage/RB data has loaded) - turn on for the real, full MLB-style check.",
+            )
+            if only_sim_confirmed:
+                def _clears_sim(r):
+                    if pd.isna(r.get("sim_over_rate")):
+                        return False
+                    lean = "OVER" if pd.notna(r.get("p_over")) and r.get("p_over") > 0.5 else "UNDER"
+                    rate = r.get("sim_over_rate") if lean == "OVER" else r.get("sim_under_rate")
+                    return rate is not None and rate >= min_sim_rate
+                scored_df = scored_df[scored_df.apply(_clears_sim, axis=1)]
 
         if scored_df.empty:
             # REAL BUG FOUND+FIXED this session: an empty `results` list
@@ -1369,7 +1465,9 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         # (raw)" expander, just applied here too.
         core_display_cols = ["player_display_name", "team", "opponent", "matchup",
                               "position", "prop_type", "line", "mu", "sigma",
-                              "p_over", "edge", "real_hit_rate_read", "real_supporting_metrics",
+                              "p_over", "edge", "sim_over_rate", "sim_under_rate",
+                              "sim_avg", "sim_avg_gap_pct", "sim_lean",
+                              "real_hit_rate_read", "real_supporting_metrics",
                               "stage1_player_majority_elite", "stage1_player_majority_poor",
                               "quality_score", "data_confidence",
                               "games_sampled_total"]
