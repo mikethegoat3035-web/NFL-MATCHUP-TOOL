@@ -781,14 +781,13 @@ else:
         if pc_survivors is not None and not pc_survivors.empty:
             st.write("Pass / pass-catching")
             st.dataframe(
-                pc_survivors[["player", "team", "opponent", "prop_type", "coverages_qualifying", "coverages_scored", "read"]],
+                pc_survivors[["player", "team", "opponent", "prop_type", "alignment"]],
                 width="stretch", hide_index=True,
             )
         if rush_survivors is not None and not rush_survivors.empty:
             st.write("Rush concept")
             st.dataframe(
-                rush_survivors[["player", "team", "opponent", "prop_type", "dominant_concept",
-                                 "own_percentile", "defense_allowed_percentile", "read"]],
+                rush_survivors[["player", "team", "opponent", "prop_type"]],
                 width="stretch", hide_index=True,
             )
 
@@ -821,20 +820,51 @@ else:
 
                     if not pc_match.empty:
                         row = pc_match.iloc[0]
-                        team_full = TEAM_ABBREV_TO_FULL.get(row["team"], row["team"])
-                        result = stage2_pass_catch_cross_reference(
-                            row["gsis_id"], row["prop_type"], row["qualifying_coverage_fields"][0],
-                            st.session_state.coverage_bundle, stage2_line, player_stats_hist,
-                            exclude_team_full=team_full,
+                        opponent_full = row["opponent"]
+                        sim_result = simulate_receiver_matchup_n_times(
+                            st.session_state.coverage_bundle, row["player"], opponent_full,
+                            n_simulations=1000, alignment=row.get("alignment"),
                         )
+                        result = None
+                        if sim_result.get("usable"):
+                            prop_to_series = {
+                                "receptions": "receptions", "targets": "targets",
+                                "rec_yards": "rec_yards", "rec_tds": "rec_tds",
+                                "longest_reception": "rec_yards",
+                            }
+                            series_key = prop_to_series.get(row["prop_type"])
+                            if series_key:
+                                sim_check = real_over_rate_from_nfl_simulation(
+                                    sim_result["series"][series_key], stage2_line)
+                                result = {"usable": True, "read": f"{sim_check['lean']} - {sim_check['over_rate']}% over "
+                                                                    f"{sim_check['total']} real simulated games, "
+                                                                    f"avg gap {sim_check['avg_gap_pct']}%",
+                                          "hits": sim_check["over_count"], "total": sim_check["total"],
+                                          "hit_rate": sim_check["over_rate"] / 100}
+                        if result is None:
+                            result = {"usable": False, "reason": "couldn't simulate this real matchup"}
                     elif not rush_match.empty:
                         row = rush_match.iloc[0]
-                        team_full = TEAM_ABBREV_TO_FULL_RB.get(row["team"], row["team"])
-                        result = stage2_rush_cross_reference(
-                            row["gsis_id"], row["prop_type"], row["dominant_concept"],
-                            st.session_state.rb_bundle, stage2_line, player_stats_hist,
-                            exclude_team_full=team_full,
-                        )
+                        opponent_full = row["opponent"]
+                        sim_result = simulate_rb_matchup_n_times(
+                            st.session_state.rb_bundle, row["player"], opponent_full, n_simulations=1000)
+                        result = None
+                        if sim_result.get("usable"):
+                            prop_to_series = {
+                                "rush_attempts": "rush_attempts", "rush_yards": "rush_yards",
+                                "rush_tds": "rush_tds", "longest_rush": "longest_rush",
+                            }
+                            series_key = prop_to_series.get(row["prop_type"])
+                            if series_key:
+                                sim_check = real_over_rate_from_nfl_simulation(
+                                    sim_result["series"][series_key], stage2_line)
+                                result = {"usable": True, "read": f"{sim_check['lean']} - {sim_check['over_rate']}% over "
+                                                                    f"{sim_check['total']} real simulated games, "
+                                                                    f"avg gap {sim_check['avg_gap_pct']}%",
+                                          "hits": sim_check["over_count"], "total": sim_check["total"],
+                                          "hit_rate": sim_check["over_rate"] / 100}
+                        if result is None:
+                            result = {"usable": False, "reason": "couldn't simulate this real matchup"}
                     else:
                         result = {"usable": False, "reason": "survivor not found - try re-running Stage 1"}
 
