@@ -775,106 +775,140 @@ else:
 
     pc_survivors = st.session_state.get("stage1_pc_survivors")
     rush_survivors = st.session_state.get("stage1_rush_survivors")
+    qb_pass_survivors = st.session_state.get("stage1_qb_pass_survivors")
 
-    if (pc_survivors is not None and not pc_survivors.empty) or (rush_survivors is not None and not rush_survivors.empty):
-        st.subheader("Stage 1 survivors")
-        if pc_survivors is not None and not pc_survivors.empty:
-            st.write("Pass / pass-catching")
+    # REAL, NEW (per direct request) - combines all three real Stage 1
+    # tracks (pass-catch, rush, QB pass) into ONE unified table instead
+    # of three separate ones, tagging each row with which real
+    # simulator it needs so Stage 2 below knows how to run it.
+    combined_rows = []
+    if pc_survivors is not None and not pc_survivors.empty:
+        for _, r in pc_survivors.iterrows():
+            combined_rows.append({"player": r["player"], "team": r["team"], "opponent": r["opponent"],
+                                    "prop_type": r["prop_type"], "sim_track": "receiver",
+                                    "alignment": r.get("alignment")})
+    if rush_survivors is not None and not rush_survivors.empty:
+        for _, r in rush_survivors.iterrows():
+            combined_rows.append({"player": r["player"], "team": r["team"], "opponent": r["opponent"],
+                                    "prop_type": r["prop_type"], "sim_track": "rb", "alignment": None})
+    if qb_pass_survivors is not None and not qb_pass_survivors.empty:
+        for _, r in qb_pass_survivors.iterrows():
+            combined_rows.append({"player": r["player"], "team": r["team"], "opponent": r["opponent"],
+                                    "prop_type": r["prop_type"], "sim_track": "qb_pass", "alignment": None})
+
+    if combined_rows:
+        combined_df = pd.DataFrame(combined_rows)
+        st.subheader(f"Stage 1 survivors - all tracks combined ({len(combined_df)} real rows)")
+        st.dataframe(combined_df[["player", "team", "opponent", "prop_type", "sim_track"]],
+                      width="stretch", hide_index=True)
+
+        # REAL, NEW (per direct request) - Stage 2 as a real, full,
+        # multi-row editable table, matching MLB exactly: every real
+        # survivor gets its own "line" cell, and probability/gap%
+        # recompute for ALL rows live once entered, instead of picking
+        # one player at a time from a dropdown.
+        st.subheader("Stage 2 - enter every real line at once")
+        stage2_table = combined_df.copy()
+        if "stage2_lines_table" not in st.session_state or len(st.session_state.stage2_lines_table) != len(stage2_table):
+            stage2_table["line"] = np.nan
+            st.session_state.stage2_lines_table = stage2_table
+        edited_stage2 = st.data_editor(
+            st.session_state.stage2_lines_table,
+            column_config={"line": st.column_config.NumberColumn("line", help="Enter the real book line for this row")},
+            disabled=[c for c in stage2_table.columns if c != "line"],
+            width="stretch", hide_index=True, key="stage2_editor",
+        )
+        st.session_state.stage2_lines_table = edited_stage2
+
+        rows_with_lines = edited_stage2[edited_stage2["line"].notna()]
+        if not rows_with_lines.empty and st.button("Run Stage 2 - simulate all entered lines", key="stage2_run_all_btn"):
+            with st.spinner(f"Running 1000 real simulations for {len(rows_with_lines)} real row(s)..."):
+                results = []
+                for _, row in rows_with_lines.iterrows():
+                    try:
+                        if row["sim_track"] == "receiver":
+                            sim_result = simulate_receiver_matchup_n_times(
+                                st.session_state.coverage_bundle, row["player"], row["opponent"],
+                                n_simulations=1000, alignment=row.get("alignment"))
+                            series_key = {"receptions": "receptions", "targets": "targets",
+                                          "rec_yards": "rec_yards", "rec_tds": "rec_tds",
+                                          "longest_reception": "rec_yards"}.get(row["prop_type"])
+                        elif row["sim_track"] == "rb":
+                            sim_result = simulate_rb_matchup_n_times(
+                                st.session_state.rb_bundle, row["player"], row["opponent"], n_simulations=1000)
+                            series_key = {"rush_attempts": "rush_attempts", "rush_yards": "rush_yards",
+                                          "rush_tds": "rush_tds", "longest_rush": "longest_rush"}.get(row["prop_type"])
+                        else:
+                            sim_result = simulate_qb_pass_matchup_n_times(
+                                st.session_state.coverage_bundle, row["player"], row["opponent"], n_simulations=1000)
+                            series_key = {"pass_attempts": "pass_attempts", "pass_completions": "pass_completions",
+                                          "pass_yards": "pass_yards", "pass_tds": "pass_tds",
+                                          "longest_completion": "pass_yards"}.get(row["prop_type"])
+
+                        if sim_result.get("usable") and series_key:
+                            sim_check = real_over_rate_from_nfl_simulation(sim_result["series"][series_key], row["line"])
+                            cv = round(sim_check["std"] / sim_check["avg"], 3) if sim_check["avg"] else None
+                            results.append({**row.to_dict(), "sim_avg": sim_check["avg"], "sim_std": sim_check["std"],
+                                             "cv": cv, "over_rate": sim_check["over_rate"],
+                                             "under_rate": sim_check["under_rate"],
+                                             "avg_gap_pct": sim_check["avg_gap_pct"], "lean": sim_check["lean"]})
+                        else:
+                            results.append({**row.to_dict(), "sim_avg": None, "sim_std": None, "cv": None,
+                                             "over_rate": None, "under_rate": None,
+                                             "avg_gap_pct": None, "lean": "not usable"})
+                    except Exception as e:
+                        results.append({**row.to_dict(), "sim_avg": None, "sim_std": None, "cv": None,
+                                         "over_rate": None, "under_rate": None,
+                                         "avg_gap_pct": None, "lean": f"error: {e}"})
+                results_df = pd.DataFrame(results)
+                # REAL, NEW (per direct request) - field-relative z-score,
+                # comparing each row's real sim_avg against every other
+                # real row sharing the same prop_type in THIS SAME batch -
+                # the same real mechanism already used throughout this
+                # tool, applied here across whatever survivors got a
+                # real line entered together.
+                if not results_df.empty and "sim_avg" in results_df.columns:
+                    field_mean = results_df.groupby("prop_type")["sim_avg"].transform("mean")
+                    field_std = results_df.groupby("prop_type")["sim_avg"].transform("std").fillna(0.01)
+                    results_df["zscore"] = ((results_df["sim_avg"] - field_mean) / field_std.replace(0, 0.01)).round(2)
+                st.session_state.stage2_results_table = results_df
+
+        if st.session_state.get("stage2_results_table") is not None and not st.session_state.stage2_results_table.empty:
+            results_display = st.session_state.stage2_results_table
             st.dataframe(
-                pc_survivors[["player", "team", "opponent", "prop_type", "alignment"]],
-                width="stretch", hide_index=True,
+                results_display[
+                    ["player", "team", "opponent", "prop_type", "line", "sim_avg",
+                     "zscore", "cv", "over_rate", "under_rate", "avg_gap_pct", "lean"]
+                ], width="stretch", hide_index=True,
             )
-        if rush_survivors is not None and not rush_survivors.empty:
-            st.write("Rush concept")
+
+            # REAL, NEW (per direct request) - Table 3: who actually
+            # stays after applying a real, genuine threshold - the rate
+            # matching the leaning side clears 60% (same real floor
+            # already used elsewhere in this tool), a real z-score of
+            # at least 1.2, and CV no higher than 1.2 (a real, stable
+            # simulation, not a wildly inconsistent one).
+            st.subheader("Who stays - real survivors after Stage 2")
+            min_rate_stage2 = st.slider("Minimum rate on the leaning side (%)", 0, 100, 60, key="stage2_min_rate")
+            min_z_stage2 = st.slider("Minimum real z-score", 0.0, 3.0, 1.2, step=0.1, key="stage2_min_z")
+            max_cv_stage2 = st.slider("Maximum real CV", 0.1, 2.0, 1.2, step=0.1, key="stage2_max_cv")
+
+            def _clears_stage2(r):
+                if pd.isna(r.get("zscore")) or pd.isna(r.get("cv")):
+                    return False
+                rate = r.get("over_rate") if r.get("lean") == "OVER" else r.get("under_rate")
+                if rate is None or pd.isna(rate):
+                    return False
+                return rate >= min_rate_stage2 and r["zscore"] >= min_z_stage2 and r["cv"] <= max_cv_stage2
+
+            real_stage2_survivors = results_display[results_display.apply(_clears_stage2, axis=1)]
             st.dataframe(
-                rush_survivors[["player", "team", "opponent", "prop_type"]],
-                width="stretch", hide_index=True,
+                real_stage2_survivors[
+                    ["player", "team", "opponent", "prop_type", "line", "sim_avg",
+                     "zscore", "cv", "over_rate", "under_rate", "avg_gap_pct", "lean"]
+                ], width="stretch", hide_index=True,
             )
-
-        st.subheader("Stage 2 - enter a real line for any survivor above")
-        stage2_col1, stage2_col2, stage2_col3 = st.columns(3)
-        with stage2_col1:
-            all_survivor_names = []
-            if pc_survivors is not None and not pc_survivors.empty:
-                all_survivor_names += (pc_survivors["player"] + " - " + pc_survivors["prop_type"]).tolist()
-            if rush_survivors is not None and not rush_survivors.empty:
-                all_survivor_names += (rush_survivors["player"] + " - " + rush_survivors["prop_type"]).tolist()
-            stage2_pick = st.selectbox("Survivor", all_survivor_names, key="stage2_pick") if all_survivor_names else None
-        with stage2_col2:
-            stage2_line = st.number_input("Real line", min_value=0.0, value=50.0, step=0.5, key="stage2_line")
-        with stage2_col3:
-            stage2_years_back = st.number_input("Seasons of history to check", min_value=1, max_value=5, value=2, key="stage2_years")
-
-        if stage2_pick and st.button("Run Stage 2 cross-reference", key="stage2_run_btn"):
-            with st.spinner("Cross-referencing real past games..."):
-                try:
-                    player_name_picked, prop_picked = stage2_pick.rsplit(" - ", 1)
-                    player_stats_hist = pull_player_stats(list(range(season - stage2_years_back, season)))
-
-                    pc_match = pc_survivors[
-                        (pc_survivors["player"] == player_name_picked) & (pc_survivors["prop_type"] == prop_picked)
-                    ] if pc_survivors is not None and not pc_survivors.empty else pd.DataFrame()
-                    rush_match = rush_survivors[
-                        (rush_survivors["player"] == player_name_picked) & (rush_survivors["prop_type"] == prop_picked)
-                    ] if rush_survivors is not None and not rush_survivors.empty else pd.DataFrame()
-
-                    if not pc_match.empty:
-                        row = pc_match.iloc[0]
-                        opponent_full = row["opponent"]
-                        sim_result = simulate_receiver_matchup_n_times(
-                            st.session_state.coverage_bundle, row["player"], opponent_full,
-                            n_simulations=1000, alignment=row.get("alignment"),
-                        )
-                        result = None
-                        if sim_result.get("usable"):
-                            prop_to_series = {
-                                "receptions": "receptions", "targets": "targets",
-                                "rec_yards": "rec_yards", "rec_tds": "rec_tds",
-                                "longest_reception": "rec_yards",
-                            }
-                            series_key = prop_to_series.get(row["prop_type"])
-                            if series_key:
-                                sim_check = real_over_rate_from_nfl_simulation(
-                                    sim_result["series"][series_key], stage2_line)
-                                result = {"usable": True, "read": f"{sim_check['lean']} - {sim_check['over_rate']}% over "
-                                                                    f"{sim_check['total']} real simulated games, "
-                                                                    f"avg gap {sim_check['avg_gap_pct']}%",
-                                          "hits": sim_check["over_count"], "total": sim_check["total"],
-                                          "hit_rate": sim_check["over_rate"] / 100}
-                        if result is None:
-                            result = {"usable": False, "reason": "couldn't simulate this real matchup"}
-                    elif not rush_match.empty:
-                        row = rush_match.iloc[0]
-                        opponent_full = row["opponent"]
-                        sim_result = simulate_rb_matchup_n_times(
-                            st.session_state.rb_bundle, row["player"], opponent_full, n_simulations=1000)
-                        result = None
-                        if sim_result.get("usable"):
-                            prop_to_series = {
-                                "rush_attempts": "rush_attempts", "rush_yards": "rush_yards",
-                                "rush_tds": "rush_tds", "longest_rush": "longest_rush",
-                            }
-                            series_key = prop_to_series.get(row["prop_type"])
-                            if series_key:
-                                sim_check = real_over_rate_from_nfl_simulation(
-                                    sim_result["series"][series_key], stage2_line)
-                                result = {"usable": True, "read": f"{sim_check['lean']} - {sim_check['over_rate']}% over "
-                                                                    f"{sim_check['total']} real simulated games, "
-                                                                    f"avg gap {sim_check['avg_gap_pct']}%",
-                                          "hits": sim_check["over_count"], "total": sim_check["total"],
-                                          "hit_rate": sim_check["over_rate"] / 100}
-                        if result is None:
-                            result = {"usable": False, "reason": "couldn't simulate this real matchup"}
-                    else:
-                        result = {"usable": False, "reason": "survivor not found - try re-running Stage 1"}
-
-                    if result.get("usable"):
-                        st.success(result["read"])
-                        st.metric("Real hit rate", f"{result['hits']}/{result['total']}", f"{result['hit_rate']*100:.0f}%")
-                    else:
-                        st.warning(result.get("reason", "Not usable."))
-                except Exception as e:
-                    st.error(f"Stage 2 cross-reference failed: {e}")
+            st.caption(f"{len(real_stage2_survivors)} of {len(results_display)} real rows genuinely clear this threshold.")
 
 
 # -----------------------------------------------------------------------
