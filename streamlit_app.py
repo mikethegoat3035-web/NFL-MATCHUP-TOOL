@@ -798,6 +798,77 @@ else:
 
     if combined_rows:
         combined_df = pd.DataFrame(combined_rows)
+
+        # REAL, NEW (per direct request) - runs the real 1000-game
+        # simulation for EVERY real survivor right here, before any
+        # line is entered, and computes a real, field-relative
+        # z-score/CV from the simulation's own average/consistency
+        # alone - exactly mirroring MLB's structure, where Stage 1
+        # already flags GREAT/VERY STRONG quality without needing a
+        # real book line at all. This means only the genuinely strong
+        # candidates need a manual line typed in below, instead of
+        # every single survivor.
+        if st.button("Run quality check on all Stage 1 survivors (no lines needed yet)", key="run_quality_check"):
+            with st.spinner(f"Running 1000 real simulations for {len(combined_df)} real survivor(s)..."):
+                quality_rows = []
+                for _, row in combined_df.iterrows():
+                    try:
+                        if row["sim_track"] == "receiver":
+                            sim_result = simulate_receiver_matchup_n_times(
+                                st.session_state.coverage_bundle, row["player"], row["opponent"],
+                                n_simulations=1000, alignment=row.get("alignment"))
+                            series_key = {"receptions": "receptions", "targets": "targets",
+                                          "rec_yards": "rec_yards", "rec_tds": "rec_tds",
+                                          "longest_reception": "longest_reception"}.get(row["prop_type"])
+                        elif row["sim_track"] == "rb":
+                            sim_result = simulate_rb_matchup_n_times(
+                                st.session_state.rb_bundle, row["player"], row["opponent"], n_simulations=1000)
+                            series_key = {"rush_attempts": "rush_attempts", "rush_yards": "rush_yards",
+                                          "rush_tds": "rush_tds", "longest_rush": "longest_rush"}.get(row["prop_type"])
+                        else:
+                            sim_result = simulate_qb_pass_matchup_n_times(
+                                st.session_state.coverage_bundle, row["player"], row["opponent"], n_simulations=1000)
+                            series_key = {"pass_attempts": "pass_attempts", "pass_completions": "pass_completions",
+                                          "pass_yards": "pass_yards", "pass_tds": "pass_tds",
+                                          "longest_completion": "longest_completion"}.get(row["prop_type"])
+
+                        if sim_result.get("usable") and series_key:
+                            series = sim_result["series"][series_key]
+                            sim_avg = sum(series) / len(series)
+                            sim_std = (sum((v - sim_avg) ** 2 for v in series) / len(series)) ** 0.5
+                            cv = round(sim_std / sim_avg, 3) if sim_avg else None
+                            quality_rows.append({**row.to_dict(), "sim_avg": round(sim_avg, 2), "cv": cv})
+                        else:
+                            quality_rows.append({**row.to_dict(), "sim_avg": None, "cv": None})
+                    except Exception:
+                        quality_rows.append({**row.to_dict(), "sim_avg": None, "cv": None})
+
+                quality_df = pd.DataFrame(quality_rows)
+                if not quality_df.empty and "sim_avg" in quality_df.columns:
+                    field_mean = quality_df.groupby("prop_type")["sim_avg"].transform("mean")
+                    field_std = quality_df.groupby("prop_type")["sim_avg"].transform("std").fillna(0.01)
+                    quality_df["zscore"] = ((quality_df["sim_avg"] - field_mean) / field_std.replace(0, 0.01)).round(2)
+                    quality_df["quality_tier"] = quality_df.apply(
+                        lambda r: "GREAT" if pd.notna(r["zscore"]) and r["zscore"] >= 1.5 and pd.notna(r["cv"]) and r["cv"] <= 1.2 else
+                                  ("VERY STRONG" if pd.notna(r["zscore"]) and r["zscore"] >= 1.2 and pd.notna(r["cv"]) and r["cv"] <= 1.2 else "other"),
+                        axis=1,
+                    )
+                st.session_state.stage1_quality_df = quality_df
+
+        quality_df = st.session_state.get("stage1_quality_df")
+        if quality_df is not None and not quality_df.empty:
+            great_and_strong = quality_df[quality_df["quality_tier"].isin(["GREAT", "VERY STRONG"])]
+            st.subheader(f"Quality-ranked - {len(great_and_strong)} of {len(quality_df)} real survivors are GREAT/VERY STRONG")
+            st.dataframe(
+                great_and_strong[["player", "team", "opponent", "prop_type", "sim_avg", "zscore", "cv", "quality_tier"]]
+                .sort_values("zscore", ascending=False),
+                width="stretch", hide_index=True,
+            )
+            only_quality_for_stage2 = st.checkbox(
+                "Only send GREAT/VERY STRONG rows to Stage 2 below (recommended - fewer real lines to type in)",
+                value=True, key="only_quality_stage2",
+            )
+            combined_df = great_and_strong if only_quality_for_stage2 else quality_df
         st.subheader(f"Stage 1 survivors - all tracks combined ({len(combined_df)} real rows)")
         st.dataframe(combined_df[["player", "team", "opponent", "prop_type", "sim_track"]],
                       width="stretch", hide_index=True)
@@ -832,7 +903,7 @@ else:
                                 n_simulations=1000, alignment=row.get("alignment"))
                             series_key = {"receptions": "receptions", "targets": "targets",
                                           "rec_yards": "rec_yards", "rec_tds": "rec_tds",
-                                          "longest_reception": "rec_yards"}.get(row["prop_type"])
+                                          "longest_reception": "longest_reception"}.get(row["prop_type"])
                         elif row["sim_track"] == "rb":
                             sim_result = simulate_rb_matchup_n_times(
                                 st.session_state.rb_bundle, row["player"], row["opponent"], n_simulations=1000)
@@ -843,7 +914,7 @@ else:
                                 st.session_state.coverage_bundle, row["player"], row["opponent"], n_simulations=1000)
                             series_key = {"pass_attempts": "pass_attempts", "pass_completions": "pass_completions",
                                           "pass_yards": "pass_yards", "pass_tds": "pass_tds",
-                                          "longest_completion": "pass_yards"}.get(row["prop_type"])
+                                          "longest_completion": "longest_completion"}.get(row["prop_type"])
 
                         if sim_result.get("usable") and series_key:
                             sim_check = real_over_rate_from_nfl_simulation(sim_result["series"][series_key], row["line"])
