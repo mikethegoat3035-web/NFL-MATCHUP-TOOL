@@ -542,6 +542,15 @@ if st.session_state.get("free_data_season_used"):
         "no CSV upload needed, auto-refreshes each session."
     )
 
+st.info(
+    "🎯 **Looking for the all-in-one scan + simulation tool (like the MLB model)?** "
+    "Scroll to the **'⭐ All-In-One Scan'** section - it's inside 'Stage 1 / Stage 2 - "
+    "Coverage & Concept Survivors', further down the page. That's the real Stage 1 → "
+    "Stage 2 flow: it scans the whole slate, and its mu/sigma come directly from 1000 "
+    "real simulated games. 'Monte Carlo Simulation Scan' above it, and 'Full Matchup "
+    "Simulation' at the very bottom, are separate, different tools - not the unified one."
+)
+
 if mode == "Weekly Scan / Draft Rankings":
     pass  # REAL, SAFE REMOVAL (per direct request) - Draft Rankings removed
     # entirely. The "League Settings" UI and "Build Draft Rankings" button
@@ -1171,6 +1180,8 @@ elif st.session_state.slate_df is not None and not st.session_state.slate_df.emp
         # -----------------------------------------------------------
         # SCAN DISPLAY: adjustable lines, live edge/p_over
         # -----------------------------------------------------------
+        st.divider()
+        st.header("⭐ All-In-One Scan (the real MLB-style tool)")
         st.subheader("Slate - enter a line per row to compute edge/probability")
         st.caption(
             "Type a value in the 'line' column for any prop you want scored. "
@@ -2487,3 +2498,4 @@ if True:  # was: if mode == "Season Backtest": - now always renders below the sc
         pmiss_summary["mean_abs_miss"] = round(pmiss_summary["mean_abs_miss"], 2)
         st.markdown("**Real mu accuracy by 1Q/1H prop_type**")
         st.dataframe(pmiss_summary, width='stretch')
+
