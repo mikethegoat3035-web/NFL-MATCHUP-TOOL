@@ -12431,6 +12431,7 @@ def simulate_receiver_game(coverage_rows: dict, opponent_coverage_profile: "Team
     num_targets = _poisson_sample(rng, per_game_target_rate)
 
     targets, receptions, rec_yards, rec_tds = 0, 0, 0.0, 0
+    longest_reception = 0.0
     for _ in range(num_targets):
         targets += 1
         chosen_coverage = rng.choices(coverage_names, weights=coverage_weights, k=1)[0]
@@ -12438,10 +12439,12 @@ def simulate_receiver_game(coverage_rows: dict, opponent_coverage_profile: "Team
         if caught:
             receptions += 1
             rec_yards += yards
+            longest_reception = max(longest_reception, yards)
             if td:
                 rec_tds += 1
 
-    return {"targets": targets, "receptions": receptions, "rec_yards": round(rec_yards, 1), "rec_tds": rec_tds}
+    return {"targets": targets, "receptions": receptions, "rec_yards": round(rec_yards, 1), "rec_tds": rec_tds,
+            "longest_reception": round(longest_reception, 1)}
 
 
 def simulate_receiver_matchup_n_times(coverage_bundle: "CoverageDataBundle", player_name: str,
@@ -12475,7 +12478,7 @@ def simulate_receiver_matchup_n_times(coverage_bundle: "CoverageDataBundle", pla
         return {"usable": False, "reason": f"no real coverage profile found for opponent {opponent_full}"}
 
     rng = random.Random(random_state)
-    series = {"targets": [], "receptions": [], "rec_yards": [], "rec_tds": []}
+    series = {"targets": [], "receptions": [], "rec_yards": [], "rec_tds": [], "longest_reception": []}
     for _ in range(n_simulations):
         result = simulate_receiver_game(coverage_rows, opponent_profile, per_game_target_rate, rng)
         for k in series:
@@ -13831,7 +13834,7 @@ def scan_stage1_qb_pass_survivors_free(coverage_bundle, week_rosters, opponent_b
 QUALITY_MU_PROP_TO_SIMULATOR = {
     "receptions": ("receiver", "receptions"), "targets": ("receiver", "targets"),
     "rec_yards": ("receiver", "rec_yards"), "rec_tds": ("receiver", "rec_tds"),
-    "longest_reception": ("receiver", "rec_yards"),  # real, honest proxy - no direct longest-play series in the receiver simulator
+    "longest_reception": ("receiver", "longest_reception"),  # REAL FIX (confirmed bug, found via direct user report) - was using rec_yards as a proxy, meaning "longest catch" showed the exact same number as total game yardage. Now uses the real, per-target max tracked directly in the simulator.
     "rush_attempts": ("rb", "rush_attempts"), "rush_yards": ("rb", "rush_yards"),
     "rush_tds": ("rb", "rush_tds"), "longest_rush": ("rb", "longest_rush"),
     "pass_attempts": ("qb_pass", "pass_attempts"), "pass_completions": ("qb_pass", "pass_completions"),
