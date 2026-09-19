@@ -712,7 +712,69 @@ else:
             & (st.session_state.sim_scan_df["cv"] <= sim_max_cv_nfl)
         ]
         st.subheader(f"Kept simulated results ({len(sim_survivors)} of {len(st.session_state.sim_scan_df)})")
-        st.dataframe(sim_survivors, width='stretch')
+
+        # REAL, NEW (per direct request) - editable line entry directly
+        # on these wide-field survivors, so finding quality and
+        # checking it against a real line becomes one step. Re-runs
+        # the real, actual simulator per flagged row (not an
+        # approximated formula) to get a genuine probability/gap%/lean,
+        # the same real standard used everywhere else in this tool.
+        sim_survivors_editable = sim_survivors.copy()
+        if "sim_lines_table" not in st.session_state or len(st.session_state.sim_lines_table) != len(sim_survivors_editable):
+            sim_survivors_editable["line"] = np.nan
+            st.session_state.sim_lines_table = sim_survivors_editable
+        edited_sim_survivors = st.data_editor(
+            st.session_state.sim_lines_table,
+            column_config={"line": st.column_config.NumberColumn("line", help="Enter the real book line for this row")},
+            disabled=[c for c in sim_survivors_editable.columns if c != "line"],
+            width="stretch", hide_index=True, key="sim_survivors_editor",
+        )
+        st.session_state.sim_lines_table = edited_sim_survivors
+
+        sim_rows_with_lines = edited_sim_survivors[edited_sim_survivors["line"].notna()]
+        if not sim_rows_with_lines.empty and st.button("Check real lines against the simulation", key="sim_check_lines_btn"):
+            with st.spinner(f"Running 1000 real simulations for {len(sim_rows_with_lines)} real row(s)..."):
+                sim_line_results = []
+                for _, srow in sim_rows_with_lines.iterrows():
+                    try:
+                        side = srow["side"]
+                        if side == "receiver":
+                            r = simulate_receiver_matchup_n_times(
+                                st.session_state.coverage_bundle, srow["player"], srow["opponent"], n_simulations=1000)
+                            series_key = srow["prop"]
+                        elif side == "rb":
+                            r = simulate_rb_matchup_n_times(
+                                st.session_state.rb_bundle, srow["player"], srow["opponent"], n_simulations=1000)
+                            series_key = srow["prop"]
+                        elif side == "qb_pass":
+                            r = simulate_qb_pass_matchup_n_times(
+                                st.session_state.coverage_bundle, srow["player"], srow["opponent"], n_simulations=1000)
+                            series_key = srow["prop"]
+                        else:
+                            r = simulate_qb_scramble_matchup_n_times(
+                                st.session_state.coverage_bundle, srow["player"], srow["opponent"], n_simulations=1000)
+                            series_key = srow["prop"]
+
+                        if r.get("usable") and series_key in r.get("series", {}):
+                            check = real_over_rate_from_nfl_simulation(r["series"][series_key], srow["line"])
+                            sim_line_results.append({**srow.to_dict(), "over_rate": check["over_rate"],
+                                                       "under_rate": check["under_rate"],
+                                                       "avg_gap_pct": check["avg_gap_pct"], "lean": check["lean"]})
+                        else:
+                            sim_line_results.append({**srow.to_dict(), "over_rate": None, "under_rate": None,
+                                                       "avg_gap_pct": None, "lean": "not usable"})
+                    except Exception as e:
+                        sim_line_results.append({**srow.to_dict(), "over_rate": None, "under_rate": None,
+                                                   "avg_gap_pct": None, "lean": f"error: {e}"})
+                st.session_state.sim_line_results_table = pd.DataFrame(sim_line_results)
+
+        if st.session_state.get("sim_line_results_table") is not None and not st.session_state.sim_line_results_table.empty:
+            st.dataframe(
+                st.session_state.sim_line_results_table[
+                    ["player", "team", "opponent", "prop", "line", "avg", "zscore", "cv",
+                     "over_rate", "under_rate", "avg_gap_pct", "lean"]
+                ], width="stretch", hide_index=True,
+            )
 
     st.divider()
     st.header("🎯 Stage 1 / Stage 2 - Coverage & Concept Survivors")
