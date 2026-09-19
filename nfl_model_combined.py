@@ -8560,8 +8560,18 @@ def calc_original_method_match_nfl(coverage_profile: "TeamCoverageProfile", play
             per_coverage_results.append({"coverage": coverage, "qualifies": None,
                                           "note": "no real player data for this coverage - not counted either way"})
             continue
-        clears_all = True
+        # REAL FIX (per direct request, found via direct user report -
+        # props with more metrics were surviving far less often, not
+        # because they were genuinely worse matchups, but because
+        # requiring EVERY single metric to clear made props with 6-8
+        # metrics exponentially harder to survive than props with only
+        # 1-2. Now requires a real MAJORITY of this prop's metrics to
+        # clear, the same fair standard already used for coverage-level
+        # qualification, putting every prop on equal footing regardless
+        # of how many metrics it happens to use.
+        clears_count = 0
         real_percentiles = {}
+        counted_stats = 0
         for stat_key in stat_keys:
             # REAL FIX (found via direct live testing against the actual
             # Week 1 slate) - value was a raw CSV string, never converted
@@ -8571,7 +8581,6 @@ def calc_original_method_match_nfl(coverage_profile: "TeamCoverageProfile", play
             value = _to_float(stats.get(stat_key))
             threshold = NFL_PROP_METRIC_THRESHOLDS.get(stat_key)
             if value is None or threshold is None:
-                clears_all = False
                 continue
             # REAL, NEW - a rate stat only counts if this specific
             # coverage row also has real, meaningful target volume behind
@@ -8581,13 +8590,15 @@ def calc_original_method_match_nfl(coverage_profile: "TeamCoverageProfile", play
             if stat_key in NFL_RATE_STATS_NEEDING_VOLUME_FLOOR:
                 real_tgt_this_coverage = _to_float(stats.get("TGT")) or 0
                 if real_tgt_this_coverage < MIN_REAL_TGT_FOR_RATE_STATS:
-                    clears_all = False
+                    counted_stats += 1
                     continue
             direction = stat_directions.get(stat_key, "high")
             clears_this_stat = (value <= threshold) if direction == "low" else (value >= threshold)
             real_percentiles[stat_key] = value
-            if not clears_this_stat:
-                clears_all = False
+            counted_stats += 1
+            if clears_this_stat:
+                clears_count += 1
+        clears_all = counted_stats > 0 and clears_count >= (counted_stats + 1) // 2
         per_coverage_results.append({"coverage": coverage, "qualifies": clears_all,
                                        "stats": stats, "real_percentiles": real_percentiles})
 
@@ -13727,14 +13738,16 @@ def scan_stage1_rush_survivors_free(rb_bundle, week_rosters, opponent_by_team, m
                     if def_row is None:
                         continue
                     scored += 1
-                    own_clears = all(
-                        (_to_float(own_row.get(sk)) or 0) >= NFL_FREE_DATA_RB_THRESHOLDS.get(sk, 999)
-                        for sk in stat_keys
+                    own_clears_count = sum(
+                        1 for sk in stat_keys
+                        if (_to_float(own_row.get(sk)) or 0) >= NFL_FREE_DATA_RB_THRESHOLDS.get(sk, 999)
                     )
-                    def_clears = all(
-                        (_to_float(def_row.get(sk)) or 0) >= NFL_FREE_DATA_RB_THRESHOLDS.get(sk, 999)
-                        for sk in stat_keys
+                    own_clears = len(stat_keys) > 0 and own_clears_count >= (len(stat_keys) + 1) // 2
+                    def_clears_count = sum(
+                        1 for sk in stat_keys
+                        if (_to_float(def_row.get(sk)) or 0) >= NFL_FREE_DATA_RB_THRESHOLDS.get(sk, 999)
                     )
+                    def_clears = len(stat_keys) > 0 and def_clears_count >= (len(stat_keys) + 1) // 2
                     if own_clears and def_clears:
                         clears_count += 1
                 if scored and clears_count > scored / 2:
@@ -14140,14 +14153,18 @@ def scan_stage1_qb_scramble_survivors_free(coverage_bundle, week_rosters, oppone
             if not own_row or not def_row:
                 continue
             for prop_type, stat_keys in NFL_FREE_DATA_QB_SCRAMBLE_PROP_METRICS.items():
-                own_clears = all(
-                    (_to_float(own_row.get(sk)) or 0) >= NFL_FREE_DATA_QB_SCRAMBLE_THRESHOLDS.get(sk, 999)
-                    for sk in stat_keys if sk in own_row
+                relevant_own_keys = [sk for sk in stat_keys if sk in own_row]
+                relevant_def_keys = [sk for sk in stat_keys if sk in def_row]
+                own_clears_count = sum(
+                    1 for sk in relevant_own_keys
+                    if (_to_float(own_row.get(sk)) or 0) >= NFL_FREE_DATA_QB_SCRAMBLE_THRESHOLDS.get(sk, 999)
                 )
-                def_clears = all(
-                    (_to_float(def_row.get(sk)) or 0) >= NFL_FREE_DATA_QB_SCRAMBLE_THRESHOLDS.get(sk, 999)
-                    for sk in stat_keys if sk in def_row
+                own_clears = len(relevant_own_keys) > 0 and own_clears_count >= (len(relevant_own_keys) + 1) // 2
+                def_clears_count = sum(
+                    1 for sk in relevant_def_keys
+                    if (_to_float(def_row.get(sk)) or 0) >= NFL_FREE_DATA_QB_SCRAMBLE_THRESHOLDS.get(sk, 999)
                 )
+                def_clears = len(relevant_def_keys) > 0 and def_clears_count >= (len(relevant_def_keys) + 1) // 2
                 if own_clears and def_clears:
                     survivors.append({"player": player_name, "team": team_abbr,
                                        "opponent": opponent_full, "prop_type": prop_type})
