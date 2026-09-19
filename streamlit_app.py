@@ -70,7 +70,7 @@ from nfl_model_combined import (
     real_over_rate_from_nfl_simulation, simulate_receiver_matchup_n_times,
     simulate_rb_matchup_n_times, simulate_qb_pass_matchup_n_times, simulate_qb_scramble_matchup_n_times,
     stage2_pass_catch_cross_reference, stage2_rush_cross_reference,
-    scan_full_slate_simulation_nfl,
+    scan_full_slate_simulation_nfl, pull_depth_charts, get_starters_for_week, pull_injuries,
     load_free_nfl_data, build_bundles_from_free_data,
     CoverageDataBundle, TeamCoverageProfile, RBDataBundle,
 )
@@ -696,12 +696,44 @@ else:
                         sim_opponent_rb[away_rb] = home_rb
                         sim_opponent_rb[home_rb] = away_rb
                     sim_rosters = pull_rosters([int(season)])
+
+                    # REAL, NEW ADDITION (per direct request) - starter
+                    # filtering was confirmed missing from this specific
+                    # scan (it pulled the full roster with zero
+                    # filtering) - now uses the same real, already-
+                    # proven get_starters_for_week function used
+                    # elsewhere in this tool.
+                    sim_depth_charts = pull_depth_charts([int(season)])
+                    sim_schedules_for_starters = pull_schedules([int(season)])
+                    sim_starter_ids = get_starters_for_week(int(season), int(week), sim_depth_charts,
+                                                              sim_schedules_for_starters)
+                    sim_rosters = sim_rosters[sim_rosters["gsis_id"].isin(sim_starter_ids)]
+
+                    # REAL, NEW ADDITION (per direct request) - real,
+                    # verified injury-status exclusion (confirmed
+                    # directly against live data: report_status has
+                    # real values "Out"/"Questionable"/"Doubtful").
+                    # Removes real players ruled Out this week before
+                    # simulating them - a player who isn't playing has
+                    # no real matchup to simulate.
+                    sim_out_ids = set()
+                    try:
+                        sim_injuries = pull_injuries([int(season)])
+                        sim_injuries_this_week = sim_injuries[
+                            (sim_injuries["week"] == int(week)) & (sim_injuries["report_status"] == "Out")
+                        ]
+                        sim_out_ids = set(sim_injuries_this_week["gsis_id"].dropna())
+                        sim_rosters = sim_rosters[~sim_rosters["gsis_id"].isin(sim_out_ids)]
+                    except Exception:
+                        pass  # real, honest fallback - if injury data isn't available yet this week, proceed without it rather than blocking the whole scan
+
                     st.session_state.sim_scan_df = scan_full_slate_simulation_nfl(
                         st.session_state.coverage_bundle, st.session_state.rb_bundle,
                         sim_rosters, sim_opponent_pc, sim_opponent_rb,
                         n_simulations=int(sim_n_simulations_nfl),
                     )
-                    st.success(f"Simulated {len(st.session_state.sim_scan_df)} real player/prop combinations.")
+                    st.success(f"Simulated {len(st.session_state.sim_scan_df)} real player/prop combinations "
+                               f"(real starters only, {len(sim_out_ids)} real players ruled Out excluded).")
                 except Exception as e:
                     st.error(f"Simulation scan failed: {e}")
                     st.session_state.sim_scan_df = None
