@@ -981,6 +981,17 @@ if (st.session_state.slate_df is None or st.session_state.slate_df.empty) \
     # the backtest again the moment a new scan runs, the exact problem
     # this whole change is meant to fix).
     _render_season_report(st.session_state.season_report)
+elif st.session_state.slate_df is None or st.session_state.slate_df.empty:
+    # REAL FIX (confirmed gap, found via direct user report - "I don't
+    # see it") - if neither a scan nor a backtest has ever been run,
+    # NEITHER branch here used to render anything at all, leaving the
+    # whole "⭐ All-In-One Scan" section completely blank with zero
+    # explanation. This is the actual, most common first-visit case.
+    st.info(
+        "⭐ **Click \"Scan full slate\" near the top of the page first** - the All-In-One "
+        "Scan table (line entry, real simulated mu/sigma, probability/edge) only appears "
+        "once a real scan has been run. Nothing has been scanned yet this session."
+    )
 
 # -----------------------------------------------------------------------
 # Filters + editable table (Scan / Backtest modes)
