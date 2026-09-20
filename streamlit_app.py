@@ -666,14 +666,21 @@ else:
         "z-score/CV filter already proven throughout this tool - not a separate or "
         "lesser standard."
     )
-    sim_col1, sim_col2, sim_col3 = st.columns(3)
+    sim_col1, sim_col2, sim_col3, sim_col4 = st.columns(4)
     with sim_col1:
         sim_n_simulations_nfl = st.number_input("Simulations per player", min_value=100, max_value=5000,
                                                   value=1000, step=100, key="sim_n_nfl")
     with sim_col2:
-        sim_min_zscore_nfl = st.slider("Minimum real edge (z-score)", 0.0, 3.0, 1.5, step=0.1, key="sim_min_z_nfl")
+        sim_min_zscore_nfl = st.slider("Minimum real edge (z-score)", 0.0, 3.0, 1.2, step=0.1, key="sim_min_z_nfl")
     with sim_col3:
-        sim_max_cv_nfl = st.slider("Maximum real CV (consistency)", 0.1, 2.0, 1.0, step=0.1, key="sim_max_cv_nfl")
+        sim_max_cv_nfl = st.slider("Maximum real CV (consistency)", 0.1, 2.0, 1.2, step=0.1, key="sim_max_cv_nfl")
+    with sim_col4:
+        # REAL, NEW ADDITION (per direct request) - matches MLB's exact
+        # "top N survivors" control, letting the strongest real edges
+        # surface first instead of scrolling a long, unranked list.
+        sim_top_n_nfl = st.number_input("Show only top N survivors (by real edge)", min_value=0, max_value=500,
+                                          value=40, step=5, key="sim_top_n_nfl",
+                                          help="0 = show all real survivors, no cap")
 
     if st.button("Run Monte Carlo simulation scan", type="primary"):
         if st.session_state.get("coverage_bundle") is None or st.session_state.get("rb_bundle") is None:
@@ -742,8 +749,12 @@ else:
         sim_survivors = st.session_state.sim_scan_df[
             (st.session_state.sim_scan_df["zscore"] >= sim_min_zscore_nfl)
             & (st.session_state.sim_scan_df["cv"] <= sim_max_cv_nfl)
-        ]
-        st.subheader(f"Kept simulated results ({len(sim_survivors)} of {len(st.session_state.sim_scan_df)})")
+        ].sort_values("zscore", ascending=False)
+        real_survivor_count = len(sim_survivors)
+        if sim_top_n_nfl > 0:
+            sim_survivors = sim_survivors.head(int(sim_top_n_nfl))
+        st.subheader(f"Kept simulated results ({len(sim_survivors)} shown of {real_survivor_count} real "
+                     f"survivors, {len(st.session_state.sim_scan_df)} total scanned)")
 
         # REAL, NEW (per direct request) - editable line entry directly
         # on these wide-field survivors, so finding quality and
@@ -2738,3 +2749,4 @@ if True:  # was: if mode == "Season Backtest": - now always renders below the sc
         pmiss_summary["mean_abs_miss"] = round(pmiss_summary["mean_abs_miss"], 2)
         st.markdown("**Real mu accuracy by 1Q/1H prop_type**")
         st.dataframe(pmiss_summary, width='stretch')
+
