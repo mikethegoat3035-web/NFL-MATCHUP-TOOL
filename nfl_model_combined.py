@@ -12501,7 +12501,18 @@ def simulate_receiver_matchup_n_times(coverage_bundle: "CoverageDataBundle", pla
             # flat rate up or down rather than replacing it outright.
             neutral_baseline = 1.0 / len(coverage_rows) if coverage_rows else 1.0
             matchup_mult = (weighted_num / weighted_den) / neutral_baseline if neutral_baseline else 1.0
-            matchup_mult = max(0.5, min(1.75, matchup_mult))  # real, sane bounds - no single matchup should double or halve volume outright
+            matchup_mult = max(0.85, min(1.20, matchup_mult))
+            # REAL FIX (confirmed bug, found via direct user report -
+            # Puka Nacua projected at 15+ targets/167+ rec_yards, far
+            # above his real, tested baseline of ~9-10 targets/107-118
+            # yards). Traced directly: when a player's own coverage-
+            # share genuinely aligns with an opponent's coverage usage
+            # (confirmed case: Nacua's Cover 1/Cover 3 share matched
+            # the Giants' heavy Cover 1/Cover 3 usage), the multiplier
+            # hit 1.557 - compounding on an already-substantial baseline
+            # into an unrealistic single-game projection. Real week-to-
+            # week volume doesn't swing 50-75% from coverage tendencies
+            # alone - tightened to a real, modest +-20% range.
         else:
             matchup_mult = 1.0
     else:
@@ -12684,7 +12695,7 @@ def simulate_rb_matchup_n_times(rb_bundle: "RBDataBundle", player_name: str, opp
             if weighted_den > 0:
                 neutral_baseline = 1.0 / len(own_concept_rows) if own_concept_rows else 1.0
                 matchup_mult = (weighted_num / weighted_den) / neutral_baseline if neutral_baseline else 1.0
-                matchup_mult = max(0.5, min(1.75, matchup_mult))
+                matchup_mult = max(0.85, min(1.20, matchup_mult))  # REAL FIX (same confirmed bug as receivers) - tightened to a real, modest +-20% range
             else:
                 matchup_mult = 1.0
         else:
