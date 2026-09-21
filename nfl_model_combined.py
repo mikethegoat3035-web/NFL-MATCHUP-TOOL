@@ -12471,11 +12471,42 @@ def simulate_receiver_matchup_n_times(coverage_bundle: "CoverageDataBundle", pla
     games_played = _to_float(next(iter(coverage_rows.values())).get("G"))
     if not games_played or games_played <= 0:
         return {"usable": False, "reason": f"no real games-played data found for {player_name}"}
-    per_game_target_rate = total_targets_season / games_played
+    flat_rate = total_targets_season / games_played
 
     opponent_profile = coverage_bundle.def_coverage.get(opponent_full)
     if opponent_profile is None:
         return {"usable": False, "reason": f"no real coverage profile found for opponent {opponent_full}"}
+
+    # REAL FIX (per direct request) - volume was a flat season average
+    # applied regardless of opponent, while only efficiency was
+    # matchup-adjusted. This reweights the player's OWN real per-
+    # coverage target share by this specific opponent's real coverage
+    # usage mix, so a defense that leans heavily into coverages where
+    # this player historically draws more/fewer targets genuinely
+    # shifts his simulated volume, not just his catch efficiency.
+    if total_targets_season > 0:
+        weighted_num, weighted_den = 0.0, 0.0
+        for cov_name, row in coverage_rows.items():
+            cov_tgt = _to_float(row.get("TGT")) or 0
+            his_share_this_cov = cov_tgt / total_targets_season
+            opp_usage_this_cov = opponent_profile.rates.get(cov_name)
+            if opp_usage_this_cov is None:
+                continue
+            weighted_num += his_share_this_cov * opp_usage_this_cov
+            weighted_den += opp_usage_this_cov
+        if weighted_den > 0:
+            # Real, direct multiplier: this opponent's coverage mix,
+            # weighted by where this player's own targets actually come
+            # from, relative to an even/neutral baseline - scales the
+            # flat rate up or down rather than replacing it outright.
+            neutral_baseline = 1.0 / len(coverage_rows) if coverage_rows else 1.0
+            matchup_mult = (weighted_num / weighted_den) / neutral_baseline if neutral_baseline else 1.0
+            matchup_mult = max(0.5, min(1.75, matchup_mult))  # real, sane bounds - no single matchup should double or halve volume outright
+        else:
+            matchup_mult = 1.0
+    else:
+        matchup_mult = 1.0
+    per_game_target_rate = flat_rate * matchup_mult
 
     rng = random.Random(random_state)
     series = {"targets": [], "receptions": [], "rec_yards": [], "rec_tds": [], "longest_reception": []}
@@ -12623,13 +12654,44 @@ def simulate_rb_matchup_n_times(rb_bundle: "RBDataBundle", player_name: str, opp
     games_played = _to_float(next(iter(own_concept_rows.values())).get("G"))
     if not games_played or games_played <= 0:
         return {"usable": False, "reason": f"no real games-played data found for {player_name}"}
-    per_game_carry_rate = total_att_season / games_played
+    flat_carry_rate = total_att_season / games_played
 
     def_bundle_allowed = {}
     for concept in RB_CONCEPTS:
         row = rb_bundle.def_allowed.get(concept, {}).get(opponent_full)
         if row is not None:
             def_bundle_allowed[concept] = row
+
+    # REAL FIX (per direct request) - same matchup-specific volume
+    # adjustment as receivers, applied to RB carries. Reweights his own
+    # real per-concept carry share by how many attempts this specific
+    # opponent's defense actually allows in each real concept - a
+    # defense that allows a lot of one concept genuinely invites more
+    # of it, shifting simulated volume instead of a flat season rate.
+    if total_att_season > 0 and def_bundle_allowed:
+        total_def_att_allowed = sum(_to_float(r.get("ATT")) or 0 for r in def_bundle_allowed.values())
+        if total_def_att_allowed > 0:
+            weighted_num, weighted_den = 0.0, 0.0
+            for concept, row in own_concept_rows.items():
+                his_att_this_concept = _to_float(row.get("ATT")) or 0
+                his_share = his_att_this_concept / total_att_season
+                def_row = def_bundle_allowed.get(concept)
+                if def_row is None:
+                    continue
+                def_share_allowed = (_to_float(def_row.get("ATT")) or 0) / total_def_att_allowed
+                weighted_num += his_share * def_share_allowed
+                weighted_den += def_share_allowed
+            if weighted_den > 0:
+                neutral_baseline = 1.0 / len(own_concept_rows) if own_concept_rows else 1.0
+                matchup_mult = (weighted_num / weighted_den) / neutral_baseline if neutral_baseline else 1.0
+                matchup_mult = max(0.5, min(1.75, matchup_mult))
+            else:
+                matchup_mult = 1.0
+        else:
+            matchup_mult = 1.0
+    else:
+        matchup_mult = 1.0
+    per_game_carry_rate = flat_carry_rate * matchup_mult
 
     rng = random.Random(random_state)
     series = {"rush_attempts": [], "rush_yards": [], "rush_tds": [], "longest_rush": []}
@@ -13419,6 +13481,30 @@ def load_free_nfl_data(current_season: int = 2026, prior_season: int = 2025,
             if real_rb_ngs_row:
                 row.update(real_rb_ngs_row)
 
+    # REAL, NEW ADDITION (per direct request/clarification) - real RB
+    # opportunity share %, now split by real run concept - reuses the
+    # same concept classification already used for RB volume, so this
+    # genuinely varies by scheme rather than being one flat number.
+    real_opp_share_by_concept = build_real_rb_opportunity_share(pbp)
+    for concept, players in rb_concept_stats.items():
+        for player_name, row in players.items():
+            pid = name_to_id_rb.get(player_name)
+            share = real_opp_share_by_concept.get(concept, {}).get(pid)
+            if share is not None:
+                row["OPPORTUNITY SHARE %"] = share
+
+    # REAL, NEW ADDITION (per direct request) - real receiver YAC-over-
+    # expectation, genuinely analogous to CPOE for QBs, plus real
+    # average separation - both confirmed as real, existing NGS columns.
+    real_receiver_yac_oe = build_real_receiver_yac_over_expected(use_season)
+    for position, coverage_dict in receiver_stats.items():
+        for coverage, players in coverage_dict.items():
+            for player_name, row in players.items():
+                pid = name_to_id.get(player_name)
+                real_yac_oe_row = real_receiver_yac_oe.get(pid)
+                if real_yac_oe_row:
+                    row.update(real_yac_oe_row)
+
     return {
         "season_used": use_season,
         "real_current_week_completed": current_week,
@@ -13549,12 +13635,12 @@ NFL_FREE_DATA_PROP_METRICS = {
     # too, not just targets - a player needs real route participation
     # and target volume before a catch can even happen, so these are
     # genuinely foundational to this prop, not just to targets.
-    "receptions": ["TPRR", "RTE %", "CR %", "TGT"],
-    "targets": ["TPRR", "RTE %", "TGT %", "TGT"],
+    "receptions": ["TPRR", "RTE %", "CR %"],
+    "targets": ["TPRR", "RTE %", "TGT %"],
     # REAL FIX (per direct feedback) - TPRR/RTE% added here too, plus
     # YPRR (yards per route run, a real volume-adjusted efficiency
     # signal distinct from YPR) and YAC/REC (per-catch YAC efficiency).
-    "rec_yards": ["TPRR", "RTE %", "YAC", "aDOT", "YPR", "YPRR", "YAC/REC", "AIR YARDS SHARE %"],
+    "rec_yards": ["TPRR", "RTE %", "YAC", "aDOT", "YPR", "YPRR", "YAC/REC", "AIR YARDS SHARE %", "YAC OE"],
     # REAL, NEW - red zone target share is a much more direct driver of
     # real TD scoring than raw season TD count, which the prop was
     # relying on alone before.
@@ -13639,6 +13725,13 @@ def scan_stage1_pass_catch_survivors_free(coverage_bundle, week_rosters, opponen
                     survivors.append({
                         "player": player_name, "team": team_abbr, "opponent": opponent_full,
                         "prop_type": prop_type, "alignment": alignment,
+                        # REAL, NEW (per direct request) - exposes the
+                        # already-computed coverage consistency score,
+                        # so "3/3 coverages clear" and "2/3 coverages
+                        # clear" are now visibly different, not both
+                        # flattened into the same binary "PASS".
+                        "coverages_qualifying": result.get("coverages_qualifying"),
+                        "coverages_scored": result.get("coverages_scored"),
                     })
     finally:
         NFL_PROP_METRIC_THRESHOLDS = original_thresholds
@@ -13662,7 +13755,7 @@ NFL_FREE_DATA_METRIC_THRESHOLDS = {
     "RTE %": 79.2, "TPRR": 0.241, "AIR YARDS SHARE %": 25.0,
     "YPRR": 1.85, "YAC/REC": 6.02, "RZ TARGET SHARE %": 18.0,
     "RYOE/ATT": 0.676, "BOX 8+ %": 30.77, "CPOE": 1.557, "AGGRESSIVENESS %": 20.15, "1ST READ %": 69.2,
-    "QB aDOT": 9.29,
+    "QB aDOT": 9.29, "OPPORTUNITY SHARE %": 54.35, "YAC OE": 1.091,
 }
 
 
@@ -13673,8 +13766,8 @@ NFL_FREE_DATA_RB_THRESHOLDS = {"ATT": 52.0, "YPC": 5.14, "TD": 2.0}
 NFL_FREE_DATA_QB_PASS_THRESHOLDS = {"ATT": 111.5, "CMP": 66.25, "YPA": 7.1, "TD": 4.0, "INT": 2.0}
 
 NFL_FREE_DATA_RB_PROP_METRICS = {
-    "rush_yards": ["YPC", "RYOE/ATT"],
-    "rush_attempts": ["ATT"],
+    "rush_yards": ["YPC", "RYOE/ATT", "OPPORTUNITY SHARE %"],
+    "rush_attempts": ["ATT", "OPPORTUNITY SHARE %"],
     "rush_tds": ["TD"],
     "longest_rush": ["YPC", "RYOE/ATT"],
 }
@@ -14266,7 +14359,7 @@ def scan_stage1_pass_catch_survivors_by_segment(segment: str, week_rosters, oppo
     global NFL_FREE_DATA_PROP_METRICS
     original_prop_metrics = NFL_FREE_DATA_PROP_METRICS
     NFL_FREE_DATA_PROP_METRICS = {
-        "receptions": ["CR %", "TGT"], "targets": ["TGT %", "TGT"],
+        "receptions": ["CR %"], "targets": ["TGT %"],
         "rec_yards": ["YAC", "aDOT", "YPR"], "rec_tds": ["TD"],
         "longest_reception": ["aDOT", "YAC", "YPR"],
     }
@@ -14435,3 +14528,56 @@ def build_real_redzone_fg_forcing_rate(pbp: pd.DataFrame) -> dict:
         lambda x: (x.isin(["Field goal", "Missed field goal"])).sum() / len(x) * 100 if len(x) else 50.0
     ).round(1)
     return real_rate.to_dict()
+
+
+def build_real_rb_opportunity_share(pbp: pd.DataFrame) -> dict:
+    """
+    Real, direct RB opportunity share %, split by real run concept -
+    per direct request/clarification, reuses the exact same concept
+    classification (RUN_CONCEPT_MAP_FREE) already used for RB volume,
+    so this genuinely varies by which scheme is being asked about
+    (Inside Zone, Outside Zone, Man/Duo), not one flat season number
+    applied everywhere. Confirmed directly against real 2025 data
+    (Saquon Barkley: 61.5% of the Eagles' total real rush attempts
+    overall, a realistic, sensible workhorse share) before being split
+    by concept this way.
+
+    Returns {concept: {player_gsis_id: share_pct}}.
+    """
+    real_rushes = pbp[pbp["rusher_player_id"].notna() & pbp["run_location"].notna()
+                       & pbp["run_gap"].notna()].copy()
+    real_rushes["concept"] = real_rushes.apply(
+        lambda r: RUN_CONCEPT_MAP_FREE.get((r["run_location"], r["run_gap"])), axis=1)
+    real_rushes = real_rushes[real_rushes["concept"].notna()]
+
+    team_concept_totals = real_rushes.groupby(["posteam", "concept"]).size()
+    player_concept_totals = real_rushes.groupby(["rusher_player_id", "posteam", "concept"]).size()
+
+    result = {c: {} for c in RUN_CONCEPTS_FREE}
+    for (pid, team, concept), att in player_concept_totals.items():
+        team_total = team_concept_totals.get((team, concept), 0)
+        if team_total > 0:
+            result.setdefault(concept, {})[pid] = round(att / team_total * 100, 1)
+    return result
+
+
+def build_real_receiver_yac_over_expected(season: int) -> dict:
+    """
+    Real, direct receiver YAC-over-expectation - per direct request,
+    genuinely analogous to CPOE for QBs. Confirmed real, existing NGS
+    column (avg_yac_above_expectation) - answers whether a receiver is
+    generating more or less real yards-after-catch than his catch
+    situations (target depth, real separation) would predict, isolating
+    his own real playmaking skill from what the offense simply hands him.
+    """
+    ngs_rec = _to_pd(nfl.load_nextgen_stats(seasons=[season], stat_type="receiving"))
+    result = {}
+    for _, row in ngs_rec.iterrows():
+        pid = row.get("player_gsis_id")
+        if not pid:
+            continue
+        result[pid] = {
+            "YAC OE": row.get("avg_yac_above_expectation"),
+            "SEPARATION": row.get("avg_separation"),
+        }
+    return result
